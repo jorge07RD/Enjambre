@@ -5,7 +5,7 @@ edition = "2021"
 
 [dependencies]
 macroquad = "0.4"
-egui-macroquad = "0.17"
+egui-macroquad = { version = "0.17", default-features = false }
 rand = "0.8"
 rayon = "1"
 
