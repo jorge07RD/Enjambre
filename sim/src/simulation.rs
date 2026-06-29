@@ -1,5 +1,5 @@
-use crate::config::{hue_for_index, Boundary, SimParams, NUM_COLORS};
 use crate::grid::Grid;
+use shared::{hue_for_index, Boundary, SimParams, NUM_COLORS};
 use macroquad::prelude::Vec2;
 use rand::Rng;
 use rayon::prelude::*;
@@ -288,7 +288,7 @@ fn force_fn(r: f32, coef: f32, beta: f32) -> f32 {
 #[cfg(test)]
 mod bench {
     use super::*;
-    use crate::config::SimParams;
+    use shared::SimParams;
     use std::time::Instant;
 
     #[test]

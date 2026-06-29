@@ -1,0 +1,15 @@
+[package]
+name = "panel"
+version.workspace = true
+edition.workspace = true
+
+[[bin]]
+name = "panel"
+path = "src/main.rs"
+
+[dependencies]
+shared = { path = "../shared" }
+eframe = "0.31"
+egui.workspace = true
+serde.workspace = true
+serde_json.workspace = true
