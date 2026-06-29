@@ -1,0 +1,1 @@
+/home/jorge/Projects/Enjambre/target/release/puntos_atraccion: /home/jorge/Projects/Enjambre/src/config.rs /home/jorge/Projects/Enjambre/src/grid.rs /home/jorge/Projects/Enjambre/src/main.rs /home/jorge/Projects/Enjambre/src/render.rs /home/jorge/Projects/Enjambre/src/simulation.rs
