@@ -252,6 +252,21 @@ pub struct SimParams {
     pub blend: f32,
     /// Configuración de interacción congelada al iniciar la transición (origen).
     pub from_state: InteractionSnapshot,
+
+    // --- Velocidad suave ---
+    // `time_scale` es la velocidad EFECTIVA que usa la física; transita de forma
+    // suave hacia `speed_target` (el valor que pide el usuario con el slider o
+    // los botones de %). El resto son el estado de esa transición.
+    /// Si está activo, los cambios de velocidad se interpolan en vez de saltar.
+    pub speed_smooth: bool,
+    /// Duración (s) de la transición de velocidad.
+    pub speed_transition_duration: f32,
+    /// Velocidad objetivo a la que tiende `time_scale`.
+    pub speed_target: f32,
+    /// Velocidad al inicio de la transición de velocidad actual.
+    pub speed_from: f32,
+    /// Progreso de la transición de velocidad: 1.0 = ya en el objetivo.
+    pub speed_blend: f32,
 }
 
 impl Default for SimParams {
@@ -292,6 +307,11 @@ impl Default for SimParams {
                 same_repel_others: false,
                 same_repel_strength: 0.5,
             },
+            speed_smooth: true,
+            speed_transition_duration: 1.0,
+            speed_target: 1.0,
+            speed_from: 1.0,
+            speed_blend: 1.0,
         }
     }
 }
@@ -358,6 +378,33 @@ impl SimParams {
         }
     }
 
+    /// Fija una nueva velocidad objetivo. Si la velocidad suave está activa,
+    /// arranca una transición desde la velocidad actual; si no, salta.
+    pub fn set_speed(&mut self, target: f32) {
+        self.speed_target = target.max(0.0);
+        if self.speed_smooth {
+            self.speed_from = self.time_scale;
+            self.speed_blend = 0.0;
+        } else {
+            self.time_scale = self.speed_target;
+            self.speed_blend = 1.0;
+        }
+    }
+
+    /// Avanza la transición de velocidad y actualiza `time_scale` (la velocidad
+    /// efectiva que usa la física). Suavizado ease-in-out, como las demás.
+    pub fn advance_speed(&mut self, seconds: f32) {
+        if self.speed_blend < 1.0 {
+            self.speed_blend = (self.speed_blend
+                + seconds.max(0.0) / self.speed_transition_duration.max(0.05))
+            .min(1.0);
+            let t = self.speed_blend * self.speed_blend * (3.0 - 2.0 * self.speed_blend);
+            self.time_scale = self.speed_from + (self.speed_target - self.speed_from) * t;
+        } else {
+            self.time_scale = self.speed_target;
+        }
+    }
+
     /// Rellena la matriz con coeficientes aleatorios en [-1, 1].
     pub fn randomize_matrix(&mut self, rng: &mut impl Rng) {
         for i in 0..NUM_COLORS {
@@ -365,5 +412,32 @@ impl SimParams {
                 self.matrix[i][j] = rng.gen_range(-1.0..=1.0);
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn speed_smooth_converges_to_target() {
+        let mut p = SimParams::default();
+        p.speed_smooth = true;
+        p.speed_transition_duration = 1.0;
+        p.set_speed(0.1); // 100% -> 10%
+        assert!((p.time_scale - 1.0).abs() < 1e-6, "arranca en el valor actual");
+        // ~1.2 s a 60 fps debe alcanzar el objetivo (blend llega a 1).
+        for _ in 0..72 {
+            p.advance_speed(1.0 / 60.0);
+        }
+        assert!((p.time_scale - 0.1).abs() < 1e-3, "llega a 10%: {}", p.time_scale);
+    }
+
+    #[test]
+    fn speed_instant_when_not_smooth() {
+        let mut p = SimParams::default();
+        p.speed_smooth = false;
+        p.set_speed(2.5);
+        assert!((p.time_scale - 2.5).abs() < 1e-6);
     }
 }

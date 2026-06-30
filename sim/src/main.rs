@@ -176,11 +176,8 @@ fn apply_local_event(
         PanelEvent::Step => *step_once = true,
         PanelEvent::Clear => sim.clear(),
         PanelEvent::Fill(n) => sim.spawn_random(n, rng),
-        PanelEvent::RandomizeMatrix(snap) => {
-            params.randomize_matrix(rng);
-            params.start_transition(snap);
-        }
         PanelEvent::StartTransition(snap) => params.start_transition(snap),
+        PanelEvent::SetSpeed(v) => params.set_speed(v),
         PanelEvent::FitCanvas => {
             st.zoom_level = (screen_width() / world.x)
                 .min(screen_height() / world.y)
@@ -231,6 +228,10 @@ async fn main() {
         let aspect = screen_width() / screen_height();
         let world = Vec2::new(st.canvas_size * aspect, st.canvas_size);
         sim.world = world;
+
+        // La velocidad transita de forma suave hacia su objetivo (aunque esté
+        // en pausa, para que al reanudar ya esté en el valor pedido).
+        params.advance_speed(get_frame_time());
 
         // Física.
         if !st.paused || step_once {
@@ -284,6 +285,12 @@ async fn main() {
                         let mut p = state.params;
                         p.blend = params.blend;
                         p.from_state = params.from_state;
+                        // La transición de velocidad la conduce el sim; el panel
+                        // solo fija el objetivo vía evento SetSpeed.
+                        p.time_scale = params.time_scale;
+                        p.speed_target = params.speed_target;
+                        p.speed_from = params.speed_from;
+                        p.speed_blend = params.speed_blend;
                         if params.gradual {
                             p.matrix = params.matrix;
                         }
@@ -354,6 +361,7 @@ async fn main() {
                     particle_count: sim.particles.len(),
                     fps: get_fps(),
                     blend: params.blend,
+                    time_scale: params.time_scale,
                     matrix: params.matrix,
                     canvas_size: st.canvas_size,
                     zoom_level: st.zoom_level,

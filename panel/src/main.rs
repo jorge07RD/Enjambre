@@ -136,12 +136,16 @@ impl PanelApp {
                 particle_count,
                 fps,
                 blend,
+                time_scale,
                 matrix,
                 ..
             } => {
                 self.st.particle_count = particle_count;
                 self.st.fps = fps;
                 self.params.blend = blend;
+                // Velocidad efectiva real, para mostrar el % en vivo (el sim es
+                // quien conduce la transición de velocidad).
+                self.params.time_scale = time_scale;
                 // La matriz a la deriva (modo `gradual`) la manda el sim; solo
                 // entonces la reflejamos, para no pisar las ediciones manuales.
                 if self.params.gradual {

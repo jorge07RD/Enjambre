@@ -59,10 +59,10 @@ pub enum PanelEvent {
     Clear,
     /// Llenar aleatoriamente con N partículas.
     Fill(usize),
-    /// Aleatorizar la matriz (con el rng del `sim`) y transicionar desde `snap`.
-    RandomizeMatrix(InteractionSnapshot),
     /// Iniciar transición de interacción desde `snap` (cambio de modo, etc.).
     StartTransition(InteractionSnapshot),
+    /// Fijar una nueva velocidad objetivo (transición suave si está activa).
+    SetSpeed(f32),
     /// Ajustar el zoom para que el lienzo entre en la ventana.
     FitCanvas,
     /// Igualar el lienzo a los píxeles de la ventana de simulación (1:1).
@@ -119,7 +119,43 @@ pub fn config_panel(
                 events.push(PanelEvent::Clear);
             }
         });
-        ui.add(egui::Slider::new(&mut params.time_scale, 0.0..=3.0).text("Velocidad"));
+        // --- Velocidad (en %, con cambio suave y atajos rápidos) ---
+        ui.checkbox(&mut params.speed_smooth, "Cambio de velocidad suave");
+        if params.speed_smooth {
+            ui.add(
+                egui::Slider::new(&mut params.speed_transition_duration, 0.1..=10.0)
+                    .logarithmic(true)
+                    .text("Duración cambio (s)"),
+            );
+        }
+        let mut pct = params.speed_target * 100.0;
+        if ui
+            .add(
+                egui::Slider::new(&mut pct, 0.0..=300.0)
+                    .suffix(" %")
+                    .text("Velocidad"),
+            )
+            .changed()
+        {
+            params.speed_target = pct / 100.0; // evita que el slider rebote
+            events.push(PanelEvent::SetSpeed(pct / 100.0));
+        }
+        // Botones rápidos del 10 % al 100 %.
+        ui.horizontal_wrapped(|ui| {
+            for p in (10..=100).step_by(10) {
+                let v = p as f32 / 100.0;
+                let selected = (params.speed_target - v).abs() < 1e-3;
+                if ui.selectable_label(selected, format!("{p}%")).clicked() {
+                    params.speed_target = v;
+                    events.push(PanelEvent::SetSpeed(v));
+                }
+            }
+        });
+        ui.label(format!(
+            "Actual: {:.0}%  ·  objetivo: {:.0}%",
+            params.time_scale * 100.0,
+            params.speed_target * 100.0
+        ));
 
         ui.separator();
         ui.heading("Llenar aleatorio");
@@ -199,7 +235,6 @@ pub fn config_panel(
         let snap_before = params.current_snapshot();
         let old_mode = params.mode;
         let mut trigger = false;
-        let mut randomized = false;
 
         ui.horizontal_wrapped(|ui| {
             ui.selectable_value(&mut params.mode, InteractionMode::SameColorOnly, "Mismo color");
@@ -230,7 +265,10 @@ pub fn config_panel(
         }
         if params.mode == InteractionMode::Matrix {
             if ui.button("🎲 Aleatorizar reglas").clicked() {
-                randomized = true;
+                // La matriz es propiedad del panel: la aleatorizamos aquí mismo
+                // para que el nuevo estado fluya al `sim` por `State` y no lo
+                // pise el eco de la matriz anterior (bug en modo separado).
+                params.randomize_matrix(&mut ::rand::thread_rng());
                 trigger = true;
             }
             ui.label("Fila = recibe · Columna = ejerce");
@@ -271,9 +309,7 @@ pub fn config_panel(
         if params.mode != old_mode {
             trigger = true;
         }
-        if randomized {
-            events.push(PanelEvent::RandomizeMatrix(snap_before));
-        } else if trigger {
+        if trigger {
             events.push(PanelEvent::StartTransition(snap_before));
         }
 
