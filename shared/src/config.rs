@@ -1,5 +1,5 @@
-use macroquad::prelude::Color;
 use rand::Rng;
+use serde::{Deserialize, Serialize};
 
 /// Número de "tipos" discretos de color (para los modos de matriz / mismo color
 /// y para los botones de la paleta). El color real de cada partícula es un
@@ -13,25 +13,26 @@ pub fn hue_for_index(i: usize) -> f32 {
     i as f32 / NUM_COLORS as f32
 }
 
-/// Convierte un matiz [0,1) en color RGB vivo (HSV con s=v=1).
-pub fn color_for_hue(h: f32) -> Color {
+/// Convierte un matiz [0,1) en color RGB vivo (HSV con s=v=1). Devuelve los
+/// canales `[r, g, b]` en [0,1] para no depender de ningún tipo gráfico
+/// concreto (macroquad o egui los envuelven a su gusto).
+pub fn color_for_hue(h: f32) -> [f32; 3] {
     let h6 = h.rem_euclid(1.0) * 6.0;
     let i = h6.floor() as i32;
     let f = h6 - i as f32;
-    let (r, g, b) = match i.rem_euclid(6) {
-        0 => (1.0, f, 0.0),
-        1 => (1.0 - f, 1.0, 0.0),
-        2 => (0.0, 1.0, f),
-        3 => (0.0, 1.0 - f, 1.0),
-        4 => (f, 0.0, 1.0),
-        _ => (1.0, 0.0, 1.0 - f),
-    };
-    Color::new(r, g, b, 1.0)
+    match i.rem_euclid(6) {
+        0 => [1.0, f, 0.0],
+        1 => [1.0 - f, 1.0, 0.0],
+        2 => [0.0, 1.0, f],
+        3 => [0.0, 1.0 - f, 1.0],
+        4 => [f, 0.0, 1.0],
+        _ => [1.0, 0.0, 1.0 - f],
+    }
 }
 
 /// Colores de la paleta (uno por tipo discreto), para la interfaz.
-pub fn palette() -> [Color; NUM_COLORS] {
-    let mut p = [Color::new(0.0, 0.0, 0.0, 1.0); NUM_COLORS];
+pub fn palette() -> [[f32; 3]; NUM_COLORS] {
+    let mut p = [[0.0f32; 3]; NUM_COLORS];
     for i in 0..NUM_COLORS {
         p[i] = color_for_hue(hue_for_index(i));
     }
@@ -55,7 +56,7 @@ pub fn hue_distance(a: f32, b: f32) -> f32 {
 }
 
 /// Modo de interacción entre colores.
-#[derive(Clone, Copy, PartialEq)]
+#[derive(Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub enum InteractionMode {
     /// Solo el mismo tipo de color se atrae.
     SameColorOnly,
@@ -64,17 +65,36 @@ pub enum InteractionMode {
     /// Por similitud: cuanto más parecido el matiz, más atracción; los muy
     /// distintos se repelen. (El naranja se siente atraído por rojo y amarillo.)
     Similarity,
+    /// Cíclico (piedra-papel-tijera): cada color persigue al siguiente de la
+    /// rueda y huye del anterior. Surgen persecuciones, espirales y ondas.
+    Cyclic,
+    /// Opuestos se atraen: los matices complementarios (opuestos en la rueda)
+    /// se atraen y los parecidos se repelen.
+    Opposite,
+    /// Depredador–presa: los colores pares cazan a los impares (y estos huyen);
+    /// cada bando se mantiene cohesionado. Manadas que se desplazan.
+    PredatorPrey,
+    /// Repulsión propia / atracción ajena: el mismo color se repele y los
+    /// distintos se atraen. Espumas y mosaicos homogéneos.
+    SelfRepel,
 }
 
 /// Comportamiento en los bordes del lienzo.
-#[derive(Clone, Copy, PartialEq)]
+#[derive(Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub enum Boundary {
     Wrap,
     Bounce,
 }
 
+/// Modo de la brocha de pintado en el lienzo.
+#[derive(Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub enum Brush {
+    Add,
+    Erase,
+}
+
 /// Aspecto visual de cada punto.
-#[derive(Clone, Copy, PartialEq)]
+#[derive(Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub enum RenderStyle {
     /// Disco de brillo radial (cuanto más grande/solapado, más brilla).
     Glow,
@@ -111,12 +131,54 @@ fn coef_raw(
             let dh = hue_distance(hue_a, hue_b);
             (1.0 - dh / sim_range.max(1e-3)).clamp(-1.0, 1.0)
         }
+        InteractionMode::Cyclic => {
+            // Persigue al siguiente color de la rueda, huye del anterior y se
+            // agrupa un poco con su propio color.
+            let a = hue_bucket(hue_a);
+            let b = hue_bucket(hue_b);
+            let n = NUM_COLORS;
+            if a == b {
+                0.6
+            } else if b == (a + 1) % n {
+                1.0
+            } else if b == (a + n - 1) % n {
+                -1.0
+            } else {
+                0.0
+            }
+        }
+        InteractionMode::Opposite => {
+            // dh ∈ [0, 0.5]: parecidos (dh≈0) se repelen, complementarios
+            // (dh≈0.5) se atraen, con el cruce neutro en el cuarto de rueda.
+            let dh = hue_distance(hue_a, hue_b);
+            (dh * 4.0 - 1.0).clamp(-1.0, 1.0)
+        }
+        InteractionMode::PredatorPrey => {
+            // Dos bandos según la paridad del tipo: los pares (depredadores)
+            // cazan a los impares (presas) y estos huyen; cada bando se cohesiona.
+            let a = hue_bucket(hue_a);
+            let b = hue_bucket(hue_b);
+            if a % 2 == b % 2 {
+                0.5
+            } else if a % 2 == 0 {
+                1.0
+            } else {
+                -1.0
+            }
+        }
+        InteractionMode::SelfRepel => {
+            if hue_bucket(hue_a) == hue_bucket(hue_b) {
+                -1.0
+            } else {
+                0.5
+            }
+        }
     }
 }
 
 /// Instantánea de la configuración de interacción, para congelar el estado de
 /// origen al iniciar una transición y poder mezclar de forma continua.
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Serialize, Deserialize)]
 pub struct InteractionSnapshot {
     pub mode: InteractionMode,
     pub matrix: [[f32; NUM_COLORS]; NUM_COLORS],
@@ -141,7 +203,7 @@ impl InteractionSnapshot {
 }
 
 /// Parámetros ajustables de la simulación.
-#[derive(Clone)]
+#[derive(Clone, Serialize, Deserialize)]
 pub struct SimParams {
     pub force: f32,
     pub r_max: f32,
@@ -190,6 +252,21 @@ pub struct SimParams {
     pub blend: f32,
     /// Configuración de interacción congelada al iniciar la transición (origen).
     pub from_state: InteractionSnapshot,
+
+    // --- Velocidad suave ---
+    // `time_scale` es la velocidad EFECTIVA que usa la física; transita de forma
+    // suave hacia `speed_target` (el valor que pide el usuario con el slider o
+    // los botones de %). El resto son el estado de esa transición.
+    /// Si está activo, los cambios de velocidad se interpolan en vez de saltar.
+    pub speed_smooth: bool,
+    /// Duración (s) de la transición de velocidad.
+    pub speed_transition_duration: f32,
+    /// Velocidad objetivo a la que tiende `time_scale`.
+    pub speed_target: f32,
+    /// Velocidad al inicio de la transición de velocidad actual.
+    pub speed_from: f32,
+    /// Progreso de la transición de velocidad: 1.0 = ya en el objetivo.
+    pub speed_blend: f32,
 }
 
 impl Default for SimParams {
@@ -230,6 +307,11 @@ impl Default for SimParams {
                 same_repel_others: false,
                 same_repel_strength: 0.5,
             },
+            speed_smooth: true,
+            speed_transition_duration: 1.0,
+            speed_target: 1.0,
+            speed_from: 1.0,
+            speed_blend: 1.0,
         }
     }
 }
@@ -296,6 +378,33 @@ impl SimParams {
         }
     }
 
+    /// Fija una nueva velocidad objetivo. Si la velocidad suave está activa,
+    /// arranca una transición desde la velocidad actual; si no, salta.
+    pub fn set_speed(&mut self, target: f32) {
+        self.speed_target = target.max(0.0);
+        if self.speed_smooth {
+            self.speed_from = self.time_scale;
+            self.speed_blend = 0.0;
+        } else {
+            self.time_scale = self.speed_target;
+            self.speed_blend = 1.0;
+        }
+    }
+
+    /// Avanza la transición de velocidad y actualiza `time_scale` (la velocidad
+    /// efectiva que usa la física). Suavizado ease-in-out, como las demás.
+    pub fn advance_speed(&mut self, seconds: f32) {
+        if self.speed_blend < 1.0 {
+            self.speed_blend = (self.speed_blend
+                + seconds.max(0.0) / self.speed_transition_duration.max(0.05))
+            .min(1.0);
+            let t = self.speed_blend * self.speed_blend * (3.0 - 2.0 * self.speed_blend);
+            self.time_scale = self.speed_from + (self.speed_target - self.speed_from) * t;
+        } else {
+            self.time_scale = self.speed_target;
+        }
+    }
+
     /// Rellena la matriz con coeficientes aleatorios en [-1, 1].
     pub fn randomize_matrix(&mut self, rng: &mut impl Rng) {
         for i in 0..NUM_COLORS {
@@ -303,5 +412,32 @@ impl SimParams {
                 self.matrix[i][j] = rng.gen_range(-1.0..=1.0);
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn speed_smooth_converges_to_target() {
+        let mut p = SimParams::default();
+        p.speed_smooth = true;
+        p.speed_transition_duration = 1.0;
+        p.set_speed(0.1); // 100% -> 10%
+        assert!((p.time_scale - 1.0).abs() < 1e-6, "arranca en el valor actual");
+        // ~1.2 s a 60 fps debe alcanzar el objetivo (blend llega a 1).
+        for _ in 0..72 {
+            p.advance_speed(1.0 / 60.0);
+        }
+        assert!((p.time_scale - 0.1).abs() < 1e-3, "llega a 10%: {}", p.time_scale);
+    }
+
+    #[test]
+    fn speed_instant_when_not_smooth() {
+        let mut p = SimParams::default();
+        p.speed_smooth = false;
+        p.set_speed(2.5);
+        assert!((p.time_scale - 2.5).abs() < 1e-6);
     }
 }

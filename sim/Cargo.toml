@@ -1,0 +1,15 @@
+[package]
+name = "sim"
+version.workspace = true
+edition.workspace = true
+
+[[bin]]
+name = "sim"
+path = "src/main.rs"
+
+[dependencies]
+shared = { path = "../shared" }
+macroquad = "0.4"
+egui-macroquad = "0.17"
+rand.workspace = true
+rayon = "1"

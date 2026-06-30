@@ -1,6 +1,6 @@
-use crate::config::{color_for_hue, RenderStyle, SimParams};
 use crate::simulation::Simulation;
 use macroquad::prelude::*;
+use shared::{color_for_hue, RenderStyle, SimParams};
 
 /// Partículas por lote de dibujo. Se mantiene por debajo de los límites
 /// internos del batcher de macroquad para `draw_mesh`.
@@ -55,8 +55,8 @@ impl Renderer {
 
             for p in chunk {
                 let base = verts.len() as u16;
-                let mut c = color_for_hue(p.hue);
-                c.a = alpha;
+                let [r, g, b] = color_for_hue(p.hue);
+                let c = Color::new(r, g, b, alpha);
                 let (x, y) = (p.pos.x, p.pos.y);
                 verts.push(Vertex::new(x - s, y - s, 0.0, 0.0, 0.0, c));
                 verts.push(Vertex::new(x + s, y - s, 0.0, 1.0, 0.0, c));
