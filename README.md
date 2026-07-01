@@ -156,6 +156,8 @@ cargo test -p sim --release throughput -- --nocapture
 > XDG**; en Hyprland instala `xdg-desktop-portal` + un backend (p. ej. `xdg-desktop-portal-gtk`
 > o `-hyprland`). Sin portal, se guarda en el directorio actual.
 
+![Recuadro de encuadre 9:16 con rejilla de tercios sobre el lienzo, y el panel de control](docs/img/06-encuadre.png)
+
 ## Estructura del código
 
 | Archivo | Responsabilidad |
