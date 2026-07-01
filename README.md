@@ -104,6 +104,10 @@ programe explícitamente.
 - 🎵 **Reactivo al audio:** el sonido del micrófono/entrada modula la **velocidad**, la **fuerza**
   o el **brillo**; el enjambre "baila" con la música. Usa `ffmpeg` (PulseAudio/PipeWire o ALSA);
   si no hay entrada, la opción simplemente no hace nada.
+- ✍️ **Formar texto e imágenes:** escribe un mensaje o importa un PNG (logo/emoji/silueta) y las
+  partículas se agrupan para formarlo. Slider de **fijación** (de "texto vivo" que respira a
+  "nítido" para leerse claro), opción de **teñir** de un color o mantener el arcoíris, y botón
+  **Soltar** para liberar el enjambre. Cuantas más partículas, más legible.
 
 ![Modo "matriz": clústeres orgánicos mezclando colores según la tabla 6×6](docs/img/02-matriz.png)
 

@@ -369,6 +369,15 @@ pub struct SimParams {
     /// `true` = repele (espanta); `false` = atrae.
     pub pointer_repel: bool,
 
+    // --- Formar texto / imagen ---
+    /// "Fijación" de la forma: 0 = las partículas fluyen con la física (texto
+    /// vivo), 1 = se fijan nítidas en la forma. Solo actúa si hay una forma.
+    pub shape_strength: f32,
+    /// Teñir la forma de un color en vez de mantener los colores actuales.
+    pub shape_tint: bool,
+    /// Índice de color de la paleta para el tinte de la forma.
+    pub shape_color: usize,
+
     // --- Reactivo al audio ---
     /// Si está activo, el audio del micrófono modula un parámetro.
     pub audio_reactive: bool,
@@ -441,6 +450,9 @@ impl Default for SimParams {
             audio_reactive: false,
             audio_target: AudioTarget::Speed,
             audio_intensity: 1.0,
+            shape_strength: 0.5,
+            shape_tint: false,
+            shape_color: 0,
         }
     }
 }
@@ -574,6 +586,7 @@ impl SimParams {
         self.pointer_strength = l(from.pointer_strength, target.pointer_strength);
         self.pointer_radius = l(from.pointer_radius, target.pointer_radius);
         self.audio_intensity = l(from.audio_intensity, target.audio_intensity);
+        self.shape_strength = l(from.shape_strength, target.shape_strength);
     }
 
     /// Rellena la matriz con coeficientes aleatorios en [-1, 1].

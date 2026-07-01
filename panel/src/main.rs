@@ -232,6 +232,21 @@ impl eframe::App for PanelApp {
                             self.st.video_dir = dir.to_string_lossy().into_owned();
                         }
                     }
+                    // El diálogo de imagen se abre aquí; la ruta viaja al sim, que
+                    // es quien genera los puntos meta de la forma.
+                    PanelEvent::FormImagePick => {
+                        if let Some(path) = rfd::FileDialog::new()
+                            .add_filter("Imagen", &["png", "jpg", "jpeg", "webp", "bmp"])
+                            .pick_file()
+                        {
+                            let _ = write_msg(
+                                &mut self.write_stream,
+                                &ControlMsg::Event(PanelEvent::FormImagePath(
+                                    path.to_string_lossy().into_owned(),
+                                )),
+                            );
+                        }
+                    }
                     _ => {
                         if matches!(ev, PanelEvent::Reattach) {
                             closing = true;

@@ -142,6 +142,130 @@ fn record_camera(rt: &RenderTarget, center: Vec2, w: f32, h: f32) -> Camera2D {
     cam
 }
 
+/// Convierte una imagen RGBA en una nube de puntos meta (mundo) para que las
+/// partículas la formen. Marca "encendido" por alfa (siluetas/emoji con
+/// transparencia) o, si la imagen es opaca, por luminancia. Submuestrea a
+/// `count` puntos y ajusta la caja al lienzo con margen, preservando el aspecto.
+/// `flip_y` compensa la orientación (los RT se leen de abajo a arriba).
+fn image_to_points(
+    img: &Image,
+    flip_y: bool,
+    world: Vec2,
+    count: usize,
+    rng: &mut impl Rng,
+) -> Vec<Vec2> {
+    let w = img.width as usize;
+    let h = img.height as usize;
+    if w == 0 || h == 0 {
+        return Vec::new();
+    }
+    let bytes = &img.bytes;
+    let total = w * h;
+
+    // ¿La imagen usa transparencia de forma significativa? (muestreo rápido)
+    let mut transparent = 0usize;
+    let mut sampled = 0usize;
+    let mut i = 0;
+    while i < total {
+        if bytes[i * 4 + 3] < 250 {
+            transparent += 1;
+        }
+        sampled += 1;
+        i += 7;
+    }
+    let use_alpha = transparent * 20 > sampled; // >5% de píxeles con alfa parcial
+
+    let mut on: Vec<(usize, usize)> = Vec::new();
+    for py in 0..h {
+        for px in 0..w {
+            let idx = (py * w + px) * 4;
+            let hit = if use_alpha {
+                bytes[idx + 3] > 128
+            } else {
+                let lum = 0.299 * bytes[idx] as f32
+                    + 0.587 * bytes[idx + 1] as f32
+                    + 0.114 * bytes[idx + 2] as f32;
+                lum > 128.0
+            };
+            if hit {
+                on.push((px, py));
+            }
+        }
+    }
+    if on.is_empty() {
+        return Vec::new();
+    }
+
+    // Submuestreo aleatorio (Fisher–Yates parcial) hasta `count`.
+    let count = count.max(1);
+    if on.len() > count {
+        for k in 0..count {
+            let j = rng.gen_range(k..on.len());
+            on.swap(k, j);
+        }
+        on.truncate(count);
+    }
+
+    let iw = w as f32;
+    let ih = h as f32;
+    let scale = (world.x * 0.9 / iw).min(world.y * 0.9 / ih);
+    let center = world * 0.5;
+    on.iter()
+        .map(|&(px, py)| {
+            let sx = (px as f32 + 0.5) / iw;
+            let mut sy = (py as f32 + 0.5) / ih;
+            if flip_y {
+                sy = 1.0 - sy;
+            }
+            Vec2::new(
+                center.x + (sx - 0.5) * iw * scale,
+                center.y + (sy - 0.5) * ih * scale,
+            )
+        })
+        .collect()
+}
+
+/// Rasteriza `text` a un `render_target` y devuelve sus puntos meta (mundo).
+fn text_to_points(text: &str, world: Vec2, count: usize, rng: &mut impl Rng) -> Vec<Vec2> {
+    let font_size: u16 = 180;
+    let dims = measure_text(text, None, font_size, 1.0);
+    let pad = 24.0;
+    let w = (dims.width + pad * 2.0).ceil().max(8.0) as u32;
+    let h = (font_size as f32 + pad * 2.0).ceil() as u32;
+    let rt = render_target(w, h);
+    rt.texture.set_filter(FilterMode::Linear);
+    let mut cam = Camera2D::from_display_rect(Rect::new(0.0, 0.0, w as f32, h as f32));
+    cam.render_target = Some(rt.clone());
+    set_camera(&cam);
+    clear_background(Color::new(0.0, 0.0, 0.0, 0.0));
+    draw_text(text, pad, pad + dims.offset_y, font_size as f32, WHITE);
+    set_default_camera();
+    let img = rt.texture.get_texture_data();
+    image_to_points(&img, false, world, count, rng)
+}
+
+/// Carga una imagen de disco y la forma con las partículas (con tinte opcional).
+fn form_image(path: &std::path::Path, sim: &mut Simulation, params: &SimParams, rng: &mut impl Rng) {
+    let bytes = match std::fs::read(path) {
+        Ok(b) => b,
+        Err(e) => {
+            eprintln!("No pude abrir la imagen: {e}");
+            return;
+        }
+    };
+    match Image::from_file_with_format(&bytes, None) {
+        Ok(img) => {
+            let count = (sim.particles.len() * 7 / 10).max(1);
+            let pts = image_to_points(&img, false, sim.world, count, rng);
+            sim.set_shape(pts);
+            if params.shape_tint {
+                sim.tint_shape(hue_for_index(params.shape_color));
+            }
+        }
+        Err(e) => eprintln!("No pude decodificar la imagen: {e}"),
+    }
+}
+
 struct Recorder {
     child: std::process::Child,
     stdin: std::process::ChildStdin,
@@ -419,7 +543,11 @@ fn apply_local_event(
         | PanelEvent::NextScene
         | PanelEvent::PrevScene
         | PanelEvent::ExportScenes
-        | PanelEvent::ImportScenes => {}
+        | PanelEvent::ImportScenes
+        | PanelEvent::FormText(_)
+        | PanelEvent::FormImagePick
+        | PanelEvent::FormImagePath(_)
+        | PanelEvent::ReleaseShape => {}
     }
 }
 
@@ -910,6 +1038,28 @@ async fn main() {
                     }
                     scenes_dirty = true;
                 }
+                PanelEvent::FormText(text) => {
+                    // Solo una parte de las partículas forma el texto (en el
+                    // centro); el resto sigue con la animación del modo.
+                    let count = (sim.particles.len() * 7 / 10).max(1);
+                    let pts = text_to_points(&text, sim.world, count, &mut rng);
+                    sim.set_shape(pts);
+                    if params.shape_tint {
+                        sim.tint_shape(hue_for_index(params.shape_color));
+                    }
+                }
+                PanelEvent::FormImagePick => {
+                    if let Some(path) = rfd::FileDialog::new()
+                        .add_filter("Imagen", &["png", "jpg", "jpeg", "webp", "bmp"])
+                        .pick_file()
+                    {
+                        form_image(&path, &mut sim, &params, &mut rng);
+                    }
+                }
+                PanelEvent::FormImagePath(path) => {
+                    form_image(std::path::Path::new(&path), &mut sim, &params, &mut rng);
+                }
+                PanelEvent::ReleaseShape => sim.clear_shape(),
                 other => apply_local_event(
                     other,
                     &mut sim,

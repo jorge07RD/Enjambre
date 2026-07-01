@@ -29,6 +29,9 @@ pub struct PanelState {
     /// Carpeta de guardado de los vídeos (vacío = directorio de trabajo).
     pub video_dir: String,
 
+    /// Texto en edición para formar con las partículas.
+    pub shape_text: String,
+
     // --- Escenas ---
     /// Nombre en edición para guardar una escena nueva.
     pub scene_name_input: String,
@@ -71,6 +74,7 @@ impl Default for PanelState {
             zoom_level: 1.0,
             paused: false,
             video_dir: String::new(),
+            shape_text: String::new(),
             scene_name_input: String::new(),
             scene_smooth: true,
             scene_transition_duration: 3.0,
@@ -135,6 +139,15 @@ pub enum PanelEvent {
     Detach,
     /// Volver a acoplar el panel dentro de la ventana de simulación.
     Reattach,
+    /// Formar un texto con las partículas.
+    FormText(String),
+    /// Abrir un diálogo para elegir una imagen y formarla.
+    FormImagePick,
+    /// Formar la imagen del fichero indicado (lo emite el panel separado tras
+    /// abrir su propio diálogo).
+    FormImagePath(String),
+    /// Soltar la forma actual (volver al modo de interacción).
+    ReleaseShape,
 }
 
 fn egui_color(c: [f32; 3]) -> egui::Color32 {
@@ -639,6 +652,41 @@ pub fn config_panel(
             ui.add(egui::Slider::new(&mut st.brush_size, 2.0..=60.0).text("Brocha"));
             ui.label("Click/arrastra en el lienzo para pintar o borrar.");
         }
+
+        ui.separator();
+        ui.heading("Mensaje / Forma");
+        ui.horizontal(|ui| {
+            ui.text_edit_singleline(&mut st.shape_text);
+            if ui.button("✍ Formar texto").clicked() && !st.shape_text.trim().is_empty() {
+                events.push(PanelEvent::FormText(st.shape_text.clone()));
+            }
+        });
+        ui.horizontal(|ui| {
+            if ui.button("🖼 Importar imagen…").clicked() {
+                events.push(PanelEvent::FormImagePick);
+            }
+            if ui.button("💨 Soltar").clicked() {
+                events.push(PanelEvent::ReleaseShape);
+            }
+        });
+        ui.add(egui::Slider::new(&mut params.shape_strength, 0.0..=1.0).text("Fijación"));
+        ui.checkbox(&mut params.shape_tint, "Teñir de un color");
+        if params.shape_tint {
+            ui.horizontal_wrapped(|ui| {
+                for i in 0..NUM_COLORS {
+                    let selected = params.shape_color == i;
+                    let label = if selected { "●" } else { "○" };
+                    if ui
+                        .add(egui::Button::new(label).fill(egui_color(palette[i])))
+                        .on_hover_text(COLOR_NAMES[i])
+                        .clicked()
+                    {
+                        params.shape_color = i;
+                    }
+                }
+            });
+        }
+        ui.label("Más partículas = forma más legible. «Soltar» las libera.");
     });
 
     events

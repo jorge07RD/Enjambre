@@ -21,6 +21,8 @@ pub struct Simulation {
     pub focus: Vec2,
     /// Posición (mundo) del cursor cuando la herramienta Fuerza está activa.
     pub pointer: Option<Vec2>,
+    /// Puntos meta (mundo) que forman un texto/imagen. `None` = sin forma.
+    pub shape: Option<Vec<Vec2>>,
     grid: Grid,
     /// Aceleraciones acumuladas por partícula (scratch reutilizado).
     forces: Vec<Vec2>,
@@ -33,6 +35,7 @@ impl Simulation {
             world,
             focus: world * 0.5,
             pointer: None,
+            shape: None,
             grid: Grid::new(),
             forces: Vec::new(),
         }
@@ -40,6 +43,27 @@ impl Simulation {
 
     pub fn clear(&mut self) {
         self.particles.clear();
+    }
+
+    /// Fija una forma (nube de puntos meta) hacia la que se agrupan las
+    /// partículas. Vacía = se ignora.
+    pub fn set_shape(&mut self, targets: Vec<Vec2>) {
+        self.shape = if targets.is_empty() { None } else { Some(targets) };
+    }
+
+    /// Suelta la forma actual (las partículas retoman el modo de interacción).
+    pub fn clear_shape(&mut self) {
+        self.shape = None;
+    }
+
+    /// Tiñe del matiz indicado solo las partículas que forman la forma actual
+    /// (las primeras `shape.len()`), dejando el resto con su color.
+    pub fn tint_shape(&mut self, hue: f32) {
+        let n = self.shape.as_ref().map_or(0, |t| t.len());
+        for p in self.particles.iter_mut().take(n) {
+            p.hue = hue;
+            p.target_hue = hue;
+        }
     }
 
     /// Llena el lienzo con `n` partículas de posición y color aleatorios.
@@ -154,6 +178,18 @@ impl Simulation {
         let ptr_radius2 = ptr_radius * ptr_radius;
         let ptr_sign = if params.pointer_repel { -1.0 } else { 1.0 };
         let ptr_gain = params.pointer_strength * 6.0;
+
+        // Forma (texto/imagen): solo las PRIMERAS `n_shape` partículas se agrupan
+        // en la forma (en el centro); el resto sigue con la animación del modo.
+        // Cada partícula de la forma recibe un resorte hacia su punto meta más una
+        // pizca de interacción residual (`shape_inter`) para un movimiento
+        // orgánico y tranquilo que deje leer el texto. La "fijación" sube la
+        // rigidez del resorte y baja la interacción residual.
+        let shape = self.shape.as_deref();
+        let n_shape = shape.map_or(0, |t| t.len());
+        let shape_fix = params.shape_strength.clamp(0.0, 1.0);
+        let shape_k = 0.02 + shape_fix * 0.38; // 0.02..0.4
+        let shape_inter = 0.35 * (1.0 - shape_fix); // interacción residual (0..0.35)
 
         // Bandada (Boids): física vectorial que sustituye a la fuerza radial.
         // Como Boids no usa el coeficiente escalar, no puede mezclarse con el
@@ -372,6 +408,26 @@ impl Simulation {
                         acc += (toward / d) * (ptr_sign * ptr_gain * falloff);
                     }
                 }
+
+                // Forma: solo las partículas asignadas (i < n_shape) van al texto;
+                // el resto conserva su `acc` normal (siguen la animación).
+                if i < n_shape {
+                    let tgt = shape.unwrap()[i];
+                    let mut pull = tgt - pi.pos;
+                    if wrap {
+                        if pull.x > half.x {
+                            pull.x -= world.x;
+                        } else if pull.x < -half.x {
+                            pull.x += world.x;
+                        }
+                        if pull.y > half.y {
+                            pull.y -= world.y;
+                        } else if pull.y < -half.y {
+                            pull.y += world.y;
+                        }
+                    }
+                    acc = acc * shape_inter + pull * shape_k;
+                }
                 *out = acc;
             });
         }
@@ -385,7 +441,8 @@ impl Simulation {
         // una partícula disparada a través de toda la pantalla.
         let max_speed = r_max;
         // Velocidad de crucero (bandada): rapidez mínima para que no se detenga.
-        // Escalada por `boids_mix` para que aparezca/desaparezca con la transición.
+        // Escalada por `boids_mix` (transición). No se aplica a las partículas de
+        // la forma (deben asentarse), lo que se decide por índice en la integración.
         let cruise = params.boids_cruise * boids_mix;
         // Durante la transición (mix>0) usamos el deslizamiento en las paredes en
         // vez del rebote elástico.
@@ -393,15 +450,17 @@ impl Simulation {
 
         self.particles
             .par_iter_mut()
+            .enumerate()
             .zip(forces.par_iter())
-            .for_each(|(p, &f)| {
+            .for_each(|((i, p), &f)| {
                 p.vel = p.vel * friction + f * force_gain * dt;
                 let speed = p.vel.length();
                 if speed > max_speed {
                     p.vel *= max_speed / speed;
                 }
                 // Crucero: mantener una rapidez mínima (murmuración que no se para).
-                if cruise > 0.0 {
+                // No se aplica a las partículas de la forma (deben asentarse).
+                if cruise > 0.0 && i >= n_shape {
                     let speed = p.vel.length();
                     if speed > 1e-4 {
                         if speed < cruise {
