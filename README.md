@@ -5,6 +5,25 @@ Miles de puntos de colores se mueven según reglas simples de atracción y repul
 y, a partir de ellas, emergen patrones complejos: enjambres, células, anillos,
 cadenas y estructuras que parecen vivas.
 
+## Demo
+
+Vídeo vertical **9:16** grabado desde la propia app (tecla `R`), como los que se suben a TikTok:
+
+<p align="center">
+  <img src="docs/img/demo.gif" width="300" alt="Demo animada: células orgánicas de partículas en formato vertical">
+</p>
+
+<p align="center">
+  <img src="docs/img/03-video-rosetas.png" width="220" alt="Rosetas de colores">
+  <img src="docs/img/04-video-flujo.png" width="220" alt="Estructuras orgánicas en flujo">
+  <img src="docs/img/05-video-denso.png" width="220" alt="Campo denso de células">
+</p>
+
+> ▶️ **Vídeo en alta calidad** (1080×1920, 120 fps): [`docs/img/demo.mp4`](docs/img/demo.mp4).
+> GitHub muestra un reproductor con la etiqueta de abajo; en otros visores, usa el enlace o el GIF.
+
+<video src="docs/img/demo.mp4" controls loop muted width="300"></video>
+
 ![Modo "mismo color": cada color se agrupa en anillos](docs/img/01-inicio.png)
 
 ## ¿Qué es esto?
