@@ -183,6 +183,10 @@ impl Simulation {
         let w_coh = params.boids_cohesion;
         let sep_r = (params.boids_sep_radius * r_max).max(1.0);
         let sep_r2 = sep_r * sep_r;
+        // Evasión entre grupos (repulsión de otros colores), solo en Híbrido/Por
+        // color; en "Todas" no hay grupos distintos que esquivar.
+        let group_avoid = !matches!(scope, BoidsScope::All);
+        let w_grp = params.boids_group_avoid;
         // Esquive de paredes (solo bandada + borde de rebote): en lugar de
         // rebotar como una pelota, los "pájaros" giran su vector al acercarse.
         let wall_avoid = need_boids && !wrap;
@@ -211,6 +215,7 @@ impl Simulation {
                 let mut sep_acc = Vec2::ZERO;
                 let mut ali_acc = Vec2::ZERO;
                 let mut coh_acc = Vec2::ZERO;
+                let mut grp_acc = Vec2::ZERO;
                 let mut flock_n = 0u32;
 
                 for dy in -1..=1 {
@@ -270,6 +275,12 @@ impl Simulation {
                                     coh_acc += d;
                                     flock_n += 1;
                                 }
+                                // Evasión de otros grupos: repulsión de los vecinos
+                                // de distinto color en todo el radio de percepción,
+                                // con caída lineal (más fuerte cuanto más cerca).
+                                if group_avoid && !same {
+                                    grp_acc -= d * ((1.0 - dist * inv_r_max) / dist);
+                                }
                             }
                             if need_radial {
                                 let r = dist * inv_r_max;
@@ -284,7 +295,7 @@ impl Simulation {
                 // Composición de las tres reglas de Boids en un acumulador aparte
                 // que luego se mezcla con la parte radial según `boids_mix`.
                 if need_boids {
-                    let mut b = sep_acc * w_sep;
+                    let mut b = sep_acc * w_sep + grp_acc * w_grp;
                     if flock_n > 0 {
                         let inv = 1.0 / flock_n as f32;
                         // Alineación: dirigir la velocidad hacia la media local.

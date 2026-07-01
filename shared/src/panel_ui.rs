@@ -408,10 +408,13 @@ pub fn config_panel(
                 params.trail_fade = 1.0 - length;
             }
         }
-        ui.checkbox(
-            &mut params.orient_to_velocity,
-            "Orientar según movimiento (flechas)",
-        );
+        let mut orient_on = params.orient > 0.5;
+        if ui
+            .checkbox(&mut orient_on, "Orientar según movimiento (flechas)")
+            .changed()
+        {
+            params.orient = if orient_on { 1.0 } else { 0.0 };
+        }
 
         ui.separator();
         ui.heading("Lienzo");
@@ -545,6 +548,12 @@ pub fn config_panel(
             ui.add(egui::Slider::new(&mut params.boids_separation, 0.0..=3.0).text("Separación"));
             ui.add(egui::Slider::new(&mut params.boids_alignment, 0.0..=3.0).text("Alineación"));
             ui.add(egui::Slider::new(&mut params.boids_cohesion, 0.0..=3.0).text("Cohesión"));
+            if params.boids_scope != BoidsScope::All {
+                ui.add(
+                    egui::Slider::new(&mut params.boids_group_avoid, 0.0..=3.0)
+                        .text("Evitar otros grupos"),
+                );
+            }
             ui.add(
                 egui::Slider::new(&mut params.boids_sep_radius, 0.1..=1.0)
                     .text("Radio de separación"),

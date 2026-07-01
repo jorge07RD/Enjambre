@@ -1149,7 +1149,7 @@ async fn main() {
                 WHITE,
                 DrawTextureParams {
                     dest_size: Some(vec2(sw, sh)),
-                    flip_y: true,
+                    flip_y: false,
                     ..Default::default()
                 },
             );

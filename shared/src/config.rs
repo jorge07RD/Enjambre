@@ -346,6 +346,9 @@ pub struct SimParams {
     pub boids_sep_radius: f32,
     /// Velocidad de crucero: rapidez mínima que mantienen los "pájaros" (0 = off).
     pub boids_cruise: f32,
+    /// Repulsión entre bandadas de distinto color (solo en ámbito Híbrido/Por
+    /// color): hace que los grupos se esquiven. 0 = sin evasión.
+    pub boids_group_avoid: f32,
 
     // --- Estelas de movimiento ---
     /// Si está activo, las partículas dejan rastro (buffer que se desvanece).
@@ -354,9 +357,9 @@ pub struct SimParams {
     pub trail_fade: f32,
 
     // --- Orientación de las partículas ---
-    /// Si está activo, cada partícula se dibuja como un triángulo orientado según
-    /// su velocidad (flechas), en vez de un disco.
-    pub orient_to_velocity: bool,
+    /// Mezcla disco↔flecha (0 = disco, 1 = triángulo orientado por la velocidad).
+    /// Es continuo para poder transicionar de forma fluida entre escenas.
+    pub orient: f32,
 
     // --- Fuerza con el ratón ---
     /// Intensidad de la fuerza del cursor (herramienta Fuerza).
@@ -428,9 +431,10 @@ impl Default for SimParams {
             boids_cohesion: 1.0,
             boids_sep_radius: 0.35,
             boids_cruise: 48.0,
+            boids_group_avoid: 0.8,
             trails: false,
             trail_fade: 0.12,
-            orient_to_velocity: false,
+            orient: 0.0,
             pointer_strength: 1.0,
             pointer_radius: 160.0,
             pointer_repel: true,
@@ -564,7 +568,9 @@ impl SimParams {
         self.boids_cohesion = l(from.boids_cohesion, target.boids_cohesion);
         self.boids_sep_radius = l(from.boids_sep_radius, target.boids_sep_radius);
         self.boids_cruise = l(from.boids_cruise, target.boids_cruise);
+        self.boids_group_avoid = l(from.boids_group_avoid, target.boids_group_avoid);
         self.trail_fade = l(from.trail_fade, target.trail_fade);
+        self.orient = l(from.orient, target.orient);
         self.pointer_strength = l(from.pointer_strength, target.pointer_strength);
         self.pointer_radius = l(from.pointer_radius, target.pointer_radius);
         self.audio_intensity = l(from.audio_intensity, target.audio_intensity);
