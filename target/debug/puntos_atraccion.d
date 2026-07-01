@@ -1,1 +1,0 @@
-/home/jorge/Projects/puntos_atraccion/target/debug/puntos_atraccion: /home/jorge/Projects/puntos_atraccion/src/config.rs /home/jorge/Projects/puntos_atraccion/src/grid.rs /home/jorge/Projects/puntos_atraccion/src/main.rs /home/jorge/Projects/puntos_atraccion/src/render.rs /home/jorge/Projects/puntos_atraccion/src/simulation.rs
