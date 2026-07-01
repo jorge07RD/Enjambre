@@ -42,6 +42,16 @@ pub fn palette() -> [[f32; 3]; NUM_COLORS] {
 pub const COLOR_NAMES: [&str; NUM_COLORS] =
     ["Rojo", "Amarillo", "Verde", "Cyan", "Azul", "Magenta"];
 
+/// Presets de resolución/relación de aspecto para el recuadro de grabación.
+/// Dimensiones pares (yuv420p las exige). El índice se guarda en `frame_preset`.
+pub const FRAME_PRESETS: [(&str, u32, u32); 5] = [
+    ("TikTok 9:16", 1080, 1920),
+    ("Reel 4:5", 1080, 1350),
+    ("Cuadrado 1:1", 1080, 1080),
+    ("Horizontal 16:9", 1920, 1080),
+    ("9:16 ligero", 720, 1280),
+];
+
 /// Tipo discreto al que pertenece un matiz (para los modos de matriz).
 #[inline]
 pub fn hue_bucket(h: f32) -> usize {
@@ -267,6 +277,13 @@ pub struct SimParams {
     pub speed_from: f32,
     /// Progreso de la transición de velocidad: 1.0 = ya en el objetivo.
     pub speed_blend: f32,
+
+    // --- Auto-aleatorizado de la matriz ---
+    /// Si está activo (y en modo Matriz), la matriz se aleatoriza sola cada
+    /// `auto_randomize_interval` segundos. El `sim` conduce el temporizador.
+    pub auto_randomize: bool,
+    /// Intervalo (s) entre aleatorizados automáticos de la matriz.
+    pub auto_randomize_interval: f32,
 }
 
 impl Default for SimParams {
@@ -312,6 +329,8 @@ impl Default for SimParams {
             speed_target: 1.0,
             speed_from: 1.0,
             speed_blend: 1.0,
+            auto_randomize: false,
+            auto_randomize_interval: 8.0,
         }
     }
 }

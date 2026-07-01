@@ -9,8 +9,8 @@ use ::rand::Rng;
 use render::Renderer;
 use shared::ipc::{read_msg, socket_path, write_msg};
 use shared::{
-    config_panel, hue_for_index, Brush, ControlMsg, ControlState, PanelEvent, PanelState, SimParams,
-    TelemetryMsg,
+    config_panel, hue_for_index, Brush, ControlMsg, ControlState, InteractionMode, PanelEvent,
+    PanelState, SimParams, TelemetryMsg, FRAME_PRESETS,
 };
 use simulation::Simulation;
 
@@ -51,17 +51,20 @@ fn make_camera(zoom: f32, target: Vec2) -> Camera2D {
 // aunque el volcado vaya más lento que el tiempo real.
 // ----------------------------------------------------------------------------
 
-const REC_W: u32 = 1080;
-const REC_H: u32 = 1920;
 const REC_FPS: i32 = 120;
 
-/// Cámara que encuadra el mundo en vertical (9:16) hacia el `render_target`,
-/// centrada en `target` y al mismo `zoom` que la vista en pantalla.
-fn record_camera(rt: &RenderTarget, zoom: f32, target: Vec2) -> Camera2D {
-    let vw = REC_W as f32 / zoom;
-    let vh = REC_H as f32 / zoom;
+/// Arrastre en curso del recuadro de encuadre.
+#[derive(Clone, Copy)]
+enum FrameDrag {
+    Move,
+    Resize,
+}
+
+/// Cámara que mapea el rectángulo de mundo del recuadro (centro + ancho/alto)
+/// al `render_target`, de modo que la grabación capture exactamente esa zona.
+fn record_camera(rt: &RenderTarget, center: Vec2, w: f32, h: f32) -> Camera2D {
     let mut cam =
-        Camera2D::from_display_rect(Rect::new(target.x - vw / 2.0, target.y - vh / 2.0, vw, vh));
+        Camera2D::from_display_rect(Rect::new(center.x - w / 2.0, center.y - h / 2.0, w, h));
     cam.render_target = Some(rt.clone());
     cam
 }
@@ -75,15 +78,21 @@ struct Recorder {
 }
 
 impl Recorder {
-    /// Arranca `ffmpeg` y el destino de render. Falla si `ffmpeg` no está.
-    fn start() -> std::io::Result<Recorder> {
-        let rt = render_target(REC_W, REC_H);
+    /// Arranca `ffmpeg` y el destino de render a la resolución `w×h`, guardando
+    /// en `dir` (o el directorio actual si está vacío). Falla si `ffmpeg` no está.
+    fn start(w: u32, h: u32, dir: &str) -> std::io::Result<Recorder> {
+        let rt = render_target(w, h);
         rt.texture.set_filter(FilterMode::Linear);
         let ts = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_secs())
             .unwrap_or(0);
-        let path = format!("enjambre_{ts}.mp4");
+        let name = format!("enjambre_{ts}.mp4");
+        let path = if dir.is_empty() {
+            name
+        } else {
+            format!("{}/{}", dir.trim_end_matches('/'), name)
+        };
         let mut child = std::process::Command::new("ffmpeg")
             .args([
                 "-y",
@@ -92,7 +101,7 @@ impl Recorder {
                 "-pix_fmt",
                 "rgba",
                 "-s",
-                &format!("{REC_W}x{REC_H}"),
+                &format!("{w}x{h}"),
                 "-r",
                 &REC_FPS.to_string(),
                 "-i",
@@ -114,7 +123,7 @@ impl Recorder {
             .stderr(std::process::Stdio::null())
             .spawn()?;
         let stdin = child.stdin.take().expect("stdin de ffmpeg");
-        eprintln!("● Grabando vídeo vertical en {path} (pulsa R para parar)");
+        eprintln!("● Grabando en {path} ({w}×{h}, pulsa R para parar)");
         Ok(Recorder {
             child,
             stdin,
@@ -268,6 +277,7 @@ fn control_state(params: &SimParams, st: &PanelState) -> ControlState {
         brush_size: st.brush_size,
         active_color: st.active_color,
         fill_count: st.fill_count,
+        video_dir: st.video_dir.clone(),
     }
 }
 
@@ -303,8 +313,15 @@ fn apply_local_event(
             st.zoom_level = 1.0;
             *pan_target = Vec2::new(screen_width(), screen_height()) * 0.5;
         }
-        // Los maneja el bucle principal (necesitan cambiar de modo o el grabador).
-        PanelEvent::Detach | PanelEvent::Reattach | PanelEvent::ToggleRecord => {}
+        // Los maneja el bucle principal (necesitan cambiar de modo, el grabador
+        // o el estado del recuadro de encuadre / carpeta de guardado).
+        PanelEvent::Detach
+        | PanelEvent::Reattach
+        | PanelEvent::ToggleRecord
+        | PanelEvent::ToggleFrame
+        | PanelEvent::SetFramePreset(_)
+        | PanelEvent::CenterFrame
+        | PanelEvent::PickVideoDir => {}
     }
 }
 
@@ -328,7 +345,15 @@ async fn main() {
 
     let mut mode = AppMode::Embedded;
     let mut rec: Option<Recorder> = None;
-    eprintln!("Pulsa R para grabar/parar un vídeo vertical 1080×1920 @ {REC_FPS} fps (TikTok).");
+    // Recuadro de encuadre de grabación (estado local, lo mueve el ratón).
+    let mut show_frame = false;
+    let mut frame_preset = 0usize;
+    let mut frame_center = pan_target;
+    let mut frame_height = screen_height() * 0.8;
+    let mut frame_drag: Option<FrameDrag> = None;
+    let mut video_dir = String::new();
+    let mut auto_rng_timer = 0.0f32;
+    eprintln!("Teclas: R grabar · G encuadre. Elige tamaño y carpeta en el panel.");
     let mut ipc: Option<Ipc> = None;
     let mut panel_was_connected = false;
     let mut init_sent = false;
@@ -350,6 +375,16 @@ async fn main() {
 
         // Física.
         if !st.paused || step_once {
+            // Auto-aleatorizado de la matriz cada X segundos (solo en modo Matriz).
+            if params.auto_randomize && params.mode == InteractionMode::Matrix {
+                auto_rng_timer += get_frame_time();
+                if auto_rng_timer >= params.auto_randomize_interval.max(0.2) {
+                    let snap = params.current_snapshot();
+                    params.randomize_matrix(&mut rng);
+                    params.start_transition(snap);
+                    auto_rng_timer = 0.0;
+                }
+            }
             sim.apply_dynamics(&mut params, &mut rng, get_frame_time());
             sim.step(&params);
             params.advance_transition(get_frame_time());
@@ -359,7 +394,14 @@ async fn main() {
         let mut want_pointer = false;
         let mut want_keyboard = false;
         let mut events: Vec<PanelEvent> = Vec::new();
+        let (preset_w, preset_h) = (FRAME_PRESETS[frame_preset].1, FRAME_PRESETS[frame_preset].2);
+        let frame_aspect = preset_w as f32 / preset_h as f32;
         st.recording = rec.is_some();
+        st.show_frame = show_frame;
+        st.frame_preset = frame_preset;
+        st.frame_w = preset_w;
+        st.frame_h = preset_h;
+        st.video_dir = video_dir.clone();
 
         match mode {
             AppMode::Embedded => {
@@ -389,6 +431,8 @@ async fn main() {
                         st.active_color = state.active_color;
                         st.fill_count = state.fill_count;
                         st.paused = state.paused;
+                        // La carpeta de guardado la elige el usuario en el panel.
+                        video_dir = state.video_dir.clone();
                         // El zoom lo puede mover tanto el slider del panel como
                         // la rueda en esta ventana: solo adoptamos el del panel
                         // cuando cambia de verdad.
@@ -409,7 +453,9 @@ async fn main() {
                         p.speed_target = params.speed_target;
                         p.speed_from = params.speed_from;
                         p.speed_blend = params.speed_blend;
-                        if params.gradual {
+                        // La matriz la evoluciona el `sim` cuando hay deriva o
+                        // auto-aleatorizado; en esos casos conservamos la suya.
+                        if p.gradual || p.auto_randomize {
                             p.matrix = params.matrix;
                         }
                         params = p;
@@ -466,6 +512,9 @@ async fn main() {
             if is_key_pressed(KeyCode::R) {
                 events.push(PanelEvent::ToggleRecord);
             }
+            if is_key_pressed(KeyCode::G) {
+                show_frame = !show_frame;
+            }
             // Velocidad: teclas 1..9 = 10..90 %, tecla 0 = 100 %.
             for (key, pct) in [
                 (KeyCode::Key1, 10),
@@ -509,13 +558,30 @@ async fn main() {
                 }
                 PanelEvent::ToggleRecord => match rec.take() {
                     Some(r) => r.finish(),
-                    None => match Recorder::start() {
+                    None => match Recorder::start(preset_w, preset_h, &video_dir) {
                         Ok(r) => rec = Some(r),
                         Err(e) => {
                             eprintln!("No se pudo iniciar la grabación (¿está ffmpeg?): {e}")
                         }
                     },
                 },
+                PanelEvent::ToggleFrame => show_frame = !show_frame,
+                PanelEvent::SetFramePreset(i) => {
+                    // No cambiar la resolución de salida en mitad de una grabación.
+                    if rec.is_none() && i < FRAME_PRESETS.len() {
+                        frame_preset = i;
+                    }
+                }
+                PanelEvent::CenterFrame => {
+                    frame_center = pan_target;
+                    frame_height = screen_height() * 0.8 / st.zoom_level;
+                    show_frame = true;
+                }
+                PanelEvent::PickVideoDir => {
+                    if let Some(dir) = rfd::FileDialog::new().pick_folder() {
+                        video_dir = dir.to_string_lossy().into_owned();
+                    }
+                }
                 other => apply_local_event(
                     other,
                     &mut sim,
@@ -548,6 +614,10 @@ async fn main() {
                     blend: params.blend,
                     time_scale: params.time_scale,
                     recording: rec.is_some(),
+                    show_frame,
+                    frame_preset,
+                    frame_w: preset_w,
+                    frame_h: preset_h,
                     matrix: params.matrix,
                     canvas_size: st.canvas_size,
                     zoom_level: st.zoom_level,
@@ -576,12 +646,59 @@ async fn main() {
             let cam = make_camera(st.zoom_level, pan_target);
             pan_target += cam.screen_to_world(last_mouse) - cam.screen_to_world(mouse);
         }
+
+        // --- Edición del recuadro de encuadre con el botón izquierdo ---
+        // (solo si está visible; si no se agarra, el izquierdo pinta como siempre).
+        if show_frame && !want_pointer {
+            let fcam = make_camera(st.zoom_level, pan_target);
+            let hw = frame_height * frame_aspect / 2.0;
+            let hh = frame_height / 2.0;
+            if frame_drag.is_none() && is_mouse_button_pressed(MouseButton::Left) {
+                let corners = [
+                    frame_center + Vec2::new(-hw, -hh),
+                    frame_center + Vec2::new(hw, -hh),
+                    frame_center + Vec2::new(hw, hh),
+                    frame_center + Vec2::new(-hw, hh),
+                ];
+                let near_corner = corners
+                    .iter()
+                    .any(|c| (fcam.world_to_screen(*c) - mouse).length() < 14.0);
+                let wm = fcam.screen_to_world(mouse);
+                let inside = wm.x > frame_center.x - hw
+                    && wm.x < frame_center.x + hw
+                    && wm.y > frame_center.y - hh
+                    && wm.y < frame_center.y + hh;
+                if near_corner {
+                    frame_drag = Some(FrameDrag::Resize);
+                } else if inside {
+                    frame_drag = Some(FrameDrag::Move);
+                }
+            }
+            if let Some(drag) = frame_drag {
+                if is_mouse_button_down(MouseButton::Left) {
+                    let now = fcam.screen_to_world(mouse);
+                    match drag {
+                        FrameDrag::Move => {
+                            frame_center += now - fcam.screen_to_world(last_mouse);
+                        }
+                        FrameDrag::Resize => {
+                            frame_height = (2.0 * (now.y - frame_center.y).abs()).max(10.0);
+                        }
+                    }
+                } else {
+                    frame_drag = None;
+                }
+            }
+        } else {
+            frame_drag = None;
+        }
+
         last_mouse = mouse;
 
         let camera = make_camera(st.zoom_level, pan_target);
 
-        // Pintar/borrar (solo fuera del panel) usando coordenadas del mundo.
-        if !want_pointer && is_mouse_button_down(MouseButton::Left) {
+        // Pintar/borrar (solo fuera del panel, y si no estamos moviendo el recuadro).
+        if frame_drag.is_none() && !want_pointer && is_mouse_button_down(MouseButton::Left) {
             let pos = camera.screen_to_world(mouse);
             match st.brush {
                 Brush::Add => {
@@ -611,13 +728,39 @@ async fn main() {
             2.0 / st.zoom_level,
             Color::new(0.3, 0.3, 0.35, 1.0),
         );
+
+        // Recuadro de encuadre de grabación: borde + rejilla de tercios + esquinas.
+        if show_frame {
+            let fw = frame_height * frame_aspect;
+            let x0 = frame_center.x - fw / 2.0;
+            let y0 = frame_center.y - frame_height / 2.0;
+            let th = 2.0 / st.zoom_level;
+            let edge = Color::new(1.0, 1.0, 1.0, 0.9);
+            let thirds = Color::new(1.0, 1.0, 1.0, 0.30);
+            draw_rectangle_lines(x0, y0, fw, frame_height, th, edge);
+            for k in 1..3 {
+                let x = x0 + fw * k as f32 / 3.0;
+                draw_line(x, y0, x, y0 + frame_height, th * 0.6, thirds);
+                let y = y0 + frame_height * k as f32 / 3.0;
+                draw_line(x0, y, x0 + fw, y, th * 0.6, thirds);
+            }
+            let hs = 6.0 / st.zoom_level;
+            for (cx, cy) in [
+                (x0, y0),
+                (x0 + fw, y0),
+                (x0 + fw, y0 + frame_height),
+                (x0, y0 + frame_height),
+            ] {
+                draw_rectangle(cx - hs, cy - hs, hs * 2.0, hs * 2.0, edge);
+            }
+        }
         set_default_camera();
 
         // Grabación: renderizamos la escena en vertical al render target y
         // volcamos el frame a ffmpeg (invisible para la ventana). Si falla la
         // escritura (ffmpeg murió), cerramos la grabación.
         if let Some(r) = rec.as_mut() {
-            let rcam = record_camera(&r.rt, st.zoom_level, pan_target);
+            let rcam = record_camera(&r.rt, frame_center, frame_height * frame_aspect, frame_height);
             set_camera(&rcam);
             renderer.draw(&sim, &params);
             set_default_camera();

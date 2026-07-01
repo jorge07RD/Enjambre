@@ -13,3 +13,4 @@ macroquad = "0.4"
 egui-macroquad = "0.17"
 rand.workspace = true
 rayon = "1"
+rfd = "0.15"

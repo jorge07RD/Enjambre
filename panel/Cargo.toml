@@ -13,3 +13,4 @@ eframe = "0.31"
 egui.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+rfd = "0.15"

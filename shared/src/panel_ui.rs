@@ -8,7 +8,7 @@
 
 use crate::config::{
     palette, Boundary, Brush, InteractionMode, InteractionSnapshot, RenderStyle, SimParams,
-    COLOR_NAMES, NUM_COLORS,
+    COLOR_NAMES, FRAME_PRESETS, NUM_COLORS,
 };
 use serde::{Deserialize, Serialize};
 
@@ -24,11 +24,20 @@ pub struct PanelState {
     pub zoom_level: f32,
     pub paused: bool,
 
+    /// Carpeta de guardado de los vídeos (vacío = directorio de trabajo).
+    pub video_dir: String,
+
     // Telemetría que llega de la simulación (solo para mostrar).
     pub particle_count: usize,
     pub fps: i32,
     /// `true` mientras la simulación está grabando vídeo (rótulo del botón).
     pub recording: bool,
+    /// Estado del recuadro de encuadre (lo evoluciona el ratón en el `sim`).
+    pub show_frame: bool,
+    pub frame_preset: usize,
+    /// Resolución de salida del preset actual (para mostrar).
+    pub frame_w: u32,
+    pub frame_h: u32,
 
     /// `true` cuando esta UI corre en la ventana aparte (`panel`); cambia el
     /// botón de separar por uno de reacoplar.
@@ -45,9 +54,14 @@ impl Default for PanelState {
             canvas_size: 800.0,
             zoom_level: 1.0,
             paused: false,
+            video_dir: String::new(),
             particle_count: 0,
             fps: 0,
             recording: false,
+            show_frame: false,
+            frame_preset: 0,
+            frame_w: FRAME_PRESETS[0].1,
+            frame_h: FRAME_PRESETS[0].2,
             standalone: false,
         }
     }
@@ -66,8 +80,16 @@ pub enum PanelEvent {
     StartTransition(InteractionSnapshot),
     /// Fijar una nueva velocidad objetivo (transición suave si está activa).
     SetSpeed(f32),
-    /// Empezar/detener la grabación de vídeo vertical (1080×1920).
+    /// Empezar/detener la grabación de vídeo.
     ToggleRecord,
+    /// Mostrar/ocultar el recuadro de encuadre de grabación.
+    ToggleFrame,
+    /// Elegir el preset de resolución/aspecto del recuadro.
+    SetFramePreset(usize),
+    /// Recolocar el recuadro en el centro de la vista actual.
+    CenterFrame,
+    /// Abrir un diálogo nativo para elegir la carpeta de guardado.
+    PickVideoDir,
     /// Ajustar el zoom para que el lienzo entre en la ventana.
     FitCanvas,
     /// Igualar el lienzo a los píxeles de la ventana de simulación (1:1).
@@ -107,17 +129,52 @@ pub fn config_panel(
             events.push(PanelEvent::Detach);
         }
 
-        // Grabar vídeo vertical (TikTok). También con la tecla R.
+        // Grabar vídeo. También con la tecla R.
         if ui
             .button(if st.recording {
                 "⏹ Detener grabación (R)"
             } else {
-                "⏺ Grabar vídeo vertical (R)"
+                "⏺ Grabar vídeo (R)"
             })
             .clicked()
         {
             events.push(PanelEvent::ToggleRecord);
         }
+
+        // Encuadre de grabación: recuadro ajustable sobre el lienzo.
+        let mut sf = st.show_frame;
+        if ui
+            .checkbox(&mut sf, "Mostrar encuadre de grabación (G)")
+            .changed()
+        {
+            events.push(PanelEvent::ToggleFrame);
+        }
+        ui.horizontal_wrapped(|ui| {
+            ui.label("Tamaño:");
+            for (i, (name, _, _)) in FRAME_PRESETS.iter().enumerate() {
+                if ui
+                    .selectable_label(st.frame_preset == i, *name)
+                    .clicked()
+                {
+                    events.push(PanelEvent::SetFramePreset(i));
+                }
+            }
+        });
+        ui.label(format!("Salida: {}×{} px", st.frame_w, st.frame_h));
+        if ui.button("⊹ Centrar encuadre en la vista").clicked() {
+            events.push(PanelEvent::CenterFrame);
+        }
+        ui.label("Arrastra el recuadro (mover) o una esquina (redimensionar) en el lienzo.");
+
+        // Carpeta de guardado (diálogo nativo del SO).
+        if ui.button("📁 Carpeta de guardado…").clicked() {
+            events.push(PanelEvent::PickVideoDir);
+        }
+        ui.label(if st.video_dir.is_empty() {
+            "Carpeta: (directorio actual)".to_string()
+        } else {
+            format!("Carpeta: {}", st.video_dir)
+        });
 
         ui.label(format!("Partículas: {}", st.particle_count));
         ui.label(format!("FPS: {}", st.fps));
@@ -292,6 +349,13 @@ pub fn config_panel(
                 // pise el eco de la matriz anterior (bug en modo separado).
                 params.randomize_matrix(&mut ::rand::thread_rng());
                 trigger = true;
+            }
+            ui.checkbox(&mut params.auto_randomize, "Auto-aleatorizar sola");
+            if params.auto_randomize {
+                ui.add(
+                    egui::Slider::new(&mut params.auto_randomize_interval, 1.0..=60.0)
+                        .text("Cada (s)"),
+                );
             }
             ui.label("Fila = recibe · Columna = ejerce");
             egui::Grid::new("matrix").striped(true).show(ui, |ui| {

@@ -23,6 +23,8 @@ pub struct ControlState {
     pub brush_size: f32,
     pub active_color: usize,
     pub fill_count: i32,
+    /// Carpeta donde guardar los vídeos (vacío = directorio de trabajo).
+    pub video_dir: String,
 }
 
 /// Mensajes panel → sim.
@@ -49,6 +51,12 @@ pub enum TelemetryMsg {
         time_scale: f32,
         /// `true` mientras el `sim` está grabando vídeo.
         recording: bool,
+        /// Estado del recuadro de encuadre (lo maneja el ratón en el `sim`).
+        show_frame: bool,
+        frame_preset: usize,
+        /// Resolución de salida del preset actual (para el rótulo del panel).
+        frame_w: u32,
+        frame_h: u32,
         /// Matriz de atracción tal y como la ve la simulación (puede ir a la
         /// deriva con `gradual`), para que la grilla del panel la refleje.
         matrix: [[f32; NUM_COLORS]; NUM_COLORS],

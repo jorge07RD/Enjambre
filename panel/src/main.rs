@@ -121,6 +121,7 @@ impl PanelApp {
                     brush_size,
                     active_color,
                     fill_count,
+                    video_dir,
                 } = *state;
                 self.params = params;
                 self.st.paused = paused;
@@ -130,6 +131,7 @@ impl PanelApp {
                 self.st.brush_size = brush_size;
                 self.st.active_color = active_color;
                 self.st.fill_count = fill_count;
+                self.st.video_dir = video_dir;
                 self.initialized = true;
             }
             TelemetryMsg::Stats {
@@ -138,19 +140,27 @@ impl PanelApp {
                 blend,
                 time_scale,
                 recording,
+                show_frame,
+                frame_preset,
+                frame_w,
+                frame_h,
                 matrix,
                 ..
             } => {
                 self.st.particle_count = particle_count;
                 self.st.fps = fps;
                 self.st.recording = recording;
+                self.st.show_frame = show_frame;
+                self.st.frame_preset = frame_preset;
+                self.st.frame_w = frame_w;
+                self.st.frame_h = frame_h;
                 self.params.blend = blend;
                 // Velocidad efectiva real, para mostrar el % en vivo (el sim es
                 // quien conduce la transición de velocidad).
                 self.params.time_scale = time_scale;
-                // La matriz a la deriva (modo `gradual`) la manda el sim; solo
-                // entonces la reflejamos, para no pisar las ediciones manuales.
-                if self.params.gradual {
+                // La matriz la evoluciona el sim con `gradual` o `auto_randomize`;
+                // solo entonces la reflejamos, para no pisar las ediciones manuales.
+                if self.params.gradual || self.params.auto_randomize {
                     self.params.matrix = matrix;
                 }
             }
@@ -183,16 +193,28 @@ impl eframe::App for PanelApp {
                 brush_size: self.st.brush_size,
                 active_color: self.st.active_color,
                 fill_count: self.st.fill_count,
+                video_dir: self.st.video_dir.clone(),
             };
             let mut closing = false;
             if write_msg(&mut self.write_stream, &ControlMsg::State(state)).is_err() {
                 closing = true;
             }
             for ev in events {
-                if matches!(ev, PanelEvent::Reattach) {
-                    closing = true;
+                match ev {
+                    // El diálogo de carpeta se abre en ESTE proceso (donde está el
+                    // botón); la ruta viaja al sim por el `State` del próximo frame.
+                    PanelEvent::PickVideoDir => {
+                        if let Some(dir) = rfd::FileDialog::new().pick_folder() {
+                            self.st.video_dir = dir.to_string_lossy().into_owned();
+                        }
+                    }
+                    _ => {
+                        if matches!(ev, PanelEvent::Reattach) {
+                            closing = true;
+                        }
+                        let _ = write_msg(&mut self.write_stream, &ControlMsg::Event(ev));
+                    }
                 }
-                let _ = write_msg(&mut self.write_stream, &ControlMsg::Event(ev));
             }
             if closing {
                 ctx.send_viewport_cmd(eframe::egui::ViewportCommand::Close);
