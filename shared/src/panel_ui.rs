@@ -7,8 +7,8 @@
 //! que cada proceso las resuelva a su manera (localmente o por IPC).
 
 use crate::config::{
-    palette, BoidsScope, Boundary, Brush, InteractionMode, InteractionSnapshot, RenderStyle,
-    SimParams, COLOR_NAMES, FRAME_PRESETS, NUM_COLORS,
+    palette, AudioTarget, BoidsScope, Boundary, Brush, InteractionMode, InteractionSnapshot,
+    RenderStyle, SimParams, Tool, COLOR_NAMES, FRAME_PRESETS, NUM_COLORS,
 };
 use serde::{Deserialize, Serialize};
 
@@ -16,6 +16,8 @@ use serde::{Deserialize, Serialize};
 pub struct PanelState {
     pub fill_count: i32,
     pub active_color: usize,
+    /// Herramienta del ratón: pincel (pintar) o fuerza (atraer/repeler).
+    pub tool: Tool,
     pub brush: Brush,
     pub brush_size: f32,
     /// Alto del lienzo (el mundo). El ancho se deriva del aspecto de la ventana.
@@ -62,6 +64,7 @@ impl Default for PanelState {
         Self {
             fill_count: 2000,
             active_color: 0,
+            tool: Tool::Brush,
             brush: Brush::Add,
             brush_size: 14.0,
             canvas_size: 800.0,
@@ -393,6 +396,22 @@ pub fn config_panel(
             ui.selectable_value(&mut params.style, RenderStyle::Glow, "Brillo");
             ui.selectable_value(&mut params.style, RenderStyle::SolidHalo, "Sólido+halo");
         });
+        ui.checkbox(&mut params.trails, "Estelas de movimiento");
+        if params.trails {
+            // Menor desvanecido = estela más larga; invertimos el slider para que
+            // "Longitud" crezca hacia la derecha.
+            let mut length = 1.0 - params.trail_fade;
+            if ui
+                .add(egui::Slider::new(&mut length, 0.5..=0.99).text("Longitud de estela"))
+                .changed()
+            {
+                params.trail_fade = 1.0 - length;
+            }
+        }
+        ui.checkbox(
+            &mut params.orient_to_velocity,
+            "Orientar según movimiento (flechas)",
+        );
 
         ui.separator();
         ui.heading("Lienzo");
@@ -563,26 +582,54 @@ pub fn config_panel(
         }
 
         ui.separator();
-        ui.heading("Pintar");
+        ui.heading("Reactivo al audio");
+        ui.checkbox(&mut params.audio_reactive, "Reaccionar al sonido");
+        if params.audio_reactive {
+            ui.horizontal(|ui| {
+                ui.label("Modula:");
+                ui.selectable_value(&mut params.audio_target, AudioTarget::Speed, "Velocidad");
+                ui.selectable_value(&mut params.audio_target, AudioTarget::Force, "Fuerza");
+                ui.selectable_value(&mut params.audio_target, AudioTarget::Brightness, "Brillo");
+            });
+            ui.add(egui::Slider::new(&mut params.audio_intensity, 0.0..=4.0).text("Intensidad"));
+            ui.label("Usa el micrófono/entrada por defecto del sistema.");
+        }
+
+        ui.separator();
+        ui.heading("Herramienta");
         ui.horizontal(|ui| {
-            ui.selectable_value(&mut st.brush, Brush::Add, "Añadir");
-            ui.selectable_value(&mut st.brush, Brush::Erase, "Borrar");
+            ui.selectable_value(&mut st.tool, Tool::Brush, "Pincel");
+            ui.selectable_value(&mut st.tool, Tool::Force, "Fuerza");
         });
-        ui.horizontal_wrapped(|ui| {
-            for i in 0..NUM_COLORS {
-                let selected = st.active_color == i;
-                let label = if selected { "●" } else { "○" };
-                if ui
-                    .add(egui::Button::new(label).fill(egui_color(palette[i])))
-                    .on_hover_text(COLOR_NAMES[i])
-                    .clicked()
-                {
-                    st.active_color = i;
+        if st.tool == Tool::Force {
+            ui.horizontal(|ui| {
+                ui.selectable_value(&mut params.pointer_repel, true, "Repeler");
+                ui.selectable_value(&mut params.pointer_repel, false, "Atraer");
+            });
+            ui.add(egui::Slider::new(&mut params.pointer_strength, 0.0..=3.0).text("Fuerza"));
+            ui.add(egui::Slider::new(&mut params.pointer_radius, 30.0..=600.0).text("Radio"));
+            ui.label("Click/arrastra en el lienzo para atraer o espantar el enjambre.");
+        } else {
+            ui.horizontal(|ui| {
+                ui.selectable_value(&mut st.brush, Brush::Add, "Añadir");
+                ui.selectable_value(&mut st.brush, Brush::Erase, "Borrar");
+            });
+            ui.horizontal_wrapped(|ui| {
+                for i in 0..NUM_COLORS {
+                    let selected = st.active_color == i;
+                    let label = if selected { "●" } else { "○" };
+                    if ui
+                        .add(egui::Button::new(label).fill(egui_color(palette[i])))
+                        .on_hover_text(COLOR_NAMES[i])
+                        .clicked()
+                    {
+                        st.active_color = i;
+                    }
                 }
-            }
-        });
-        ui.add(egui::Slider::new(&mut st.brush_size, 2.0..=60.0).text("Brocha"));
-        ui.label("Click/arrastra en el lienzo para pintar o borrar.");
+            });
+            ui.add(egui::Slider::new(&mut st.brush_size, 2.0..=60.0).text("Brocha"));
+            ui.label("Click/arrastra en el lienzo para pintar o borrar.");
+        }
     });
 
     events

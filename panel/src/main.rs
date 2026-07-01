@@ -117,6 +117,7 @@ impl PanelApp {
                     paused,
                     canvas_size,
                     zoom_level,
+                    tool,
                     brush,
                     brush_size,
                     active_color,
@@ -131,6 +132,7 @@ impl PanelApp {
                 self.st.paused = paused;
                 self.st.canvas_size = canvas_size;
                 self.st.zoom_level = zoom_level;
+                self.st.tool = tool;
                 self.st.brush = brush;
                 self.st.brush_size = brush_size;
                 self.st.active_color = active_color;
@@ -206,6 +208,7 @@ impl eframe::App for PanelApp {
                 paused: self.st.paused,
                 canvas_size: self.st.canvas_size,
                 zoom_level: self.st.zoom_level,
+                tool: self.st.tool,
                 brush: self.st.brush,
                 brush_size: self.st.brush_size,
                 active_color: self.st.active_color,

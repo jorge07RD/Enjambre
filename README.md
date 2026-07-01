@@ -95,6 +95,15 @@ programe explícitamente.
   tilear/redimensionar por separado. Ambos hablan por un socket Unix.
 - 🖌️ **Pincel:** pinta o borra partículas del color que quieras directamente sobre el lienzo.
 - 💡 **Tres estilos de dibujo:** sólido, brillo (*glow*) y sólido con halo.
+- 🌠 **Estelas de movimiento:** buffer que se desvanece para que las partículas dejen rastro
+  (longitud ajustable). Espectacular en bandada y cíclico; también se graba en el vídeo.
+- 🧭 **Orientar según movimiento:** dibuja cada partícula como una flecha (triángulo) apuntando
+  hacia donde va — la bandada se lee como pájaros de verdad.
+- 🖱️ **Fuerza con el ratón:** cambia el pincel por la herramienta **Fuerza** para atraer o
+  **espantar** el enjambre en vivo alrededor del cursor (radio e intensidad ajustables).
+- 🎵 **Reactivo al audio:** el sonido del micrófono/entrada modula la **velocidad**, la **fuerza**
+  o el **brillo**; el enjambre "baila" con la música. Usa `ffmpeg` (PulseAudio/PipeWire o ALSA);
+  si no hay entrada, la opción simplemente no hace nada.
 
 ![Modo "matriz": clústeres orgánicos mezclando colores según la tabla 6×6](docs/img/02-matriz.png)
 

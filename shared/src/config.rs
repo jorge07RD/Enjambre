@@ -118,6 +118,23 @@ pub enum Brush {
     Erase,
 }
 
+/// Herramienta activa del botón izquierdo del ratón sobre el lienzo.
+#[derive(Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub enum Tool {
+    /// Pincel: pinta o borra partículas (comportamiento clásico).
+    Brush,
+    /// Fuerza: atrae o repele el enjambre alrededor del cursor.
+    Force,
+}
+
+/// Qué parámetro modula la reactividad al audio.
+#[derive(Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub enum AudioTarget {
+    Speed,
+    Force,
+    Brightness,
+}
+
 /// Aspecto visual de cada punto.
 #[derive(Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub enum RenderStyle {
@@ -329,6 +346,33 @@ pub struct SimParams {
     pub boids_sep_radius: f32,
     /// Velocidad de crucero: rapidez mínima que mantienen los "pájaros" (0 = off).
     pub boids_cruise: f32,
+
+    // --- Estelas de movimiento ---
+    /// Si está activo, las partículas dejan rastro (buffer que se desvanece).
+    pub trails: bool,
+    /// Cantidad de desvanecido por frame (0..1); menor = estela más larga.
+    pub trail_fade: f32,
+
+    // --- Orientación de las partículas ---
+    /// Si está activo, cada partícula se dibuja como un triángulo orientado según
+    /// su velocidad (flechas), en vez de un disco.
+    pub orient_to_velocity: bool,
+
+    // --- Fuerza con el ratón ---
+    /// Intensidad de la fuerza del cursor (herramienta Fuerza).
+    pub pointer_strength: f32,
+    /// Radio de acción de la fuerza del cursor, en unidades de mundo.
+    pub pointer_radius: f32,
+    /// `true` = repele (espanta); `false` = atrae.
+    pub pointer_repel: bool,
+
+    // --- Reactivo al audio ---
+    /// Si está activo, el audio del micrófono modula un parámetro.
+    pub audio_reactive: bool,
+    /// Qué parámetro modula el audio.
+    pub audio_target: AudioTarget,
+    /// Intensidad de la modulación (cuánto empuja la amplitud del sonido).
+    pub audio_intensity: f32,
 }
 
 impl Default for SimParams {
@@ -384,6 +428,15 @@ impl Default for SimParams {
             boids_cohesion: 1.0,
             boids_sep_radius: 0.35,
             boids_cruise: 48.0,
+            trails: false,
+            trail_fade: 0.12,
+            orient_to_velocity: false,
+            pointer_strength: 1.0,
+            pointer_radius: 160.0,
+            pointer_repel: true,
+            audio_reactive: false,
+            audio_target: AudioTarget::Speed,
+            audio_intensity: 1.0,
         }
     }
 }
@@ -511,6 +564,10 @@ impl SimParams {
         self.boids_cohesion = l(from.boids_cohesion, target.boids_cohesion);
         self.boids_sep_radius = l(from.boids_sep_radius, target.boids_sep_radius);
         self.boids_cruise = l(from.boids_cruise, target.boids_cruise);
+        self.trail_fade = l(from.trail_fade, target.trail_fade);
+        self.pointer_strength = l(from.pointer_strength, target.pointer_strength);
+        self.pointer_radius = l(from.pointer_radius, target.pointer_radius);
+        self.audio_intensity = l(from.audio_intensity, target.audio_intensity);
     }
 
     /// Rellena la matriz con coeficientes aleatorios en [-1, 1].

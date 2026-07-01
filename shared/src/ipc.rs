@@ -4,7 +4,7 @@
 //! seguida del cuerpo JSON (`serde_json`). Simple y depurable; suficiente para
 //! la frecuencia de un panel de control.
 
-use crate::config::{Brush, SimParams, NUM_COLORS};
+use crate::config::{Brush, SimParams, Tool, NUM_COLORS};
 use crate::panel_ui::PanelEvent;
 use serde::{Deserialize, Serialize};
 use std::io::{self, Read, Write};
@@ -19,6 +19,7 @@ pub struct ControlState {
     pub paused: bool,
     pub canvas_size: f32,
     pub zoom_level: f32,
+    pub tool: Tool,
     pub brush: Brush,
     pub brush_size: f32,
     pub active_color: usize,

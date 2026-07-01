@@ -1,3 +1,4 @@
+mod audio;
 mod grid;
 mod render;
 mod simulation;
@@ -9,8 +10,9 @@ use ::rand::Rng;
 use render::Renderer;
 use shared::ipc::{read_msg, socket_path, write_msg};
 use shared::{
-    config_panel, example_store, hue_for_index, scenes_path, Brush, ControlMsg, ControlState,
-    InteractionMode, PanelEvent, PanelState, SceneStore, SimParams, TelemetryMsg, FRAME_PRESETS,
+    config_panel, example_store, hue_for_index, scenes_path, AudioTarget, Brush, ControlMsg,
+    ControlState, InteractionMode, PanelEvent, PanelState, SceneStore, SimParams, TelemetryMsg,
+    Tool, FRAME_PRESETS,
 };
 use simulation::Simulation;
 
@@ -356,6 +358,7 @@ fn control_state(params: &SimParams, st: &PanelState) -> ControlState {
         paused: st.paused,
         canvas_size: st.canvas_size,
         zoom_level: st.zoom_level,
+        tool: st.tool,
         brush: st.brush,
         brush_size: st.brush_size,
         active_color: st.active_color,
@@ -448,6 +451,14 @@ async fn main() {
     let mut frame_drag: Option<FrameDrag> = None;
     let mut video_dir = String::new();
     let mut auto_rng_timer = 0.0f32;
+    // Buffer de acumulación para las estelas (se recrea si cambia la ventana).
+    let mut trails_rt: Option<RenderTarget> = None;
+    // Captura de audio (mantener vivo el stream) + nivel suavizado 0..1.
+    let audio_in = audio::start();
+    if audio_in.is_none() {
+        eprintln!("Audio: sin dispositivo de entrada; 'Reactivo al audio' no tendrá efecto.");
+    }
+    let mut audio_level = 0.0f32;
     // Escenas guardadas (el `sim` es el dueño; ver sección "Escenas" del panel).
     // En el primer arranque (sin fichero) sembramos un set de ejemplos.
     let mut store = if scenes_path().exists() {
@@ -536,6 +547,18 @@ async fn main() {
             scene_autoplay_timer = 0.0;
         }
 
+        // Nivel de audio suavizado (ataque rápido, caída lenta) para la
+        // reactividad. Se calcula cada frame, aun en pausa (afecta al brillo).
+        let audio_raw = audio_in.as_ref().map(|a| a.level()).unwrap_or(0.0);
+        let audio_goal = (audio_raw * 6.0).clamp(0.0, 1.0);
+        let k = if audio_goal > audio_level { 0.5 } else { 0.08 };
+        audio_level += (audio_goal - audio_level) * k;
+        let audio_gain = if params.audio_reactive {
+            1.0 + audio_level * params.audio_intensity
+        } else {
+            1.0
+        };
+
         // Física.
         if !st.paused || step_once {
             // Auto-aleatorizado de la matriz cada X segundos (solo en modo Matriz).
@@ -549,7 +572,21 @@ async fn main() {
                 }
             }
             sim.apply_dynamics(&mut params, &mut rng, get_frame_time());
+            // Modulación de audio transitoria sobre velocidad o fuerza: se aplica
+            // solo para este `step` y se restaura, para no pisar el valor base ni
+            // la transición de velocidad (`advance_transition`).
+            let saved_ts = params.time_scale;
+            let saved_force = params.force;
+            if params.audio_reactive {
+                match params.audio_target {
+                    AudioTarget::Speed => params.time_scale *= audio_gain,
+                    AudioTarget::Force => params.force *= audio_gain,
+                    AudioTarget::Brightness => {}
+                }
+            }
             sim.step(&params);
+            params.time_scale = saved_ts;
+            params.force = saved_force;
             params.advance_transition(get_frame_time());
             step_once = false;
         }
@@ -599,6 +636,7 @@ async fn main() {
                     }
                     if let Some(state) = inbox.state.take() {
                         st.canvas_size = state.canvas_size;
+                        st.tool = state.tool;
                         st.brush = state.brush;
                         st.brush_size = state.brush_size;
                         st.active_color = state.active_color;
@@ -1005,78 +1043,156 @@ async fn main() {
 
         let camera = make_camera(st.zoom_level, pan_target);
 
-        // Pintar/borrar (solo fuera del panel, y si no estamos moviendo el recuadro).
+        // Herramienta del ratón (fuera del panel y si no movemos el recuadro):
+        // Fuerza atrae/repele el enjambre; Pincel pinta o borra.
+        sim.pointer = None;
         if frame_drag.is_none() && !want_pointer && is_mouse_button_down(MouseButton::Left) {
             let pos = camera.screen_to_world(mouse);
-            match st.brush {
-                Brush::Add => {
-                    let count = (st.brush_size / 5.0).max(1.0) as usize;
-                    for _ in 0..count {
-                        let ang = rng.gen_range(0.0..std::f32::consts::TAU);
-                        let rad = rng.gen_range(0.0..st.brush_size);
-                        sim.add(
-                            pos + Vec2::new(ang.cos() * rad, ang.sin() * rad),
-                            hue_for_index(st.active_color),
-                        );
+            match st.tool {
+                Tool::Force => sim.pointer = Some(pos),
+                Tool::Brush => match st.brush {
+                    Brush::Add => {
+                        let count = (st.brush_size / 5.0).max(1.0) as usize;
+                        for _ in 0..count {
+                            let ang = rng.gen_range(0.0..std::f32::consts::TAU);
+                            let rad = rng.gen_range(0.0..st.brush_size);
+                            sim.add(
+                                pos + Vec2::new(ang.cos() * rad, ang.sin() * rad),
+                                hue_for_index(st.active_color),
+                            );
+                        }
                     }
+                    Brush::Erase => sim.erase_near(pos, st.brush_size),
+                },
+            }
+        }
+
+        // Modulación de audio sobre el brillo (transitoria durante el render y la
+        // grabación; se restaura tras volcar el frame).
+        let saved_brightness = params.brightness;
+        if params.audio_reactive && params.audio_target == AudioTarget::Brightness {
+            params.brightness = (params.brightness * audio_gain).min(1.0);
+        }
+
+        // Overlays del lienzo (borde + recuadro de encuadre) en coordenadas de
+        // mundo. Se dibujan encima de las partículas y NUNCA llevan estela.
+        let draw_overlays = || {
+            draw_rectangle_lines(
+                0.0,
+                0.0,
+                world.x,
+                world.y,
+                2.0 / st.zoom_level,
+                Color::new(0.3, 0.3, 0.35, 1.0),
+            );
+            if show_frame {
+                let fw = frame_height * frame_aspect;
+                let x0 = frame_center.x - fw / 2.0;
+                let y0 = frame_center.y - frame_height / 2.0;
+                let th = 2.0 / st.zoom_level;
+                let edge = Color::new(1.0, 1.0, 1.0, 0.9);
+                let thirds = Color::new(1.0, 1.0, 1.0, 0.30);
+                draw_rectangle_lines(x0, y0, fw, frame_height, th, edge);
+                for k in 1..3 {
+                    let x = x0 + fw * k as f32 / 3.0;
+                    draw_line(x, y0, x, y0 + frame_height, th * 0.6, thirds);
+                    let y = y0 + frame_height * k as f32 / 3.0;
+                    draw_line(x0, y, x0 + fw, y, th * 0.6, thirds);
                 }
-                Brush::Erase => sim.erase_near(pos, st.brush_size),
+                let hs = 6.0 / st.zoom_level;
+                for (cx, cy) in [
+                    (x0, y0),
+                    (x0 + fw, y0),
+                    (x0 + fw, y0 + frame_height),
+                    (x0, y0 + frame_height),
+                ] {
+                    draw_rectangle(cx - hs, cy - hs, hs * 2.0, hs * 2.0, edge);
+                }
             }
-        }
+        };
 
-        // Render del mundo con la cámara, y luego el panel encima (si embebido).
-        set_camera(&camera);
-        renderer.draw(&sim, &params);
-        // Borde del lienzo (grosor constante en pantalla).
-        draw_rectangle_lines(
-            0.0,
-            0.0,
-            world.x,
-            world.y,
-            2.0 / st.zoom_level,
-            Color::new(0.3, 0.3, 0.35, 1.0),
-        );
-
-        // Recuadro de encuadre de grabación: borde + rejilla de tercios + esquinas.
-        if show_frame {
-            let fw = frame_height * frame_aspect;
-            let x0 = frame_center.x - fw / 2.0;
-            let y0 = frame_center.y - frame_height / 2.0;
-            let th = 2.0 / st.zoom_level;
-            let edge = Color::new(1.0, 1.0, 1.0, 0.9);
-            let thirds = Color::new(1.0, 1.0, 1.0, 0.30);
-            draw_rectangle_lines(x0, y0, fw, frame_height, th, edge);
-            for k in 1..3 {
-                let x = x0 + fw * k as f32 / 3.0;
-                draw_line(x, y0, x, y0 + frame_height, th * 0.6, thirds);
-                let y = y0 + frame_height * k as f32 / 3.0;
-                draw_line(x0, y, x0 + fw, y, th * 0.6, thirds);
+        // Render del mundo. Con estelas dibujamos en un buffer persistente que se
+        // desvanece un poco cada frame; sin estelas, directo a pantalla.
+        if params.trails {
+            let sw = screen_width();
+            let sh = screen_height();
+            let need_new = trails_rt.as_ref().map_or(true, |rt| {
+                (rt.texture.width() - sw).abs() > 0.5 || (rt.texture.height() - sh).abs() > 0.5
+            });
+            if need_new {
+                let rt = render_target(sw as u32, sh as u32);
+                rt.texture.set_filter(FilterMode::Linear);
+                trails_rt = Some(rt);
             }
-            let hs = 6.0 / st.zoom_level;
-            for (cx, cy) in [
-                (x0, y0),
-                (x0 + fw, y0),
-                (x0 + fw, y0 + frame_height),
-                (x0, y0 + frame_height),
-            ] {
-                draw_rectangle(cx - hs, cy - hs, hs * 2.0, hs * 2.0, edge);
-            }
+            let rt = trails_rt.as_ref().unwrap();
+            let mut tcam = make_camera(st.zoom_level, pan_target);
+            tcam.render_target = Some(rt.clone());
+            set_camera(&tcam);
+            // Desvanecido: rectángulo negro translúcido sobre el mundo visible.
+            let tl = tcam.screen_to_world(vec2(0.0, 0.0));
+            let br = tcam.screen_to_world(vec2(sw, sh));
+            draw_rectangle(
+                tl.x.min(br.x),
+                tl.y.min(br.y),
+                (br.x - tl.x).abs(),
+                (br.y - tl.y).abs(),
+                Color::new(0.0, 0.0, 0.0, params.trail_fade),
+            );
+            renderer.draw_particles(&sim, &params);
+            // Volcar el buffer a la pantalla y pintar los overlays encima.
+            set_default_camera();
+            clear_background(BLACK);
+            draw_texture_ex(
+                &rt.texture,
+                0.0,
+                0.0,
+                WHITE,
+                DrawTextureParams {
+                    dest_size: Some(vec2(sw, sh)),
+                    flip_y: true,
+                    ..Default::default()
+                },
+            );
+            set_camera(&camera);
+            draw_overlays();
+            set_default_camera();
+        } else {
+            trails_rt = None; // liberar el buffer cuando no se usa
+            set_camera(&camera);
+            renderer.draw(&sim, &params);
+            draw_overlays();
+            set_default_camera();
         }
-        set_default_camera();
 
         // Grabación: renderizamos la escena en vertical al render target y
         // volcamos el frame a ffmpeg (invisible para la ventana). Si falla la
         // escritura (ffmpeg murió), cerramos la grabación.
         if let Some(r) = rec.as_mut() {
-            let rcam = record_camera(&r.rt, frame_center, frame_height * frame_aspect, frame_height);
+            let vw = frame_height * frame_aspect;
+            let rcam = record_camera(&r.rt, frame_center, vw, frame_height);
             set_camera(&rcam);
-            renderer.draw(&sim, &params);
+            if params.trails {
+                // El render target del `Recorder` persiste entre frames, así que
+                // acumula por sí solo: solo lo desvanecemos y pintamos encima.
+                draw_rectangle(
+                    frame_center.x - vw / 2.0,
+                    frame_center.y - frame_height / 2.0,
+                    vw,
+                    frame_height,
+                    Color::new(0.0, 0.0, 0.0, params.trail_fade),
+                );
+                renderer.draw_particles(&sim, &params);
+            } else {
+                renderer.draw(&sim, &params);
+            }
             set_default_camera();
             if let Err(e) = r.capture() {
                 eprintln!("Grabación detenida (error escribiendo a ffmpeg): {e}");
                 rec.take().unwrap().finish();
             }
         }
+        // Restaurar el brillo base tras el render/grabación.
+        params.brightness = saved_brightness;
         if let Some(r) = &rec {
             draw_text(
                 &format!("● REC  {:.1}s", r.frames as f32 / REC_FPS as f32),

@@ -19,6 +19,8 @@ pub struct Simulation {
     pub world: Vec2,
     /// Punto hacia el que se atraen las zonas activas (centro de la vista).
     pub focus: Vec2,
+    /// Posición (mundo) del cursor cuando la herramienta Fuerza está activa.
+    pub pointer: Option<Vec2>,
     grid: Grid,
     /// Aceleraciones acumuladas por partícula (scratch reutilizado).
     forces: Vec<Vec2>,
@@ -30,6 +32,7 @@ impl Simulation {
             particles: Vec::new(),
             world,
             focus: world * 0.5,
+            pointer: None,
             grid: Grid::new(),
             forces: Vec::new(),
         }
@@ -143,6 +146,14 @@ impl Simulation {
         let attract = params.attract_active;
         let attract_strength = params.attract_active_strength;
         let focus = self.focus;
+
+        // Fuerza del cursor (herramienta Fuerza): atrae o repele alrededor del
+        // puntero con caída suave dentro de `pointer_radius`.
+        let pointer = self.pointer;
+        let ptr_radius = params.pointer_radius.max(1.0);
+        let ptr_radius2 = ptr_radius * ptr_radius;
+        let ptr_sign = if params.pointer_repel { -1.0 } else { 1.0 };
+        let ptr_gain = params.pointer_strength * 6.0;
 
         // Bandada (Boids): física vectorial que sustituye a la fuerza radial.
         // Como Boids no usa el coeficiente escalar, no puede mezclarse con el
@@ -324,6 +335,30 @@ impl Simulation {
                         // Densidad normalizada: ~0 para solitarias, satura en 1.
                         let activity = (neighbors as f32 / 30.0).min(1.0);
                         acc += (toward / d) * (attract_strength * activity);
+                    }
+                }
+
+                // Fuerza del cursor: atrae/repele las partículas cercanas al
+                // puntero, con caída lineal hasta `ptr_radius`.
+                if let Some(ptr) = pointer {
+                    let mut toward = ptr - pi.pos;
+                    if wrap {
+                        if toward.x > half.x {
+                            toward.x -= world.x;
+                        } else if toward.x < -half.x {
+                            toward.x += world.x;
+                        }
+                        if toward.y > half.y {
+                            toward.y -= world.y;
+                        } else if toward.y < -half.y {
+                            toward.y += world.y;
+                        }
+                    }
+                    let d2p = toward.length_squared();
+                    if d2p < ptr_radius2 && d2p > 1e-6 {
+                        let d = d2p.sqrt();
+                        let falloff = 1.0 - d / ptr_radius;
+                        acc += (toward / d) * (ptr_sign * ptr_gain * falloff);
                     }
                 }
                 *out = acc;
