@@ -37,10 +37,15 @@ programe explícitamente.
   - **Depredador–presa** — un bando caza y el otro huye en manada (interacción asimétrica).
   - **Repulsión propia** — el mismo color se repele y los distintos se atraen (mezclas
     homogéneas, espumas y mosaicos).
-- **Física ajustable en vivo:** fuerza, radio, repulsión (β), fricción, velocidad y
-  bordes **toroidales** (la pantalla se enrolla) o de **rebote**.
+- **Física ajustable en vivo:** fuerza, radio, repulsión (β), fricción, velocidad (en %,
+  con cambio suave y atajos 1…0) y bordes **toroidales** (la pantalla se enrolla) o de **rebote**.
 - **Dinámica del color:** cambios aleatorios de color, deriva lenta y gradual de
-  colores y reglas, con transiciones suaves opcionales.
+  colores y reglas, con transiciones suaves opcionales. La matriz puede **auto-aleatorizarse
+  cada X segundos** para animaciones que evolucionan solas.
+- **Grabación de vídeo:** define con un **recuadro ajustable** sobre el lienzo (mover/redimensionar,
+  con rejilla de tercios; tecla **`G`** para mostrar/ocultar) la zona a grabar, elige un **tamaño
+  sugerido** (TikTok 9:16, 4:5, 1:1, 16:9…) y graba a 120 fps con la tecla **`R`** o el botón. El
+  vídeo se codifica con `ffmpeg` a H.264; puedes **elegir la carpeta de guardado** desde la app.
 - **Lienzo + cámara:** lienzo de tamaño variable con zoom y desplazamiento (rueda para
   zoom hacia el cursor, botón derecho para mover). Botón **«Lienzo = pantalla»** que iguala
   el mundo a los píxeles de la ventana (1:1), para que llene el lienzo sea cual sea el
@@ -63,6 +68,8 @@ programe explícitamente.
 | IPC panel ↔ simulación | socket Unix + [`serde`](https://crates.io/crates/serde) (JSON) |
 | Paralelismo | [`rayon`](https://crates.io/crates/rayon) |
 | Aleatoriedad | [`rand`](https://crates.io/crates/rand) |
+| Diálogo de carpeta | [`rfd`](https://crates.io/crates/rfd) (portal XDG) |
+| Codificación de vídeo | [`ffmpeg`](https://ffmpeg.org/) (externo) |
 
 ## Compilar y ejecutar
 
@@ -102,9 +109,33 @@ cargo test -p sim --release throughput -- --nocapture
 
 - **Rueda del ratón** — zoom hacia el cursor.
 - **Botón derecho / central** — mover la vista (*pan*).
-- **Botón izquierdo sobre el lienzo** — pintar o borrar (según la brocha activa).
+- **Botón izquierdo sobre el lienzo** — pintar o borrar (o mover/redimensionar el recuadro
+  de grabación si está visible).
 - Todo lo demás se ajusta desde el **panel de control** (embebido a la derecha o en
   su ventana aparte).
+
+### Atajos de teclado (sobre la ventana del lienzo)
+
+| Tecla | Acción | | Tecla | Acción |
+|-------|--------|-|-------|--------|
+| **Espacio** | Pausa / Reanudar | | **L** | Lienzo = pantalla |
+| **.** | Paso a paso | | **Z** | Ajustar zoom al lienzo |
+| **C** | Vaciar / Reiniciar | | **D** | Separar / reacoplar panel |
+| **F** | Llenar aleatorio | | **R** | Grabar / detener vídeo |
+| **M** | Aleatorizar matriz | | **G** | Mostrar / ocultar encuadre |
+| **1…9 / 0** | Velocidad 10 %…100 % | | **A** | Atraer zonas activas al centro |
+
+## Grabación de vídeo
+
+1. Pulsa **`G`** (o el checkbox del panel) para mostrar el **recuadro de encuadre**; arrástralo
+   para moverlo o coge una esquina para redimensionarlo. Elige un **Tamaño** sugerido en el panel.
+2. Opcional: **📁 Carpeta de guardado…** abre un diálogo nativo para elegir dónde guardar.
+3. Pulsa **`R`** (o el botón) para grabar y de nuevo para parar. Sale un `enjambre_<timestamp>.mp4`
+   a 120 fps con exactamente la zona del recuadro, a la resolución del preset.
+
+> Requiere **`ffmpeg`** instalado (`sudo pacman -S ffmpeg`). El diálogo de carpeta usa el **portal
+> XDG**; en Hyprland instala `xdg-desktop-portal` + un backend (p. ej. `xdg-desktop-portal-gtk`
+> o `-hyprland`). Sin portal, se guarda en el directorio actual.
 
 ## Estructura del código
 
