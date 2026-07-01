@@ -122,6 +122,10 @@ impl PanelApp {
                     active_color,
                     fill_count,
                     video_dir,
+                    scene_smooth,
+                    scene_transition_duration,
+                    scene_autoplay,
+                    scene_autoplay_interval,
                 } = *state;
                 self.params = params;
                 self.st.paused = paused;
@@ -132,6 +136,10 @@ impl PanelApp {
                 self.st.active_color = active_color;
                 self.st.fill_count = fill_count;
                 self.st.video_dir = video_dir;
+                self.st.scene_smooth = scene_smooth;
+                self.st.scene_transition_duration = scene_transition_duration;
+                self.st.scene_autoplay = scene_autoplay;
+                self.st.scene_autoplay_interval = scene_autoplay_interval;
                 self.initialized = true;
             }
             TelemetryMsg::Stats {
@@ -164,6 +172,15 @@ impl PanelApp {
                     self.params.matrix = matrix;
                 }
             }
+            TelemetryMsg::ScenesList { names, default } => {
+                self.st.scenes = names;
+                self.st.default_scene = default;
+            }
+            TelemetryMsg::ApplyParams(params) => {
+                // El sim cargó una escena y nos da los params resultantes, para
+                // que dejemos de reenviar los ajustes anteriores.
+                self.params = *params;
+            }
         }
     }
 }
@@ -194,6 +211,10 @@ impl eframe::App for PanelApp {
                 active_color: self.st.active_color,
                 fill_count: self.st.fill_count,
                 video_dir: self.st.video_dir.clone(),
+                scene_smooth: self.st.scene_smooth,
+                scene_transition_duration: self.st.scene_transition_duration,
+                scene_autoplay: self.st.scene_autoplay,
+                scene_autoplay_interval: self.st.scene_autoplay_interval,
             };
             let mut closing = false;
             if write_msg(&mut self.write_stream, &ControlMsg::State(state)).is_err() {

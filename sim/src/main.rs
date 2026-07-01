@@ -9,8 +9,8 @@ use ::rand::Rng;
 use render::Renderer;
 use shared::ipc::{read_msg, socket_path, write_msg};
 use shared::{
-    config_panel, hue_for_index, Brush, ControlMsg, ControlState, InteractionMode, PanelEvent,
-    PanelState, SimParams, TelemetryMsg, FRAME_PRESETS,
+    config_panel, example_store, hue_for_index, scenes_path, Brush, ControlMsg, ControlState,
+    InteractionMode, PanelEvent, PanelState, SceneStore, SimParams, TelemetryMsg, FRAME_PRESETS,
 };
 use simulation::Simulation;
 
@@ -58,6 +58,77 @@ const REC_FPS: i32 = 120;
 enum FrameDrag {
     Move,
     Resize,
+}
+
+/// Transición en curso de una escena a otra: interpola los parámetros numéricos
+/// de `from` a `target`; el cruce del modo/matriz lo lleva el blend de
+/// interacción (`start_transition`). La conduce el `sim`.
+struct SceneMorph {
+    from: Box<SimParams>,
+    target: Box<SimParams>,
+    blend: f32,
+    dur: f32,
+}
+
+/// Aplica la escena `target` a `params`. Si `smooth`, arranca un morph y lo
+/// devuelve; si no, la aplica al instante (devuelve `None`).
+fn start_scene(
+    params: &mut SimParams,
+    target: &SimParams,
+    smooth: bool,
+    dur: f32,
+) -> Option<SceneMorph> {
+    if !smooth {
+        *params = target.settled();
+        return None;
+    }
+    let from = params.clone();
+    let old_snap = params.current_snapshot();
+    // Interacción destino + cruce gradual (viejo -> nuevo) con el blend existente.
+    params.mode = target.mode;
+    params.matrix = target.matrix;
+    params.sim_range = target.sim_range;
+    params.same_repel_others = target.same_repel_others;
+    params.same_repel_strength = target.same_repel_strength;
+    params.smooth = true;
+    params.transition_duration = dur.max(0.05);
+    params.start_transition(old_snap);
+    // Discretos no-interacción: se fijan al destino de inmediato.
+    params.boundary = target.boundary;
+    params.style = target.style;
+    params.random_color = target.random_color;
+    params.gradual = target.gradual;
+    params.color_smooth = target.color_smooth;
+    params.speed_smooth = target.speed_smooth;
+    params.attract_active = target.attract_active;
+    params.auto_randomize = target.auto_randomize;
+    // Velocidad: por el sistema de transición de velocidad existente.
+    params.set_speed(target.speed_target);
+    Some(SceneMorph {
+        from: Box::new(from),
+        target: Box::new(target.clone()),
+        blend: 0.0,
+        dur: dur.max(0.05),
+    })
+}
+
+/// Carga la escena en `idx + step` (con envoltura) de `store` sobre `params`,
+/// actualizando `idx`. Devuelve el morph si la transición es suave.
+fn cycle_scene(
+    step: i32,
+    store: &SceneStore,
+    params: &mut SimParams,
+    idx: &mut usize,
+    smooth: bool,
+    dur: f32,
+) -> Option<SceneMorph> {
+    let n = store.scenes.len();
+    if n == 0 {
+        return None;
+    }
+    *idx = (*idx as i32 + step).rem_euclid(n as i32) as usize;
+    let target = store.scenes[*idx].params.clone();
+    start_scene(params, &target, smooth, dur)
 }
 
 /// Cámara que mapea el rectángulo de mundo del recuadro (centro + ancho/alto)
@@ -278,6 +349,10 @@ fn control_state(params: &SimParams, st: &PanelState) -> ControlState {
         active_color: st.active_color,
         fill_count: st.fill_count,
         video_dir: st.video_dir.clone(),
+        scene_smooth: st.scene_smooth,
+        scene_transition_duration: st.scene_transition_duration,
+        scene_autoplay: st.scene_autoplay,
+        scene_autoplay_interval: st.scene_autoplay_interval,
     }
 }
 
@@ -321,7 +396,15 @@ fn apply_local_event(
         | PanelEvent::ToggleFrame
         | PanelEvent::SetFramePreset(_)
         | PanelEvent::CenterFrame
-        | PanelEvent::PickVideoDir => {}
+        | PanelEvent::PickVideoDir
+        | PanelEvent::SaveScene(_)
+        | PanelEvent::LoadScene(_)
+        | PanelEvent::SetDefaultScene(_)
+        | PanelEvent::DeleteScene(_)
+        | PanelEvent::NextScene
+        | PanelEvent::PrevScene
+        | PanelEvent::ExportScenes
+        | PanelEvent::ImportScenes => {}
     }
 }
 
@@ -353,6 +436,28 @@ async fn main() {
     let mut frame_drag: Option<FrameDrag> = None;
     let mut video_dir = String::new();
     let mut auto_rng_timer = 0.0f32;
+    // Escenas guardadas (el `sim` es el dueño; ver sección "Escenas" del panel).
+    // En el primer arranque (sin fichero) sembramos un set de ejemplos.
+    let mut store = if scenes_path().exists() {
+        SceneStore::load()
+    } else {
+        let s = example_store();
+        let _ = s.save();
+        eprintln!("Sembradas escenas de ejemplo en {:?}", scenes_path());
+        s
+    };
+    let mut scene_morph: Option<SceneMorph> = None;
+    let mut pending_apply: Option<SimParams> = None;
+    let mut scenes_dirty = false;
+    let mut current_scene_idx = 0usize;
+    let mut scene_autoplay_timer = 0.0f32;
+    if let Some(def) = store.default.clone() {
+        if let Some(scene) = store.get(&def) {
+            params = scene.params.settled();
+            current_scene_idx = store.scenes.iter().position(|s| s.name == def).unwrap_or(0);
+            eprintln!("Escena predeterminada cargada: {def}");
+        }
+    }
     eprintln!("Teclas: R grabar · G encuadre. Elige tamaño y carpeta en el panel.");
     let mut ipc: Option<Ipc> = None;
     let mut panel_was_connected = false;
@@ -374,6 +479,50 @@ async fn main() {
         // La velocidad transita de forma suave hacia su objetivo (aunque esté
         // en pausa, para que al reanudar ya esté en el valor pedido).
         params.advance_speed(get_frame_time());
+
+        // Transición de escena en curso: interpola los números; el cruce de
+        // interacción lo lleva el blend de `advance_transition` (más abajo).
+        let mut morph_done = false;
+        if let Some(m) = scene_morph.as_mut() {
+            m.blend = (m.blend + get_frame_time() / m.dur).min(1.0);
+            let t = m.blend * m.blend * (3.0 - 2.0 * m.blend);
+            params.lerp_scene_numeric(&m.from, &m.target, t);
+            if m.blend >= 1.0 {
+                let target = (*m.target).clone();
+                params.smooth = target.smooth;
+                params.transition_duration = target.transition_duration;
+                params.color_transition_duration = target.color_transition_duration;
+                params.speed_transition_duration = target.speed_transition_duration;
+                morph_done = true;
+            }
+        }
+        if morph_done {
+            scene_morph = None;
+            if mode == AppMode::Detached {
+                pending_apply = Some(params.clone());
+            }
+        }
+
+        // Auto-avance de escenas (slideshow): cambia a la siguiente cada X s.
+        if st.scene_autoplay && scene_morph.is_none() && store.scenes.len() > 1 {
+            scene_autoplay_timer += get_frame_time();
+            if scene_autoplay_timer >= st.scene_autoplay_interval.max(0.5) {
+                scene_autoplay_timer = 0.0;
+                scene_morph = cycle_scene(
+                    1,
+                    &store,
+                    &mut params,
+                    &mut current_scene_idx,
+                    st.scene_smooth,
+                    st.scene_transition_duration,
+                );
+                if scene_morph.is_none() && mode == AppMode::Detached {
+                    pending_apply = Some(params.clone());
+                }
+            }
+        } else if !st.scene_autoplay {
+            scene_autoplay_timer = 0.0;
+        }
 
         // Física.
         if !st.paused || step_once {
@@ -404,6 +553,8 @@ async fn main() {
         st.frame_w = preset_w;
         st.frame_h = preset_h;
         st.video_dir = video_dir.clone();
+        st.scenes = store.names();
+        st.default_scene = store.default.clone().unwrap_or_default();
 
         match mode {
             AppMode::Embedded => {
@@ -433,6 +584,10 @@ async fn main() {
                         st.active_color = state.active_color;
                         st.fill_count = state.fill_count;
                         st.paused = state.paused;
+                        st.scene_smooth = state.scene_smooth;
+                        st.scene_transition_duration = state.scene_transition_duration;
+                        st.scene_autoplay = state.scene_autoplay;
+                        st.scene_autoplay_interval = state.scene_autoplay_interval;
                         // La carpeta de guardado la elige el usuario en el panel.
                         video_dir = state.video_dir.clone();
                         // El zoom lo puede mover tanto el slider del panel como
@@ -443,24 +598,29 @@ async fn main() {
                         }
                         prev_incoming_zoom = state.zoom_level;
 
-                        // Adoptamos los parámetros, pero conservamos lo que esta
-                        // simulación evoluciona por su cuenta (transición y, con
-                        // `gradual`, la matriz a la deriva).
-                        let mut p = state.params;
-                        p.blend = params.blend;
-                        p.from_state = params.from_state;
-                        // La transición de velocidad la conduce el sim; el panel
-                        // solo fija el objetivo vía evento SetSpeed.
-                        p.time_scale = params.time_scale;
-                        p.speed_target = params.speed_target;
-                        p.speed_from = params.speed_from;
-                        p.speed_blend = params.speed_blend;
-                        // La matriz la evoluciona el `sim` cuando hay deriva o
-                        // auto-aleatorizado; en esos casos conservamos la suya.
-                        if p.gradual || p.auto_randomize {
-                            p.matrix = params.matrix;
+                        // Durante una transición de escena el `sim` es el dueño de
+                        // los params (los está interpolando): no adoptamos los del
+                        // panel para no cortar el morph.
+                        if scene_morph.is_none() {
+                            // Adoptamos los parámetros, pero conservamos lo que esta
+                            // simulación evoluciona por su cuenta (transición y, con
+                            // `gradual`, la matriz a la deriva).
+                            let mut p = state.params;
+                            p.blend = params.blend;
+                            p.from_state = params.from_state;
+                            // La transición de velocidad la conduce el sim; el panel
+                            // solo fija el objetivo vía evento SetSpeed.
+                            p.time_scale = params.time_scale;
+                            p.speed_target = params.speed_target;
+                            p.speed_from = params.speed_from;
+                            p.speed_blend = params.speed_blend;
+                            // La matriz la evoluciona el `sim` cuando hay deriva o
+                            // auto-aleatorizado; en esos casos conservamos la suya.
+                            if p.gradual || p.auto_randomize {
+                                p.matrix = params.matrix;
+                            }
+                            params = p;
                         }
-                        params = p;
                     }
                     events = std::mem::take(&mut inbox.events);
                     let connected = inbox.connected;
@@ -519,6 +679,12 @@ async fn main() {
             }
             if is_key_pressed(KeyCode::A) {
                 params.attract_active = !params.attract_active;
+            }
+            if is_key_pressed(KeyCode::N) {
+                events.push(PanelEvent::NextScene);
+            }
+            if is_key_pressed(KeyCode::P) {
+                events.push(PanelEvent::PrevScene);
             }
             // Velocidad: teclas 1..9 = 10..90 %, tecla 0 = 100 %.
             for (key, pct) in [
@@ -587,6 +753,98 @@ async fn main() {
                         video_dir = dir.to_string_lossy().into_owned();
                     }
                 }
+                PanelEvent::SaveScene(name) => {
+                    store.upsert(&name, params.settled());
+                    if let Err(e) = store.save() {
+                        eprintln!("No se pudo guardar la escena '{name}': {e}");
+                    }
+                    scenes_dirty = true;
+                }
+                PanelEvent::LoadScene(name) => {
+                    if let Some(idx) = store.scenes.iter().position(|s| s.name == name) {
+                        current_scene_idx = idx;
+                        let target = store.scenes[idx].params.clone();
+                        scene_morph = start_scene(
+                            &mut params,
+                            &target,
+                            st.scene_smooth,
+                            st.scene_transition_duration,
+                        );
+                        // Carga instantánea: avisamos ya al panel; la suave, al
+                        // terminar el morph (ver `morph_done`).
+                        if scene_morph.is_none() && mode == AppMode::Detached {
+                            pending_apply = Some(params.clone());
+                        }
+                    }
+                }
+                PanelEvent::NextScene => {
+                    scene_morph = cycle_scene(
+                        1,
+                        &store,
+                        &mut params,
+                        &mut current_scene_idx,
+                        st.scene_smooth,
+                        st.scene_transition_duration,
+                    );
+                    if scene_morph.is_none() && mode == AppMode::Detached {
+                        pending_apply = Some(params.clone());
+                    }
+                }
+                PanelEvent::PrevScene => {
+                    scene_morph = cycle_scene(
+                        -1,
+                        &store,
+                        &mut params,
+                        &mut current_scene_idx,
+                        st.scene_smooth,
+                        st.scene_transition_duration,
+                    );
+                    if scene_morph.is_none() && mode == AppMode::Detached {
+                        pending_apply = Some(params.clone());
+                    }
+                }
+                PanelEvent::ExportScenes => {
+                    if let Some(path) = rfd::FileDialog::new()
+                        .add_filter("JSON", &["json"])
+                        .set_file_name("escenas_enjambre.json")
+                        .save_file()
+                    {
+                        if let Err(e) = store.export_to(&path) {
+                            eprintln!("No se pudo exportar las escenas: {e}");
+                        }
+                    }
+                }
+                PanelEvent::ImportScenes => {
+                    if let Some(path) = rfd::FileDialog::new()
+                        .add_filter("JSON", &["json"])
+                        .pick_file()
+                    {
+                        match SceneStore::import_from(&path) {
+                            Ok(other) => {
+                                store.merge(other);
+                                if let Err(e) = store.save() {
+                                    eprintln!("No se pudo guardar tras importar: {e}");
+                                }
+                                scenes_dirty = true;
+                            }
+                            Err(e) => eprintln!("No se pudo importar las escenas: {e}"),
+                        }
+                    }
+                }
+                PanelEvent::SetDefaultScene(name) => {
+                    store.set_default(&name);
+                    if let Err(e) = store.save() {
+                        eprintln!("No se pudo guardar la escena predeterminada: {e}");
+                    }
+                    scenes_dirty = true;
+                }
+                PanelEvent::DeleteScene(name) => {
+                    store.remove(&name);
+                    if let Err(e) = store.save() {
+                        eprintln!("No se pudo borrar la escena '{name}': {e}");
+                    }
+                    scenes_dirty = true;
+                }
                 other => apply_local_event(
                     other,
                     &mut sim,
@@ -612,6 +870,7 @@ async fn main() {
                         let _ = write_msg(w, &TelemetryMsg::Init(Box::new(state)));
                     }
                     init_sent = true;
+                    scenes_dirty = true; // envía la lista de escenas al panel nuevo
                 }
                 let tele = TelemetryMsg::Stats {
                     particle_count: sim.particles.len(),
@@ -629,6 +888,23 @@ async fn main() {
                 };
                 if let Some(w) = ipc.writer.lock().unwrap().as_mut() {
                     let _ = write_msg(w, &tele);
+                }
+                // Lista de escenas (solo cuando cambia) y aplicación de params
+                // tras cargar una escena (para que el panel no reenvíe los viejos).
+                if scenes_dirty {
+                    let list = TelemetryMsg::ScenesList {
+                        names: store.names(),
+                        default: store.default.clone().unwrap_or_default(),
+                    };
+                    if let Some(w) = ipc.writer.lock().unwrap().as_mut() {
+                        let _ = write_msg(w, &list);
+                    }
+                    scenes_dirty = false;
+                }
+                if let Some(p) = pending_apply.take() {
+                    if let Some(w) = ipc.writer.lock().unwrap().as_mut() {
+                        let _ = write_msg(w, &TelemetryMsg::ApplyParams(Box::new(p)));
+                    }
                 }
             }
         }

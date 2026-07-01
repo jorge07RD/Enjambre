@@ -65,6 +65,10 @@ programe explícitamente.
   con rejilla de tercios; tecla **`G`** para mostrar/ocultar) la zona a grabar, elige un **tamaño
   sugerido** (TikTok 9:16, 4:5, 1:1, 16:9…) y graba a 120 fps con la tecla **`R`** o el botón. El
   vídeo se codifica con `ffmpeg` a H.264; puedes **elegir la carpeta de guardado** desde la app.
+- **Escenas:** guarda la configuración actual como una **instantánea con nombre** para reproducir un
+  escenario cuando quieras, marca una como **predeterminada** (se carga al arrancar) y **cambia entre
+  escenas** de forma instantánea o con una **transición suave** (interpola los parámetros y cruza el
+  modo de interacción). Se guardan en `~/.config/enjambre/scenes.json`.
 - **Lienzo + cámara:** lienzo de tamaño variable con zoom y desplazamiento (rueda para
   zoom hacia el cursor, botón derecho para mover). Botón **«Lienzo = pantalla»** que iguala
   el mundo a los píxeles de la ventana (1:1), para que llene el lienzo sea cual sea el
@@ -143,6 +147,7 @@ cargo test -p sim --release throughput -- --nocapture
 | **F** | Llenar aleatorio | | **R** | Grabar / detener vídeo |
 | **M** | Aleatorizar matriz | | **G** | Mostrar / ocultar encuadre |
 | **1…9 / 0** | Velocidad 10 %…100 % | | **A** | Atraer zonas activas al centro |
+| **N / P** | Escena siguiente / anterior | | | |
 
 ## Grabación de vídeo
 
@@ -157,6 +162,25 @@ cargo test -p sim --release throughput -- --nocapture
 > o `-hyprland`). Sin portal, se guarda en el directorio actual.
 
 ![Recuadro de encuadre 9:16 con rejilla de tercios sobre el lienzo, y el panel de control](docs/img/06-encuadre.png)
+
+## Escenas (instantáneas de configuración)
+
+En la sección **Escenas** del panel:
+
+1. Escribe un nombre y pulsa **📸 Guardar** para guardar la configuración actual como escena.
+2. En la lista, **▶** carga una escena, **⟳** la **actualiza** con la configuración actual,
+   **★** la marca como predeterminada (se carga al arrancar) y **🗑** la borra.
+3. Marca **«Transición suave entre escenas»** (con su duración) para que al cargar una escena los
+   parámetros se **interpolen** y el modo de interacción se **cruce** gradualmente; si lo desmarcas,
+   el cambio es instantáneo.
+4. **Ciclar:** botones **⏮/⏭** o teclas **`P`/`N`** para ir a la escena anterior/siguiente. Con
+   **«Auto-avance (slideshow)»** cambia sola cada X segundos.
+5. **Compartir/respaldar:** **⬆ Exportar todas** vuelca la colección a un `.json` (diálogo nativo) y
+   **⬇ Importar…** la fusiona con la tuya.
+
+Las escenas se guardan en `~/.config/enjambre/scenes.json` (solo los ajustes; las partículas se
+rehacen con las nuevas reglas). **En el primer arranque** se siembran unas escenas de ejemplo
+(Enjambres, Células, Cazadores, Cíclico, Espuma, Opuestos).
 
 ## Estructura del código
 

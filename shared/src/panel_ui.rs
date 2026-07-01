@@ -27,6 +27,19 @@ pub struct PanelState {
     /// Carpeta de guardado de los vídeos (vacío = directorio de trabajo).
     pub video_dir: String,
 
+    // --- Escenas ---
+    /// Nombre en edición para guardar una escena nueva.
+    pub scene_name_input: String,
+    /// Transición suave al cambiar de escena.
+    pub scene_smooth: bool,
+    pub scene_transition_duration: f32,
+    /// Auto-avance (slideshow) entre escenas y su intervalo (s).
+    pub scene_autoplay: bool,
+    pub scene_autoplay_interval: f32,
+    /// Lista de escenas y predeterminada (las gobierna el `sim` por telemetría).
+    pub scenes: Vec<String>,
+    pub default_scene: String,
+
     // Telemetría que llega de la simulación (solo para mostrar).
     pub particle_count: usize,
     pub fps: i32,
@@ -55,6 +68,13 @@ impl Default for PanelState {
             zoom_level: 1.0,
             paused: false,
             video_dir: String::new(),
+            scene_name_input: String::new(),
+            scene_smooth: true,
+            scene_transition_duration: 3.0,
+            scene_autoplay: false,
+            scene_autoplay_interval: 10.0,
+            scenes: Vec::new(),
+            default_scene: String::new(),
             particle_count: 0,
             fps: 0,
             recording: false,
@@ -90,6 +110,20 @@ pub enum PanelEvent {
     CenterFrame,
     /// Abrir un diálogo nativo para elegir la carpeta de guardado.
     PickVideoDir,
+    /// Guardar la configuración actual como escena con este nombre.
+    SaveScene(String),
+    /// Cargar una escena (transición suave si está activada).
+    LoadScene(String),
+    /// Marcar una escena como predeterminada (se carga al arrancar).
+    SetDefaultScene(String),
+    /// Borrar una escena guardada.
+    DeleteScene(String),
+    /// Cargar la siguiente / anterior escena de la lista (ciclado).
+    NextScene,
+    PrevScene,
+    /// Exportar todas las escenas a un archivo / importar y fusionar.
+    ExportScenes,
+    ImportScenes,
     /// Ajustar el zoom para que el lienzo entre en la ventana.
     FitCanvas,
     /// Igualar el lienzo a los píxeles de la ventana de simulación (1:1).
@@ -235,6 +269,84 @@ pub fn config_panel(
             params.speed_target * 100.0
         ));
         ui.label("Atajos: teclas 1…0 = 10 %…100 %");
+
+        ui.separator();
+        ui.heading("Escenas");
+        ui.horizontal(|ui| {
+            ui.add(
+                egui::TextEdit::singleline(&mut st.scene_name_input)
+                    .hint_text("nombre")
+                    .desired_width(120.0),
+            );
+            if ui.button("📸 Guardar").clicked() && !st.scene_name_input.trim().is_empty() {
+                events.push(PanelEvent::SaveScene(st.scene_name_input.trim().to_string()));
+            }
+        });
+        ui.checkbox(&mut st.scene_smooth, "Transición suave entre escenas");
+        if st.scene_smooth {
+            ui.add(
+                egui::Slider::new(&mut st.scene_transition_duration, 0.2..=20.0)
+                    .logarithmic(true)
+                    .text("Duración (s)"),
+            );
+        }
+        // Ciclado entre escenas (también con las teclas N / P).
+        ui.horizontal(|ui| {
+            if ui.button("⏮ Anterior (P)").clicked() {
+                events.push(PanelEvent::PrevScene);
+            }
+            if ui.button("Siguiente ⏭ (N)").clicked() {
+                events.push(PanelEvent::NextScene);
+            }
+        });
+        ui.checkbox(&mut st.scene_autoplay, "Auto-avance (slideshow)");
+        if st.scene_autoplay {
+            ui.add(
+                egui::Slider::new(&mut st.scene_autoplay_interval, 1.0..=120.0)
+                    .logarithmic(true)
+                    .text("Cada (s)"),
+            );
+        }
+        // Exportar / importar la colección a un archivo.
+        ui.horizontal(|ui| {
+            if ui.button("⬆ Exportar todas").clicked() {
+                events.push(PanelEvent::ExportScenes);
+            }
+            if ui.button("⬇ Importar…").clicked() {
+                events.push(PanelEvent::ImportScenes);
+            }
+        });
+        if st.scenes.is_empty() {
+            ui.label("Aún no hay escenas. Escribe un nombre y pulsa Guardar.");
+        } else {
+            for name in st.scenes.clone() {
+                let is_def = st.default_scene == name;
+                ui.horizontal(|ui| {
+                    if ui.button("▶").on_hover_text("Cargar").clicked() {
+                        events.push(PanelEvent::LoadScene(name.clone()));
+                    }
+                    if ui
+                        .button("⟳")
+                        .on_hover_text("Actualizar con la configuración actual")
+                        .clicked()
+                    {
+                        // Sobrescribe la escena existente (upsert por nombre).
+                        events.push(PanelEvent::SaveScene(name.clone()));
+                    }
+                    if ui
+                        .selectable_label(is_def, "★")
+                        .on_hover_text("Predeterminada")
+                        .clicked()
+                    {
+                        events.push(PanelEvent::SetDefaultScene(name.clone()));
+                    }
+                    if ui.button("🗑").on_hover_text("Borrar").clicked() {
+                        events.push(PanelEvent::DeleteScene(name.clone()));
+                    }
+                    ui.label(&name);
+                });
+            }
+        }
 
         ui.separator();
         ui.heading("Llenar aleatorio");

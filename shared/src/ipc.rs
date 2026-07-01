@@ -25,6 +25,13 @@ pub struct ControlState {
     pub fill_count: i32,
     /// Carpeta donde guardar los vídeos (vacío = directorio de trabajo).
     pub video_dir: String,
+    /// Si la transición entre escenas debe ser suave.
+    pub scene_smooth: bool,
+    /// Duración (s) de esa transición.
+    pub scene_transition_duration: f32,
+    /// Auto-avance (slideshow) entre escenas y su intervalo (s).
+    pub scene_autoplay: bool,
+    pub scene_autoplay_interval: f32,
 }
 
 /// Mensajes panel → sim.
@@ -63,6 +70,15 @@ pub enum TelemetryMsg {
         canvas_size: f32,
         zoom_level: f32,
     },
+    /// Lista de escenas guardadas y la predeterminada (se envía al conectar y
+    /// cada vez que cambia el almacén). El `sim` es el dueño de las escenas.
+    ScenesList {
+        names: Vec<String>,
+        default: String,
+    },
+    /// El `sim` fija los parámetros del panel (tras cargar una escena o la
+    /// predeterminada), para que el panel no reenvíe los ajustes anteriores.
+    ApplyParams(Box<SimParams>),
 }
 
 /// Ruta del socket. Usa `$XDG_RUNTIME_DIR` (efímero por sesión) y cae a `/tmp`.

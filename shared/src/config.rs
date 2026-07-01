@@ -434,6 +434,37 @@ impl SimParams {
         }
     }
 
+    /// Copia con el estado de transición ya asentado, para guardar como escena
+    /// (sin quedar a medias de un blend de interacción o de velocidad).
+    pub fn settled(&self) -> SimParams {
+        let mut p = self.clone();
+        p.blend = 1.0;
+        p.from_state = p.current_snapshot();
+        p.speed_target = p.time_scale;
+        p.speed_from = p.time_scale;
+        p.speed_blend = 1.0;
+        p
+    }
+
+    /// Interpola los parámetros numéricos "no de interacción" desde `from` hacia
+    /// `target` por la fracción `t` (0..1). La interacción (modo/matriz/rango) la
+    /// cruza aparte el sistema de transición (`start_transition`), y los campos
+    /// discretos y las duraciones se fijan al cargar/terminar la escena.
+    pub fn lerp_scene_numeric(&mut self, from: &SimParams, target: &SimParams, t: f32) {
+        let l = |a: f32, b: f32| a + (b - a) * t;
+        self.force = l(from.force, target.force);
+        self.r_max = l(from.r_max, target.r_max);
+        self.beta = l(from.beta, target.beta);
+        self.friction = l(from.friction, target.friction);
+        self.point_size = l(from.point_size, target.point_size);
+        self.brightness = l(from.brightness, target.brightness);
+        self.random_color_rate = l(from.random_color_rate, target.random_color_rate);
+        self.gradual_color_speed = l(from.gradual_color_speed, target.gradual_color_speed);
+        self.gradual_matrix_speed = l(from.gradual_matrix_speed, target.gradual_matrix_speed);
+        self.attract_active_strength = l(from.attract_active_strength, target.attract_active_strength);
+        self.auto_randomize_interval = l(from.auto_randomize_interval, target.auto_randomize_interval);
+    }
+
     /// Rellena la matriz con coeficientes aleatorios en [-1, 1].
     pub fn randomize_matrix(&mut self, rng: &mut impl Rng) {
         for i in 0..NUM_COLORS {
