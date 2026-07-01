@@ -1,11 +1,23 @@
-# Enjambre — Puntos de Atracción
+<h1 align="center">🐝 Enjambre — Puntos de Atracción</h1>
 
-Un simulador interactivo de **vida de partículas** (*particle life*) escrito en Rust.
-Miles de puntos de colores se mueven según reglas simples de atracción y repulsión
-y, a partir de ellas, emergen patrones complejos: enjambres, células, anillos,
-cadenas y estructuras que parecen vivas.
+<p align="center">
+  <em>Simulador interactivo de <strong>vida de partículas</strong> en Rust: miles de puntos de colores que se organizan solos en enjambres, células, anillos y estructuras vivas.</em>
+</p>
 
-## Demo
+<p align="center">
+  <img src="https://img.shields.io/badge/Rust-2021-000000?logo=rust&logoColor=white" alt="Rust">
+  <img src="https://img.shields.io/badge/render-macroquad-FF6B00" alt="macroquad">
+  <img src="https://img.shields.io/badge/UI-egui%20%2F%20eframe-1E88E5?logo=egui&logoColor=white" alt="egui / eframe">
+  <img src="https://img.shields.io/badge/paralelismo-rayon-8E44AD" alt="rayon">
+  <img src="https://img.shields.io/badge/Linux-Wayland%20%2F%20Hyprland-1793D1?logo=linux&logoColor=white" alt="Linux · Wayland/Hyprland">
+  <img src="https://img.shields.io/badge/v%C3%ADdeo-TikTok%209%3A16-000000?logo=tiktok&logoColor=white" alt="Vídeo vertical">
+  <img src="https://img.shields.io/badge/estado-activo-2ECC71" alt="Estado: activo">
+</p>
+
+A partir de reglas simples de atracción y repulsión emergen patrones complejos —sin
+que nadie los programe explícitamente—: enjambres, células, cadenas y ondas viajeras.
+
+## 🎬 Demo
 
 Vídeo vertical **9:16** grabado desde la propia app (tecla `R`), como los que se suben a TikTok:
 
@@ -26,7 +38,7 @@ Vídeo vertical **9:16** grabado desde la propia app (tecla `R`), como los que s
 
 ![Modo "mismo color": cada color se agrupa en anillos](docs/img/01-inicio.png)
 
-## ¿Qué es esto?
+## 🌌 ¿Qué es esto?
 
 Cada partícula tiene un **color** (un matiz en la rueda de color) y siente una fuerza
 hacia las demás que depende de:
@@ -39,12 +51,12 @@ repelen** según las reglas de color. Con esas dos reglas básicas, más una piz
 fricción, aparecen comportamientos colectivos sorprendentes — sin que nadie los
 programe explícitamente.
 
-## Características
+## ✨ Características
 
-- **Hasta decenas de miles de partículas** en tiempo real. El cálculo de fuerzas usa
+- 🐝 **Hasta decenas de miles de partículas** en tiempo real. El cálculo de fuerzas usa
   un *hash* espacial (rejilla CSR) y se reparte entre todos los núcleos con
   [`rayon`](https://crates.io/crates/rayon).
-- **Siete modos de interacción:**
+- 🎨 **Siete modos de interacción:**
   - **Mismo color** — solo los iguales se atraen (opcionalmente, los distintos se repelen).
   - **Matriz** — una tabla 6×6 editable define cuánto atrae/repele cada color a cada otro,
     al estilo *particle life* clásico. Botón para aleatorizar las reglas.
@@ -56,32 +68,32 @@ programe explícitamente.
   - **Depredador–presa** — un bando caza y el otro huye en manada (interacción asimétrica).
   - **Repulsión propia** — el mismo color se repele y los distintos se atraen (mezclas
     homogéneas, espumas y mosaicos).
-- **Física ajustable en vivo:** fuerza, radio, repulsión (β), fricción, velocidad (en %,
+- ⚙️ **Física ajustable en vivo:** fuerza, radio, repulsión (β), fricción, velocidad (en %,
   con cambio suave y atajos 1…0) y bordes **toroidales** (la pantalla se enrolla) o de **rebote**.
-- **Dinámica del color:** cambios aleatorios de color, deriva lenta y gradual de
+- 🌈 **Dinámica del color:** cambios aleatorios de color, deriva lenta y gradual de
   colores y reglas, con transiciones suaves opcionales. La matriz puede **auto-aleatorizarse
   cada X segundos** para animaciones que evolucionan solas.
-- **Grabación de vídeo:** define con un **recuadro ajustable** sobre el lienzo (mover/redimensionar,
+- 🎥 **Grabación de vídeo:** define con un **recuadro ajustable** sobre el lienzo (mover/redimensionar,
   con rejilla de tercios; tecla **`G`** para mostrar/ocultar) la zona a grabar, elige un **tamaño
   sugerido** (TikTok 9:16, 4:5, 1:1, 16:9…) y graba a 120 fps con la tecla **`R`** o el botón. El
   vídeo se codifica con `ffmpeg` a H.264; puedes **elegir la carpeta de guardado** desde la app.
-- **Escenas:** guarda la configuración actual como una **instantánea con nombre** para reproducir un
+- 🎞️ **Escenas:** guarda la configuración actual como una **instantánea con nombre** para reproducir un
   escenario cuando quieras, marca una como **predeterminada** (se carga al arrancar) y **cambia entre
   escenas** de forma instantánea o con una **transición suave** (interpola los parámetros y cruza el
   modo de interacción). Se guardan en `~/.config/enjambre/scenes.json`.
-- **Lienzo + cámara:** lienzo de tamaño variable con zoom y desplazamiento (rueda para
+- 🖼️ **Lienzo + cámara:** lienzo de tamaño variable con zoom y desplazamiento (rueda para
   zoom hacia el cursor, botón derecho para mover). Botón **«Lienzo = pantalla»** que iguala
   el mundo a los píxeles de la ventana (1:1), para que llene el lienzo sea cual sea el
   tamaño que le dé el gestor de ventanas (ideal para tiling como Hyprland).
-- **Panel separable:** el panel de control puede vivir embebido a la derecha del lienzo
+- 🪟 **Panel separable:** el panel de control puede vivir embebido a la derecha del lienzo
   o, con un clic, abrirse como **ventana del SO aparte** (proceso `panel`) que se puede
   tilear/redimensionar por separado. Ambos hablan por un socket Unix.
-- **Pincel:** pinta o borra partículas del color que quieras directamente sobre el lienzo.
-- **Tres estilos de dibujo:** sólido, brillo (*glow*) y sólido con halo.
+- 🖌️ **Pincel:** pinta o borra partículas del color que quieras directamente sobre el lienzo.
+- 💡 **Tres estilos de dibujo:** sólido, brillo (*glow*) y sólido con halo.
 
 ![Modo "matriz": clústeres orgánicos mezclando colores según la tabla 6×6](docs/img/02-matriz.png)
 
-## Tecnologías
+## 🧰 Tecnologías
 
 | Componente | Biblioteca |
 |------------|------------|
@@ -94,7 +106,7 @@ programe explícitamente.
 | Diálogo de carpeta | [`rfd`](https://crates.io/crates/rfd) (portal XDG) |
 | Codificación de vídeo | [`ffmpeg`](https://ffmpeg.org/) (externo) |
 
-## Compilar y ejecutar
+## 🚀 Compilar y ejecutar
 
 Necesitas [Rust](https://rustup.rs/) instalado.
 
@@ -119,7 +131,7 @@ El panel arranca embebido. Para separarlo, pulsa **«🗗 Separar panel en otra 
 el `sim` lanza automáticamente el binario `panel`. (También puedes ejecutarlo a mano con
 `cargo run -p panel --release` mientras el `sim` está abierto.)
 
-### Benchmark
+### 📊 Benchmark
 
 Hay una prueba de rendimiento que mide los pasos de simulación por segundo para
 5 000, 20 000 y 50 000 partículas:
@@ -128,7 +140,7 @@ Hay una prueba de rendimiento que mide los pasos de simulación por segundo para
 cargo test -p sim --release throughput -- --nocapture
 ```
 
-## Controles rápidos
+## 🎮 Controles rápidos
 
 - **Rueda del ratón** — zoom hacia el cursor.
 - **Botón derecho / central** — mover la vista (*pan*).
@@ -137,7 +149,7 @@ cargo test -p sim --release throughput -- --nocapture
 - Todo lo demás se ajusta desde el **panel de control** (embebido a la derecha o en
   su ventana aparte).
 
-### Atajos de teclado (sobre la ventana del lienzo)
+### ⌨️ Atajos de teclado (sobre la ventana del lienzo)
 
 | Tecla | Acción | | Tecla | Acción |
 |-------|--------|-|-------|--------|
@@ -149,7 +161,7 @@ cargo test -p sim --release throughput -- --nocapture
 | **1…9 / 0** | Velocidad 10 %…100 % | | **A** | Atraer zonas activas al centro |
 | **N / P** | Escena siguiente / anterior | | | |
 
-## Grabación de vídeo
+## 🎥 Grabación de vídeo
 
 1. Pulsa **`G`** (o el checkbox del panel) para mostrar el **recuadro de encuadre**; arrástralo
    para moverlo o coge una esquina para redimensionarlo. Elige un **Tamaño** sugerido en el panel.
@@ -163,7 +175,7 @@ cargo test -p sim --release throughput -- --nocapture
 
 ![Recuadro de encuadre 9:16 con rejilla de tercios sobre el lienzo, y el panel de control](docs/img/06-encuadre.png)
 
-## Escenas (instantáneas de configuración)
+## 🎞️ Escenas (instantáneas de configuración)
 
 En la sección **Escenas** del panel:
 
@@ -182,7 +194,7 @@ Las escenas se guardan en `~/.config/enjambre/scenes.json` (solo los ajustes; la
 rehacen con las nuevas reglas). **En el primer arranque** se siembran unas escenas de ejemplo
 (Enjambres, Células, Cazadores, Cíclico, Espuma, Opuestos).
 
-## Estructura del código
+## 🗂️ Estructura del código
 
 | Archivo | Responsabilidad |
 |---------|-----------------|
