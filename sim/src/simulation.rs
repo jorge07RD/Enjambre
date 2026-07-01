@@ -17,6 +17,8 @@ pub struct Particle {
 pub struct Simulation {
     pub particles: Vec<Particle>,
     pub world: Vec2,
+    /// Punto hacia el que se atraen las zonas activas (centro de la vista).
+    pub focus: Vec2,
     grid: Grid,
     /// Aceleraciones acumuladas por partícula (scratch reutilizado).
     forces: Vec<Vec2>,
@@ -27,6 +29,7 @@ impl Simulation {
         Self {
             particles: Vec::new(),
             world,
+            focus: world * 0.5,
             grid: Grid::new(),
             forces: Vec::new(),
         }
@@ -135,6 +138,11 @@ impl Simulation {
         let beta = params.beta;
         let world = self.world;
         let half = world * 0.5;
+        // Recentrado de zonas activas: atracción hacia `focus` proporcional a la
+        // densidad local (nº de vecinos), para desapilar los grumos lejanos.
+        let attract = params.attract_active;
+        let attract_strength = params.attract_active_strength;
+        let focus = self.focus;
 
         let mut forces = std::mem::take(&mut self.forces);
         forces.clear();
@@ -153,6 +161,7 @@ impl Simulation {
                 let pi = particles[i];
                 let (cx, cy) = grid.cell_coord(pi.pos);
                 let mut acc = Vec2::ZERO;
+                let mut neighbors = 0u32;
 
                 for dy in -1..=1 {
                     for dx in -1..=1 {
@@ -192,12 +201,38 @@ impl Simulation {
                             if d2 > r_max2 || d2 < 1e-8 {
                                 continue;
                             }
+                            neighbors += 1;
                             let dist = d2.sqrt();
                             let r = dist * inv_r_max;
                             let coef = params.interaction(pi.hue, pj.hue);
                             let f = force_fn(r, coef, beta);
                             acc += d * (f / dist);
                         }
+                    }
+                }
+
+                // Atracción leve al centro para las zonas con mucha actividad
+                // (densidad alta). Las partículas dispersas casi no se enteran.
+                if attract {
+                    let mut toward = focus - pi.pos;
+                    if wrap {
+                        // Imagen mínima: tira por el camino más corto del toro.
+                        if toward.x > half.x {
+                            toward.x -= world.x;
+                        } else if toward.x < -half.x {
+                            toward.x += world.x;
+                        }
+                        if toward.y > half.y {
+                            toward.y -= world.y;
+                        } else if toward.y < -half.y {
+                            toward.y += world.y;
+                        }
+                    }
+                    let d = toward.length();
+                    if d > 1.0 {
+                        // Densidad normalizada: ~0 para solitarias, satura en 1.
+                        let activity = (neighbors as f32 / 30.0).min(1.0);
+                        acc += (toward / d) * (attract_strength * activity);
                     }
                 }
                 *out = acc;

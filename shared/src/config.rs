@@ -284,6 +284,14 @@ pub struct SimParams {
     pub auto_randomize: bool,
     /// Intervalo (s) entre aleatorizados automáticos de la matriz.
     pub auto_randomize_interval: f32,
+
+    // --- Recentrado de zonas activas ---
+    /// Si está activo, las partículas en zonas densas (mucha actividad) sienten
+    /// una atracción leve hacia el centro de la vista, para traer la acción de
+    /// vuelta cuando se apila lejos de la cámara.
+    pub attract_active: bool,
+    /// Intensidad de esa atracción al centro (0 = nada).
+    pub attract_active_strength: f32,
 }
 
 impl Default for SimParams {
@@ -331,6 +339,8 @@ impl Default for SimParams {
             speed_blend: 1.0,
             auto_randomize: false,
             auto_randomize_interval: 8.0,
+            attract_active: false,
+            attract_active_strength: 0.4,
         }
     }
 }

@@ -368,6 +368,8 @@ async fn main() {
         let aspect = screen_width() / screen_height();
         let world = Vec2::new(st.canvas_size * aspect, st.canvas_size);
         sim.world = world;
+        // El recentrado de zonas activas tira hacia el centro de la vista.
+        sim.focus = pan_target;
 
         // La velocidad transita de forma suave hacia su objetivo (aunque esté
         // en pausa, para que al reanudar ya esté en el valor pedido).
@@ -514,6 +516,9 @@ async fn main() {
             }
             if is_key_pressed(KeyCode::G) {
                 show_frame = !show_frame;
+            }
+            if is_key_pressed(KeyCode::A) {
+                params.attract_active = !params.attract_active;
             }
             // Velocidad: teclas 1..9 = 10..90 %, tecla 0 = 100 %.
             for (key, pct) in [

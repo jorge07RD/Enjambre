@@ -259,6 +259,17 @@ pub fn config_panel(
             ui.selectable_value(&mut params.boundary, Boundary::Wrap, "Toroidal");
             ui.selectable_value(&mut params.boundary, Boundary::Bounce, "Rebote");
         });
+        ui.checkbox(
+            &mut params.attract_active,
+            "Atraer zonas activas al centro (A)",
+        );
+        if params.attract_active {
+            ui.add(
+                egui::Slider::new(&mut params.attract_active_strength, 0.0..=2.0)
+                    .text("Fuerza de recentrado"),
+            );
+            ui.label("Los grupos densos se acercan suavemente al centro de la vista.");
+        }
 
         ui.separator();
         ui.heading("Apariencia");
