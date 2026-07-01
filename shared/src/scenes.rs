@@ -112,7 +112,7 @@ impl SceneStore {
 /// Colección de escenas de ejemplo para sembrar en el primer arranque, una por
 /// modo de interacción, con parámetros ajustados para que luzcan distintas.
 pub fn example_store() -> SceneStore {
-    use crate::config::{InteractionMode, RenderStyle};
+    use crate::config::{BoidsScope, Boundary, InteractionMode, RenderStyle};
     let base = SimParams::default();
 
     let scene = |name: &str, p: SimParams| Scene {
@@ -176,6 +176,21 @@ pub fn example_store() -> SceneStore {
         friction: 0.86,
         ..base.clone()
     };
+    let murmuracion = SimParams {
+        mode: InteractionMode::Boids,
+        boundary: Boundary::Wrap,
+        boids_scope: BoidsScope::Hybrid,
+        boids_separation: 1.6,
+        boids_alignment: 1.1,
+        boids_cohesion: 0.9,
+        boids_sep_radius: 0.35,
+        boids_cruise: 55.0,
+        force: 1.0,
+        friction: 0.82,
+        r_max: 110.0,
+        point_size: 3.5,
+        ..base.clone()
+    };
 
     SceneStore {
         default: Some("Enjambres".to_string()),
@@ -186,6 +201,7 @@ pub fn example_store() -> SceneStore {
             scene("Cíclico", ciclico),
             scene("Espuma", espuma),
             scene("Opuestos", opuestos),
+            scene("Murmuración", murmuracion),
         ],
     }
 }

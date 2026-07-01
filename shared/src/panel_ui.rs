@@ -7,8 +7,8 @@
 //! que cada proceso las resuelva a su manera (localmente o por IPC).
 
 use crate::config::{
-    palette, Boundary, Brush, InteractionMode, InteractionSnapshot, RenderStyle, SimParams,
-    COLOR_NAMES, FRAME_PRESETS, NUM_COLORS,
+    palette, BoidsScope, Boundary, Brush, InteractionMode, InteractionSnapshot, RenderStyle,
+    SimParams, COLOR_NAMES, FRAME_PRESETS, NUM_COLORS,
 };
 use serde::{Deserialize, Serialize};
 
@@ -446,6 +446,7 @@ pub fn config_panel(
             ui.selectable_value(&mut params.mode, InteractionMode::Opposite, "Opuestos");
             ui.selectable_value(&mut params.mode, InteractionMode::PredatorPrey, "Depredador-presa");
             ui.selectable_value(&mut params.mode, InteractionMode::SelfRepel, "Repulsión propia");
+            ui.selectable_value(&mut params.mode, InteractionMode::Boids, "Bandada");
         });
         if params.mode == InteractionMode::SameColorOnly {
             if ui
@@ -513,6 +514,23 @@ pub fn config_panel(
         }
         if params.mode == InteractionMode::SelfRepel {
             ui.label("El mismo color se repele y los distintos se atraen (mezcla homogénea).");
+        }
+        if params.mode == InteractionMode::Boids {
+            ui.label("Murmuración (Boids): separación, alineación y cohesión.");
+            ui.horizontal(|ui| {
+                ui.label("Bandada:");
+                ui.selectable_value(&mut params.boids_scope, BoidsScope::All, "Todas");
+                ui.selectable_value(&mut params.boids_scope, BoidsScope::SameColor, "Por color");
+                ui.selectable_value(&mut params.boids_scope, BoidsScope::Hybrid, "Híbrido");
+            });
+            ui.add(egui::Slider::new(&mut params.boids_separation, 0.0..=3.0).text("Separación"));
+            ui.add(egui::Slider::new(&mut params.boids_alignment, 0.0..=3.0).text("Alineación"));
+            ui.add(egui::Slider::new(&mut params.boids_cohesion, 0.0..=3.0).text("Cohesión"));
+            ui.add(
+                egui::Slider::new(&mut params.boids_sep_radius, 0.1..=1.0)
+                    .text("Radio de separación"),
+            );
+            ui.add(egui::Slider::new(&mut params.boids_cruise, 0.0..=150.0).text("Crucero"));
         }
 
         if params.mode != old_mode {

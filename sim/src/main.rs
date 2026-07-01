@@ -294,6 +294,18 @@ impl Ipc {
         });
         Some(Ipc { inbox, writer })
     }
+
+    /// Cierra la conexión con el panel actual (si la hay). Al apagar el stream,
+    /// el lector del panel recibe EOF y la ventana se cierra sola; el hilo
+    /// servidor vuelve a `accept()` esperando un panel nuevo. Se usa al volver
+    /// a acoplar para no dejar paneles huérfanos (que provocan "dos paneles" y
+    /// que un panel nuevo se quede sin atender).
+    fn disconnect(&self) {
+        if let Some(w) = self.writer.lock().unwrap().take() {
+            let _ = w.shutdown(std::net::Shutdown::Both);
+        }
+        self.inbox.lock().unwrap().connected = false;
+    }
 }
 
 /// Localiza el binario `panel`. Primero el hermano del ejecutable actual
@@ -561,6 +573,14 @@ async fn main() {
                 st.standalone = false;
                 st.particle_count = sim.particles.len();
                 st.fps = get_fps();
+                // Si un panel se conecta estando acoplados (p. ej. uno lanzado
+                // que arranca tarde tras un Reattach), lo cerramos: en modo
+                // embebido no lo atendemos, y dejarlo abierto daría "dos paneles".
+                if let Some(ipc) = &ipc {
+                    if ipc.inbox.lock().unwrap().connected {
+                        ipc.disconnect();
+                    }
+                }
                 egui_macroquad::ui(|ctx| {
                     want_pointer = ctx.wants_pointer_input();
                     want_keyboard = ctx.wants_keyboard_input();
@@ -724,8 +744,15 @@ async fn main() {
                     }
                 }
                 PanelEvent::Reattach => {
+                    // Cerramos el panel separado para no dejarlo huérfano (si el
+                    // Reattach vino de la tecla `D` en esta ventana, el panel no
+                    // se entera por sí solo de que debe cerrarse).
+                    if let Some(ipc) = &ipc {
+                        ipc.disconnect();
+                    }
                     mode = AppMode::Embedded;
                     panel_was_connected = false;
+                    init_sent = false;
                 }
                 PanelEvent::ToggleRecord => match rec.take() {
                     Some(r) => r.finish(),

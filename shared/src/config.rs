@@ -87,6 +87,21 @@ pub enum InteractionMode {
     /// Repulsión propia / atracción ajena: el mismo color se repele y los
     /// distintos se atraen. Espumas y mosaicos homogéneos.
     SelfRepel,
+    /// Bandada (Boids de Craig Reynolds, 1986): cada partícula sigue tres reglas
+    /// locales —separación, alineación y cohesión— y emerge una murmuración.
+    /// No usa el coeficiente escalar; su física es vectorial (ver `Simulation`).
+    Boids,
+}
+
+/// Con qué vecinos se agrupa cada partícula en modo Boids.
+#[derive(Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub enum BoidsScope {
+    /// Todas juntas, ignorando el color: una sola gran murmuración.
+    All,
+    /// Solo con el mismo color: varias bandadas independientes por color.
+    SameColor,
+    /// Separación frente a todas; alineación y cohesión solo con el mismo color.
+    Hybrid,
 }
 
 /// Comportamiento en los bordes del lienzo.
@@ -183,6 +198,9 @@ fn coef_raw(
                 0.5
             }
         }
+        // Boids no usa coeficiente escalar: su física (separación/alineación/
+        // cohesión) se calcula aparte en `Simulation::step`.
+        InteractionMode::Boids => 0.0,
     }
 }
 
@@ -213,7 +231,12 @@ impl InteractionSnapshot {
 }
 
 /// Parámetros ajustables de la simulación.
+///
+/// `#[serde(default)]` a nivel de contenedor: los campos ausentes en un JSON
+/// (p. ej. una `scenes.json` guardada antes de añadir campos nuevos) toman su
+/// valor de `Default`. Así añadir parámetros no rompe escenas ni IPC antiguos.
 #[derive(Clone, Serialize, Deserialize)]
+#[serde(default)]
 pub struct SimParams {
     pub force: f32,
     pub r_max: f32,
@@ -292,6 +315,20 @@ pub struct SimParams {
     pub attract_active: bool,
     /// Intensidad de esa atracción al centro (0 = nada).
     pub attract_active_strength: f32,
+
+    // --- Bandada (Boids) ---
+    /// Con qué vecinos se agrupa cada partícula (todas / mismo color / híbrido).
+    pub boids_scope: BoidsScope,
+    /// Peso de la regla de separación (evitar vecinos muy cercanos).
+    pub boids_separation: f32,
+    /// Peso de la regla de alineación (igualar la velocidad media de los vecinos).
+    pub boids_alignment: f32,
+    /// Peso de la regla de cohesión (acercarse al centro del grupo).
+    pub boids_cohesion: f32,
+    /// Radio de separación como fracción de `r_max` (0..1).
+    pub boids_sep_radius: f32,
+    /// Velocidad de crucero: rapidez mínima que mantienen los "pájaros" (0 = off).
+    pub boids_cruise: f32,
 }
 
 impl Default for SimParams {
@@ -341,6 +378,12 @@ impl Default for SimParams {
             auto_randomize_interval: 8.0,
             attract_active: false,
             attract_active_strength: 0.4,
+            boids_scope: BoidsScope::Hybrid,
+            boids_separation: 1.5,
+            boids_alignment: 1.0,
+            boids_cohesion: 1.0,
+            boids_sep_radius: 0.35,
+            boids_cruise: 48.0,
         }
     }
 }
@@ -463,6 +506,11 @@ impl SimParams {
         self.gradual_matrix_speed = l(from.gradual_matrix_speed, target.gradual_matrix_speed);
         self.attract_active_strength = l(from.attract_active_strength, target.attract_active_strength);
         self.auto_randomize_interval = l(from.auto_randomize_interval, target.auto_randomize_interval);
+        self.boids_separation = l(from.boids_separation, target.boids_separation);
+        self.boids_alignment = l(from.boids_alignment, target.boids_alignment);
+        self.boids_cohesion = l(from.boids_cohesion, target.boids_cohesion);
+        self.boids_sep_radius = l(from.boids_sep_radius, target.boids_sep_radius);
+        self.boids_cruise = l(from.boids_cruise, target.boids_cruise);
     }
 
     /// Rellena la matriz con coeficientes aleatorios en [-1, 1].

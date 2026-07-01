@@ -1,5 +1,5 @@
 use crate::grid::Grid;
-use shared::{hue_for_index, Boundary, SimParams, NUM_COLORS};
+use shared::{hue_bucket, hue_for_index, BoidsScope, Boundary, InteractionMode, SimParams, NUM_COLORS};
 use macroquad::prelude::Vec2;
 use rand::Rng;
 use rayon::prelude::*;
@@ -144,6 +144,40 @@ impl Simulation {
         let attract_strength = params.attract_active_strength;
         let focus = self.focus;
 
+        // Bandada (Boids): física vectorial que sustituye a la fuerza radial.
+        // Como Boids no usa el coeficiente escalar, no puede mezclarse con el
+        // sistema de blend del `coef`. En su lugar cruzamos los DOS modelos de
+        // fuerza con un factor global `boids_mix` (0 = radial, 1 = bandada) que
+        // sigue el mismo `blend`/ease que `interaction()`. Así una transición o
+        // un morph de escena hacia/desde la bandada respeta su duración: la
+        // fuerza radial se desvanece (vía `interaction`, cuyo coef objetivo es 0
+        // en Boids) mientras la bandada aparece, y viceversa.
+        let boids_mix = {
+            let to_boids = if params.mode == InteractionMode::Boids { 1.0 } else { 0.0 };
+            if params.smooth && params.blend < 1.0 {
+                let from_boids =
+                    if params.from_state.mode == InteractionMode::Boids { 1.0 } else { 0.0 };
+                let b = params.blend;
+                let t = b * b * (3.0 - 2.0 * b); // mismo ease que `interaction()`
+                from_boids + (to_boids - from_boids) * t
+            } else {
+                to_boids
+            }
+        };
+        let need_boids = boids_mix > 0.0;
+        let need_radial = boids_mix < 1.0;
+        let scope = params.boids_scope;
+        let w_sep = params.boids_separation;
+        let w_ali = params.boids_alignment;
+        let w_coh = params.boids_cohesion;
+        let sep_r = (params.boids_sep_radius * r_max).max(1.0);
+        let sep_r2 = sep_r * sep_r;
+        // Esquive de paredes (solo bandada + borde de rebote): en lugar de
+        // rebotar como una pelota, los "pájaros" giran su vector al acercarse.
+        let wall_avoid = need_boids && !wrap;
+        let wall_margin = r_max; // distancia al borde a la que empieza el giro
+        let wall_turn = params.boids_cruise.max(1.0) * 1.5; // fuerza del giro
+
         let mut forces = std::mem::take(&mut self.forces);
         forces.clear();
         forces.resize(n, Vec2::ZERO);
@@ -162,6 +196,11 @@ impl Simulation {
                 let (cx, cy) = grid.cell_coord(pi.pos);
                 let mut acc = Vec2::ZERO;
                 let mut neighbors = 0u32;
+                // Acumuladores de Boids (solo se usan si `need_boids`).
+                let mut sep_acc = Vec2::ZERO;
+                let mut ali_acc = Vec2::ZERO;
+                let mut coh_acc = Vec2::ZERO;
+                let mut flock_n = 0u32;
 
                 for dy in -1..=1 {
                     for dx in -1..=1 {
@@ -203,12 +242,64 @@ impl Simulation {
                             }
                             neighbors += 1;
                             let dist = d2.sqrt();
-                            let r = dist * inv_r_max;
-                            let coef = params.interaction(pi.hue, pj.hue);
-                            let f = force_fn(r, coef, beta);
-                            acc += d * (f / dist);
+                            // Durante una transición pueden correr ambos modelos a
+                            // la vez (se combinan luego con `boids_mix`).
+                            if need_boids {
+                                let same = hue_bucket(pi.hue) == hue_bucket(pj.hue);
+                                let sep_ok = !matches!(scope, BoidsScope::SameColor) || same;
+                                let flock_ok = matches!(scope, BoidsScope::All) || same;
+                                // Separación: huir de los vecinos muy cercanos,
+                                // más fuerte cuanto menor la distancia.
+                                if sep_ok && d2 < sep_r2 {
+                                    sep_acc -= d * ((sep_r - dist) / (sep_r * dist));
+                                }
+                                // Alineación + cohesión con los vecinos de bandada.
+                                if flock_ok {
+                                    ali_acc += pj.vel;
+                                    coh_acc += d;
+                                    flock_n += 1;
+                                }
+                            }
+                            if need_radial {
+                                let r = dist * inv_r_max;
+                                let coef = params.interaction(pi.hue, pj.hue);
+                                let f = force_fn(r, coef, beta);
+                                acc += d * (f / dist);
+                            }
                         }
                     }
+                }
+
+                // Composición de las tres reglas de Boids en un acumulador aparte
+                // que luego se mezcla con la parte radial según `boids_mix`.
+                if need_boids {
+                    let mut b = sep_acc * w_sep;
+                    if flock_n > 0 {
+                        let inv = 1.0 / flock_n as f32;
+                        // Alineación: dirigir la velocidad hacia la media local.
+                        b += (ali_acc * inv - pi.vel) * w_ali;
+                        // Cohesión: hacia el centro de masa (normalizado por r_max
+                        // para que el peso sea comparable a las otras reglas).
+                        b += (coh_acc * (inv * inv_r_max)) * w_coh;
+                    }
+
+                    // Giro para esquivar las paredes: empuje hacia el interior que
+                    // crece al acercarse al borde. Con el crucero manteniendo la
+                    // rapidez, esto rota el vector de vuelo (esquiva, no rebota).
+                    if wall_avoid {
+                        let p = pi.pos;
+                        if p.x < wall_margin {
+                            b.x += wall_turn * (1.0 - p.x / wall_margin);
+                        } else if p.x > world.x - wall_margin {
+                            b.x -= wall_turn * (1.0 - (world.x - p.x) / wall_margin);
+                        }
+                        if p.y < wall_margin {
+                            b.y += wall_turn * (1.0 - p.y / wall_margin);
+                        } else if p.y > world.y - wall_margin {
+                            b.y -= wall_turn * (1.0 - (world.y - p.y) / wall_margin);
+                        }
+                    }
+                    acc += b * boids_mix;
                 }
 
                 // Atracción leve al centro para las zonas con mucha actividad
@@ -247,6 +338,12 @@ impl Simulation {
         // Límite de velocidad de seguridad: evita que un pico de fuerza mande
         // una partícula disparada a través de toda la pantalla.
         let max_speed = r_max;
+        // Velocidad de crucero (bandada): rapidez mínima para que no se detenga.
+        // Escalada por `boids_mix` para que aparezca/desaparezca con la transición.
+        let cruise = params.boids_cruise * boids_mix;
+        // Durante la transición (mix>0) usamos el deslizamiento en las paredes en
+        // vez del rebote elástico.
+        let boids_bounce = need_boids;
 
         self.particles
             .par_iter_mut()
@@ -256,6 +353,20 @@ impl Simulation {
                 let speed = p.vel.length();
                 if speed > max_speed {
                     p.vel *= max_speed / speed;
+                }
+                // Crucero: mantener una rapidez mínima (murmuración que no se para).
+                if cruise > 0.0 {
+                    let speed = p.vel.length();
+                    if speed > 1e-4 {
+                        if speed < cruise {
+                            p.vel *= cruise / speed;
+                        }
+                    } else {
+                        // En reposo: darle una dirección pseudoaleatoria estable
+                        // (derivada de la posición) para que arranque el vuelo.
+                        let a = p.pos.x * 12.9898 + p.pos.y * 78.233;
+                        p.vel = Vec2::new(a.cos(), a.sin()) * cruise;
+                    }
                 }
                 p.pos += p.vel * dt;
 
@@ -270,6 +381,25 @@ impl Simulation {
                             p.pos.y += world.y;
                         } else if p.pos.y >= world.y {
                             p.pos.y -= world.y;
+                        }
+                    }
+                    Boundary::Bounce if boids_bounce => {
+                        // Bandada: si un pájaro alcanza la pared, desliza a lo largo
+                        // de ella (anula solo la componente hacia fuera) en vez de
+                        // rebotar; el giro ya lo estaba curvando hacia el interior.
+                        if p.pos.x < 0.0 {
+                            p.pos.x = 0.0;
+                            p.vel.x = p.vel.x.max(0.0);
+                        } else if p.pos.x > world.x {
+                            p.pos.x = world.x;
+                            p.vel.x = p.vel.x.min(0.0);
+                        }
+                        if p.pos.y < 0.0 {
+                            p.pos.y = 0.0;
+                            p.vel.y = p.vel.y.max(0.0);
+                        } else if p.pos.y > world.y {
+                            p.pos.y = world.y;
+                            p.vel.y = p.vel.y.min(0.0);
                         }
                     }
                     Boundary::Bounce => {

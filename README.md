@@ -56,7 +56,7 @@ programe explícitamente.
 - 🐝 **Hasta decenas de miles de partículas** en tiempo real. El cálculo de fuerzas usa
   un *hash* espacial (rejilla CSR) y se reparte entre todos los núcleos con
   [`rayon`](https://crates.io/crates/rayon).
-- 🎨 **Siete modos de interacción:**
+- 🎨 **Ocho modos de interacción:**
   - **Mismo color** — solo los iguales se atraen (opcionalmente, los distintos se repelen).
   - **Matriz** — una tabla 6×6 editable define cuánto atrae/repele cada color a cada otro,
     al estilo *particle life* clásico. Botón para aleatorizar las reglas.
@@ -68,6 +68,11 @@ programe explícitamente.
   - **Depredador–presa** — un bando caza y el otro huye en manada (interacción asimétrica).
   - **Repulsión propia** — el mismo color se repele y los distintos se atraen (mezclas
     homogéneas, espumas y mosaicos).
+  - 🐦 **Bandada (Boids)** — murmuraciones de estorninos al estilo Craig Reynolds (1986):
+    cada partícula sigue solo tres reglas locales —**separación** (no chocar),
+    **alineación** (ir hacia donde van los vecinos) y **cohesión** (acercarse al grupo)— y
+    emerge una nube coordinada de fibras cambiantes, sin líder. Ámbito ajustable (todas
+    juntas, una bandada por color o híbrido) y velocidad de crucero para que no se detengan.
 - ⚙️ **Física ajustable en vivo:** fuerza, radio, repulsión (β), fricción, velocidad (en %,
   con cambio suave y atajos 1…0) y bordes **toroidales** (la pantalla se enrolla) o de **rebote**.
 - 🌈 **Dinámica del color:** cambios aleatorios de color, deriva lenta y gradual de
