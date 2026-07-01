@@ -137,11 +137,13 @@ impl PanelApp {
                 fps,
                 blend,
                 time_scale,
+                recording,
                 matrix,
                 ..
             } => {
                 self.st.particle_count = particle_count;
                 self.st.fps = fps;
+                self.st.recording = recording;
                 self.params.blend = blend;
                 // Velocidad efectiva real, para mostrar el % en vivo (el sim es
                 // quien conduce la transición de velocidad).

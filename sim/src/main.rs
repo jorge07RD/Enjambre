@@ -45,6 +45,118 @@ fn make_camera(zoom: f32, target: Vec2) -> Camera2D {
 }
 
 // ----------------------------------------------------------------------------
+// Grabación de vídeo vertical (TikTok): render offline a un `render_target` de
+// 1080×1920 y volcado crudo (RGBA) a `ffmpeg` por stdin. Cada frame de la
+// simulación es un frame del vídeo, así que el `.mp4` sale exacto a 120 fps
+// aunque el volcado vaya más lento que el tiempo real.
+// ----------------------------------------------------------------------------
+
+const REC_W: u32 = 1080;
+const REC_H: u32 = 1920;
+const REC_FPS: i32 = 120;
+
+/// Cámara que encuadra el mundo en vertical (9:16) hacia el `render_target`,
+/// centrada en `target` y al mismo `zoom` que la vista en pantalla.
+fn record_camera(rt: &RenderTarget, zoom: f32, target: Vec2) -> Camera2D {
+    let vw = REC_W as f32 / zoom;
+    let vh = REC_H as f32 / zoom;
+    let mut cam =
+        Camera2D::from_display_rect(Rect::new(target.x - vw / 2.0, target.y - vh / 2.0, vw, vh));
+    cam.render_target = Some(rt.clone());
+    cam
+}
+
+struct Recorder {
+    child: std::process::Child,
+    stdin: std::process::ChildStdin,
+    rt: RenderTarget,
+    frames: u32,
+    path: String,
+}
+
+impl Recorder {
+    /// Arranca `ffmpeg` y el destino de render. Falla si `ffmpeg` no está.
+    fn start() -> std::io::Result<Recorder> {
+        let rt = render_target(REC_W, REC_H);
+        rt.texture.set_filter(FilterMode::Linear);
+        let ts = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let path = format!("enjambre_{ts}.mp4");
+        let mut child = std::process::Command::new("ffmpeg")
+            .args([
+                "-y",
+                "-f",
+                "rawvideo",
+                "-pix_fmt",
+                "rgba",
+                "-s",
+                &format!("{REC_W}x{REC_H}"),
+                "-r",
+                &REC_FPS.to_string(),
+                "-i",
+                "-",
+                "-c:v",
+                "libx264",
+                "-preset",
+                "medium",
+                "-crf",
+                "18",
+                "-pix_fmt",
+                "yuv420p",
+                "-movflags",
+                "+faststart",
+                &path,
+            ])
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()?;
+        let stdin = child.stdin.take().expect("stdin de ffmpeg");
+        eprintln!("● Grabando vídeo vertical en {path} (pulsa R para parar)");
+        Ok(Recorder {
+            child,
+            stdin,
+            rt,
+            frames: 0,
+            path,
+        })
+    }
+
+    /// Lee los píxeles del `render_target` y los vuelca a `ffmpeg`. El texture
+    /// de un render target se lee al revés en vertical, así que invertimos las
+    /// filas para que el vídeo salga derecho.
+    fn capture(&mut self) -> std::io::Result<()> {
+        use std::io::Write;
+        let img = self.rt.texture.get_texture_data();
+        let w = img.width as usize;
+        let h = img.height as usize;
+        let stride = w * 4;
+        for y in 0..h {
+            let row = (h - 1 - y) * stride;
+            self.stdin.write_all(&img.bytes[row..row + stride])?;
+        }
+        self.frames += 1;
+        Ok(())
+    }
+
+    /// Cierra la tubería para que `ffmpeg` finalice el `.mp4` y espera a que
+    /// termine de escribir.
+    fn finish(self) {
+        drop(self.stdin); // EOF -> ffmpeg cierra el fichero limpiamente
+        let mut child = self.child;
+        let _ = child.wait();
+        eprintln!(
+            "■ Vídeo guardado: {} ({} frames · {:.1}s a {REC_FPS} fps)",
+            self.path,
+            self.frames,
+            self.frames as f32 / REC_FPS as f32
+        );
+    }
+}
+
+// ----------------------------------------------------------------------------
 // Servidor IPC: acepta la conexión del proceso `panel` en un hilo aparte y
 // expone el último estado recibido (inbox) y el stream de escritura para la
 // telemetría. La simulación nunca se bloquea esperando al panel.
@@ -191,7 +303,8 @@ fn apply_local_event(
             st.zoom_level = 1.0;
             *pan_target = Vec2::new(screen_width(), screen_height()) * 0.5;
         }
-        PanelEvent::Detach | PanelEvent::Reattach => {}
+        // Los maneja el bucle principal (necesitan cambiar de modo o el grabador).
+        PanelEvent::Detach | PanelEvent::Reattach | PanelEvent::ToggleRecord => {}
     }
 }
 
@@ -214,6 +327,8 @@ async fn main() {
     let mut last_mouse = Vec2::from(mouse_position());
 
     let mut mode = AppMode::Embedded;
+    let mut rec: Option<Recorder> = None;
+    eprintln!("Pulsa R para grabar/parar un vídeo vertical 1080×1920 @ {REC_FPS} fps (TikTok).");
     let mut ipc: Option<Ipc> = None;
     let mut panel_was_connected = false;
     let mut init_sent = false;
@@ -242,7 +357,9 @@ async fn main() {
         }
 
         let mut want_pointer = false;
+        let mut want_keyboard = false;
         let mut events: Vec<PanelEvent> = Vec::new();
+        st.recording = rec.is_some();
 
         match mode {
             AppMode::Embedded => {
@@ -251,6 +368,7 @@ async fn main() {
                 st.fps = get_fps();
                 egui_macroquad::ui(|ctx| {
                     want_pointer = ctx.wants_pointer_input();
+                    want_keyboard = ctx.wants_keyboard_input();
                     egui::SidePanel::right("panel")
                         .default_width(310.0)
                         .show(ctx, |ui| {
@@ -309,6 +427,64 @@ async fn main() {
             }
         }
 
+        // --- Atajos de teclado (control del lienzo sin ratón) ---
+        // Se ignoran si egui tiene el foco de teclado (edición de un control).
+        if !want_keyboard {
+            if is_key_pressed(KeyCode::Space) {
+                st.paused = !st.paused;
+            }
+            if is_key_pressed(KeyCode::Period) {
+                st.paused = true;
+                events.push(PanelEvent::Step);
+            }
+            if is_key_pressed(KeyCode::C) {
+                events.push(PanelEvent::Clear);
+            }
+            if is_key_pressed(KeyCode::F) {
+                events.push(PanelEvent::Fill(st.fill_count as usize));
+            }
+            if is_key_pressed(KeyCode::M) {
+                // La matriz la posee el `sim` en modo embebido; aleatorizamos y
+                // transicionamos igual que el botón del panel.
+                let snap = params.current_snapshot();
+                params.randomize_matrix(&mut rng);
+                params.start_transition(snap);
+            }
+            if is_key_pressed(KeyCode::L) {
+                events.push(PanelEvent::CanvasEqualsScreen);
+            }
+            if is_key_pressed(KeyCode::Z) {
+                events.push(PanelEvent::FitCanvas);
+            }
+            if is_key_pressed(KeyCode::D) {
+                events.push(if mode == AppMode::Detached {
+                    PanelEvent::Reattach
+                } else {
+                    PanelEvent::Detach
+                });
+            }
+            if is_key_pressed(KeyCode::R) {
+                events.push(PanelEvent::ToggleRecord);
+            }
+            // Velocidad: teclas 1..9 = 10..90 %, tecla 0 = 100 %.
+            for (key, pct) in [
+                (KeyCode::Key1, 10),
+                (KeyCode::Key2, 20),
+                (KeyCode::Key3, 30),
+                (KeyCode::Key4, 40),
+                (KeyCode::Key5, 50),
+                (KeyCode::Key6, 60),
+                (KeyCode::Key7, 70),
+                (KeyCode::Key8, 80),
+                (KeyCode::Key9, 90),
+                (KeyCode::Key0, 100),
+            ] {
+                if is_key_pressed(key) {
+                    params.set_speed(pct as f32 / 100.0);
+                }
+            }
+        }
+
         // Eventos del panel (mismo trato venga de la UI embebida o por IPC).
         for ev in events {
             match ev {
@@ -331,6 +507,15 @@ async fn main() {
                     mode = AppMode::Embedded;
                     panel_was_connected = false;
                 }
+                PanelEvent::ToggleRecord => match rec.take() {
+                    Some(r) => r.finish(),
+                    None => match Recorder::start() {
+                        Ok(r) => rec = Some(r),
+                        Err(e) => {
+                            eprintln!("No se pudo iniciar la grabación (¿está ffmpeg?): {e}")
+                        }
+                    },
+                },
                 other => apply_local_event(
                     other,
                     &mut sim,
@@ -362,6 +547,7 @@ async fn main() {
                     fps: get_fps(),
                     blend: params.blend,
                     time_scale: params.time_scale,
+                    recording: rec.is_some(),
                     matrix: params.matrix,
                     canvas_size: st.canvas_size,
                     zoom_level: st.zoom_level,
@@ -426,6 +612,30 @@ async fn main() {
             Color::new(0.3, 0.3, 0.35, 1.0),
         );
         set_default_camera();
+
+        // Grabación: renderizamos la escena en vertical al render target y
+        // volcamos el frame a ffmpeg (invisible para la ventana). Si falla la
+        // escritura (ffmpeg murió), cerramos la grabación.
+        if let Some(r) = rec.as_mut() {
+            let rcam = record_camera(&r.rt, st.zoom_level, pan_target);
+            set_camera(&rcam);
+            renderer.draw(&sim, &params);
+            set_default_camera();
+            if let Err(e) = r.capture() {
+                eprintln!("Grabación detenida (error escribiendo a ffmpeg): {e}");
+                rec.take().unwrap().finish();
+            }
+        }
+        if let Some(r) = &rec {
+            draw_text(
+                &format!("● REC  {:.1}s", r.frames as f32 / REC_FPS as f32),
+                20.0,
+                40.0,
+                34.0,
+                RED,
+            );
+        }
+
         if mode == AppMode::Embedded {
             egui_macroquad::draw();
         }

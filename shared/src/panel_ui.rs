@@ -27,6 +27,8 @@ pub struct PanelState {
     // Telemetría que llega de la simulación (solo para mostrar).
     pub particle_count: usize,
     pub fps: i32,
+    /// `true` mientras la simulación está grabando vídeo (rótulo del botón).
+    pub recording: bool,
 
     /// `true` cuando esta UI corre en la ventana aparte (`panel`); cambia el
     /// botón de separar por uno de reacoplar.
@@ -45,6 +47,7 @@ impl Default for PanelState {
             paused: false,
             particle_count: 0,
             fps: 0,
+            recording: false,
             standalone: false,
         }
     }
@@ -63,6 +66,8 @@ pub enum PanelEvent {
     StartTransition(InteractionSnapshot),
     /// Fijar una nueva velocidad objetivo (transición suave si está activa).
     SetSpeed(f32),
+    /// Empezar/detener la grabación de vídeo vertical (1080×1920).
+    ToggleRecord,
     /// Ajustar el zoom para que el lienzo entre en la ventana.
     FitCanvas,
     /// Igualar el lienzo a los píxeles de la ventana de simulación (1:1).
@@ -95,27 +100,43 @@ pub fn config_panel(
 
         // Separar / reacoplar el panel.
         if st.standalone {
-            if ui.button("⮌ Reacoplar en la ventana").clicked() {
+            if ui.button("⮌ Reacoplar en la ventana (D)").clicked() {
                 events.push(PanelEvent::Reattach);
             }
-        } else if ui.button("🗗 Separar panel en otra ventana").clicked() {
+        } else if ui.button("🗗 Separar panel en otra ventana (D)").clicked() {
             events.push(PanelEvent::Detach);
+        }
+
+        // Grabar vídeo vertical (TikTok). También con la tecla R.
+        if ui
+            .button(if st.recording {
+                "⏹ Detener grabación (R)"
+            } else {
+                "⏺ Grabar vídeo vertical (R)"
+            })
+            .clicked()
+        {
+            events.push(PanelEvent::ToggleRecord);
         }
 
         ui.label(format!("Partículas: {}", st.particle_count));
         ui.label(format!("FPS: {}", st.fps));
         ui.horizontal(|ui| {
             if ui
-                .button(if st.paused { "▶ Reanudar" } else { "⏸ Pausa" })
+                .button(if st.paused {
+                    "▶ Reanudar (Espacio)"
+                } else {
+                    "⏸ Pausa (Espacio)"
+                })
                 .clicked()
             {
                 st.paused = !st.paused;
             }
-            if ui.button("⏭ Paso").clicked() {
+            if ui.button("⏭ Paso (.)").clicked() {
                 st.paused = true;
                 events.push(PanelEvent::Step);
             }
-            if ui.button("⟲ Reiniciar").clicked() {
+            if ui.button("⟲ Reiniciar (C)").clicked() {
                 events.push(PanelEvent::Clear);
             }
         });
@@ -156,15 +177,16 @@ pub fn config_panel(
             params.time_scale * 100.0,
             params.speed_target * 100.0
         ));
+        ui.label("Atajos: teclas 1…0 = 10 %…100 %");
 
         ui.separator();
         ui.heading("Llenar aleatorio");
         ui.add(egui::Slider::new(&mut st.fill_count, 100..=20000).text("Cantidad"));
         ui.horizontal(|ui| {
-            if ui.button("Llenar").clicked() {
+            if ui.button("Llenar (F)").clicked() {
                 events.push(PanelEvent::Fill(st.fill_count as usize));
             }
-            if ui.button("Vaciar").clicked() {
+            if ui.button("Vaciar (C)").clicked() {
                 events.push(PanelEvent::Clear);
             }
         });
@@ -199,7 +221,7 @@ pub fn config_panel(
                 .logarithmic(true)
                 .text("Tamaño"),
         );
-        if ui.button("📐 Lienzo = pantalla").clicked() {
+        if ui.button("📐 Lienzo = pantalla (L)").clicked() {
             events.push(PanelEvent::CanvasEqualsScreen);
         }
         ui.label("Menos = más reducido y denso · Más = más espacio");
@@ -211,7 +233,7 @@ pub fn config_panel(
                 .logarithmic(true)
                 .text("Zoom"),
         );
-        if ui.button("Ajustar al lienzo").clicked() {
+        if ui.button("Ajustar al lienzo (Z)").clicked() {
             events.push(PanelEvent::FitCanvas);
         }
         ui.label("Rueda = zoom · botón derecho = mover");
@@ -264,7 +286,7 @@ pub fn config_panel(
             ui.add(egui::Slider::new(&mut params.sim_range, 0.02..=0.5).text("Tolerancia de color"));
         }
         if params.mode == InteractionMode::Matrix {
-            if ui.button("🎲 Aleatorizar reglas").clicked() {
+            if ui.button("🎲 Aleatorizar reglas (M)").clicked() {
                 // La matriz es propiedad del panel: la aleatorizamos aquí mismo
                 // para que el nuevo estado fluya al `sim` por `State` y no lo
                 // pise el eco de la matriz anterior (bug en modo separado).

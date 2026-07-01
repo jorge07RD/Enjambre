@@ -47,6 +47,8 @@ pub enum TelemetryMsg {
         blend: f32,
         /// Velocidad efectiva actual (para mostrar el % real mientras transita).
         time_scale: f32,
+        /// `true` mientras el `sim` está grabando vídeo.
+        recording: bool,
         /// Matriz de atracción tal y como la ve la simulación (puede ir a la
         /// deriva con `gradual`), para que la grilla del panel la refleje.
         matrix: [[f32; NUM_COLORS]; NUM_COLORS],
