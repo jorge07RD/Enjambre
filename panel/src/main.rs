@@ -183,6 +183,9 @@ impl PanelApp {
                 // que dejemos de reenviar los ajustes anteriores.
                 self.params = *params;
             }
+            TelemetryMsg::ShapesList(shapes) => {
+                self.st.saved_shapes = shapes;
+            }
         }
     }
 }

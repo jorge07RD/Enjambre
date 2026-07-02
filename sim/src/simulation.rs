@@ -23,6 +23,12 @@ pub struct Simulation {
     pub pointer: Option<Vec2>,
     /// Puntos meta (mundo) que forman un texto/imagen. `None` = sin forma.
     pub shape: Option<Vec<Vec2>>,
+    /// Mezcla 0..1 de la forma: 0 = las partículas siguen su animación, 1 = la
+    /// forma está totalmente aplicada. Sube al aplicar y baja al soltar para una
+    /// aparición/disolución fluida (ver `advance_shape`).
+    pub shape_blend: f32,
+    /// Objetivo de `shape_blend` (1 mientras hay forma, 0 al soltarla).
+    shape_target: f32,
     grid: Grid,
     /// Aceleraciones acumuladas por partícula (scratch reutilizado).
     forces: Vec<Vec2>,
@@ -36,6 +42,8 @@ impl Simulation {
             focus: world * 0.5,
             pointer: None,
             shape: None,
+            shape_blend: 0.0,
+            shape_target: 0.0,
             grid: Grid::new(),
             forces: Vec::new(),
         }
@@ -46,14 +54,39 @@ impl Simulation {
     }
 
     /// Fija una forma (nube de puntos meta) hacia la que se agrupan las
-    /// partículas. Vacía = se ignora.
+    /// partículas, apareciendo de forma fluida (la mezcla sube desde 0). Vacía =
+    /// se ignora.
     pub fn set_shape(&mut self, targets: Vec<Vec2>) {
-        self.shape = if targets.is_empty() { None } else { Some(targets) };
+        if targets.is_empty() {
+            self.clear_shape();
+        } else {
+            self.shape = Some(targets);
+            self.shape_blend = 0.0;
+            self.shape_target = 1.0;
+        }
     }
 
-    /// Suelta la forma actual (las partículas retoman el modo de interacción).
+    /// Suelta la forma de forma fluida: la mezcla baja a 0 y, al llegar, se
+    /// descartan los puntos meta (ver `advance_shape`).
     pub fn clear_shape(&mut self) {
-        self.shape = None;
+        self.shape_target = 0.0;
+        if self.shape_blend <= 1e-4 {
+            self.shape = None;
+        }
+    }
+
+    /// Avanza la mezcla de la forma hacia su objetivo durante `duration` s
+    /// (0 = instantáneo). Al terminar de disolverse, descarta los puntos meta.
+    pub fn advance_shape(&mut self, dt: f32, duration: f32) {
+        let step = if duration > 1e-3 { dt / duration } else { 1.0 };
+        if self.shape_blend < self.shape_target {
+            self.shape_blend = (self.shape_blend + step).min(self.shape_target);
+        } else if self.shape_blend > self.shape_target {
+            self.shape_blend = (self.shape_blend - step).max(self.shape_target);
+            if self.shape_blend <= 1e-4 {
+                self.shape = None;
+            }
+        }
     }
 
     /// Tiñe del matiz indicado solo las partículas que forman la forma actual
@@ -187,9 +220,21 @@ impl Simulation {
         // rigidez del resorte y baja la interacción residual.
         let shape = self.shape.as_deref();
         let n_shape = shape.map_or(0, |t| t.len());
+        // Mezcla suavizada (ease-in/out) para que la forma aparezca y se disuelva
+        // de manera fluida en vez de aparecer de golpe.
+        let sb = self.shape_blend.clamp(0.0, 1.0);
+        let shape_blend = sb * sb * (3.0 - 2.0 * sb);
+        let shape_on = n_shape > 0 && shape_blend > 1e-3;
         let shape_fix = params.shape_strength.clamp(0.0, 1.0);
-        let shape_k = 0.02 + shape_fix * 0.38; // 0.02..0.4
-        let shape_inter = 0.35 * (1.0 - shape_fix); // interacción residual (0..0.35)
+        // El resorte y la evasión crecen con la mezcla: así las partículas fluyen
+        // hacia la forma en lugar de ser tironeadas de inmediato.
+        let shape_k = (0.02 + shape_fix * 0.38) * shape_blend; // 0..0.4
+        // Interacción residual: plena al inicio (blend 0) y baja según la fijación
+        // cuando la forma ya está aplicada, para un texto legible pero orgánico.
+        let shape_inter = 1.0 - shape_blend * (1.0 - 0.35 * (1.0 - shape_fix));
+        // El texto y el fondo se ignoran entre sí; además el fondo REPELE al texto
+        // (para no invadir las letras). Ganancia de esa evasión (crece con la mezcla).
+        let shape_avoid = 2.5 * shape_blend;
 
         // Bandada (Boids): física vectorial que sustituye a la fuerza radial.
         // Como Boids no usa el coeficiente escalar, no puede mezclarse con el
@@ -245,6 +290,7 @@ impl Simulation {
             forces.par_iter_mut().enumerate().for_each(|(i, out)| {
                 let pi = particles[i];
                 let (cx, cy) = grid.cell_coord(pi.pos);
+                let i_text = shape_on && i < n_shape;
                 let mut acc = Vec2::ZERO;
                 let mut neighbors = 0u32;
                 // Acumuladores de Boids (solo se usan si `need_boids`).
@@ -294,6 +340,24 @@ impl Simulation {
                             }
                             neighbors += 1;
                             let dist = d2.sqrt();
+                            // Interacción texto ↔ fondo: se ignoran mutuamente y el
+                            // fondo esquiva al texto para no invadir las letras.
+                            if shape_on {
+                                let j_text = j < n_shape;
+                                if i_text {
+                                    // El texto ignora al fondo (solo se relaciona con
+                                    // el propio texto).
+                                    if !j_text {
+                                        continue;
+                                    }
+                                } else if j_text {
+                                    // El fondo repele al texto y no lo toma como
+                                    // vecino para su física normal.
+                                    let push = 1.0 - dist * inv_r_max;
+                                    acc -= d * (push * shape_avoid / dist);
+                                    continue;
+                                }
+                            }
                             // Durante una transición pueden correr ambos modelos a
                             // la vez (se combinan luego con `boids_mix`).
                             if need_boids {

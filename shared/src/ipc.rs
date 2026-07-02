@@ -6,6 +6,7 @@
 
 use crate::config::{Brush, SimParams, Tool, NUM_COLORS};
 use crate::panel_ui::PanelEvent;
+use crate::shapes::SavedShape;
 use serde::{Deserialize, Serialize};
 use std::io::{self, Read, Write};
 use std::path::PathBuf;
@@ -13,7 +14,12 @@ use std::path::PathBuf;
 /// Estado completo que el panel envía a la simulación (una vez por frame del
 /// panel). La simulación adopta estos campos, salvo los que evoluciona ella
 /// misma (ver `sim`: `blend`/`from_state` y la matriz mientras `gradual`).
-#[derive(Clone, Serialize, Deserialize)]
+///
+/// `#[serde(default)]` a nivel de contenedor: si el `sim` y el `panel` provienen
+/// de compilaciones distintas (campos añadidos), los que falten toman su valor
+/// por defecto en vez de romper la conexión IPC (que dejaría el panel colgado).
+#[derive(Clone, Serialize, Deserialize, Default)]
+#[serde(default)]
 pub struct ControlState {
     pub params: SimParams,
     pub paused: bool,
@@ -80,6 +86,9 @@ pub enum TelemetryMsg {
     /// El `sim` fija los parámetros del panel (tras cargar una escena o la
     /// predeterminada), para que el panel no reenvíe los ajustes anteriores.
     ApplyParams(Box<SimParams>),
+    /// Biblioteca de formas/letras guardadas (se envía al conectar y cuando
+    /// cambia). El `sim` es su dueño.
+    ShapesList(Vec<SavedShape>),
 }
 
 /// Ruta del socket. Usa `$XDG_RUNTIME_DIR` (efímero por sesión) y cae a `/tmp`.

@@ -11,8 +11,8 @@ use render::Renderer;
 use shared::ipc::{read_msg, socket_path, write_msg};
 use shared::{
     config_panel, example_store, hue_for_index, scenes_path, AudioTarget, Brush, ControlMsg,
-    ControlState, InteractionMode, PanelEvent, PanelState, SceneStore, SimParams, TelemetryMsg,
-    Tool, FRAME_PRESETS,
+    ControlState, InteractionMode, PanelEvent, PanelState, SceneStore, ShapeStore, SimParams,
+    TelemetryMsg, Tool, FRAME_PRESETS,
 };
 use simulation::Simulation;
 
@@ -40,10 +40,44 @@ enum AppMode {
 
 /// Construye la cámara 2D para un nivel de zoom y un punto del mundo centrado.
 /// Zoom mayor = se ve una porción más pequeña del mundo = más cerca.
-fn make_camera(zoom: f32, target: Vec2) -> Camera2D {
-    let vw = screen_width() / zoom;
-    let vh = screen_height() / zoom;
-    Camera2D::from_display_rect(Rect::new(target.x - vw / 2.0, target.y - vh / 2.0, vw, vh))
+///
+/// `canvas` es la región de la ventana (en píxeles, esquina superior izquierda)
+/// donde se dibuja el mundo: con el panel acoplado ocupa solo la parte libre a
+/// su izquierda. Se aplica como `viewport` para que el render no invada el panel.
+fn make_camera(zoom: f32, target: Vec2, canvas: Rect) -> Camera2D {
+    let vw = canvas.w / zoom;
+    let vh = canvas.h / zoom;
+    let mut cam =
+        Camera2D::from_display_rect(Rect::new(target.x - vw / 2.0, target.y - vh / 2.0, vw, vh));
+    // El viewport de macroquad va en píxeles con el origen abajo-izquierda.
+    cam.viewport = Some((
+        canvas.x as i32,
+        (screen_height() - canvas.y - canvas.h) as i32,
+        canvas.w as i32,
+        canvas.h as i32,
+    ));
+    cam
+}
+
+/// Convierte un punto de pantalla a mundo teniendo en cuenta el `viewport`.
+/// (Los métodos de macroquad `screen_to_world`/`world_to_screen` asumen que la
+/// cámara ocupa toda la ventana, así que dan mal la X con el panel acoplado.)
+fn cam_s2w(cam: &Camera2D, p: Vec2, canvas: Rect) -> Vec2 {
+    let ndc = vec2(
+        (p.x - canvas.x) / canvas.w * 2.0 - 1.0,
+        1.0 - (p.y - canvas.y) / canvas.h * 2.0,
+    );
+    let t = cam.matrix().inverse().project_point3(vec3(ndc.x, ndc.y, 0.0));
+    vec2(t.x, t.y)
+}
+
+/// Inversa de [`cam_s2w`]: de mundo a pantalla respetando el `viewport`.
+fn cam_w2s(cam: &Camera2D, p: Vec2, canvas: Rect) -> Vec2 {
+    let t = cam.matrix().project_point3(vec3(p.x, p.y, 0.0));
+    vec2(
+        canvas.x + (t.x * 0.5 + 0.5) * canvas.w,
+        canvas.y + (0.5 - t.y * 0.5) * canvas.h,
+    )
 }
 
 // ----------------------------------------------------------------------------
@@ -104,6 +138,9 @@ fn start_scene(
     params.speed_smooth = target.speed_smooth;
     params.attract_active = target.attract_active;
     params.auto_randomize = target.auto_randomize;
+    // Descriptor de la forma (mensaje/imagen): el llamador reconstruye la forma.
+    params.shape_text = target.shape_text.clone();
+    params.shape_image = target.shape_image.clone();
     // Velocidad: por el sistema de transición de velocidad existente.
     params.set_speed(target.speed_target);
     Some(SceneMorph {
@@ -244,25 +281,64 @@ fn text_to_points(text: &str, world: Vec2, count: usize, rng: &mut impl Rng) -> 
     image_to_points(&img, false, world, count, rng)
 }
 
-/// Carga una imagen de disco y la forma con las partículas (con tinte opcional).
-fn form_image(path: &std::path::Path, sim: &mut Simulation, params: &SimParams, rng: &mut impl Rng) {
+/// Lee una imagen de disco y devuelve sus puntos meta (o `None` si falla).
+fn image_points_from_path(
+    path: &str,
+    world: Vec2,
+    count: usize,
+    rng: &mut impl Rng,
+) -> Option<Vec<Vec2>> {
     let bytes = match std::fs::read(path) {
         Ok(b) => b,
         Err(e) => {
-            eprintln!("No pude abrir la imagen: {e}");
-            return;
+            eprintln!("No pude abrir la imagen '{path}': {e}");
+            return None;
         }
     };
     match Image::from_file_with_format(&bytes, None) {
-        Ok(img) => {
-            let count = (sim.particles.len() * 7 / 10).max(1);
-            let pts = image_to_points(&img, false, sim.world, count, rng);
-            sim.set_shape(pts);
-            if params.shape_tint {
-                sim.tint_shape(hue_for_index(params.shape_color));
-            }
+        Ok(img) => Some(image_to_points(&img, false, world, count, rng)),
+        Err(e) => {
+            eprintln!("No pude decodificar la imagen '{path}': {e}");
+            None
         }
-        Err(e) => eprintln!("No pude decodificar la imagen: {e}"),
+    }
+}
+
+/// Construye la forma a partir del descriptor de `params` (mensaje o ruta de
+/// imagen). Vacío = suelta la forma. Incondicional (siempre reconstruye).
+fn build_shape(sim: &mut Simulation, params: &SimParams, rng: &mut impl Rng) {
+    // Solo una parte de las partículas forma la figura (en el centro); el resto
+    // sigue con la animación del modo.
+    let count = (sim.particles.len() * 7 / 10).max(1);
+    if !params.shape_text.trim().is_empty() {
+        let pts = text_to_points(&params.shape_text, sim.world, count, rng);
+        sim.set_shape(pts);
+    } else if !params.shape_image.is_empty() {
+        match image_points_from_path(&params.shape_image, sim.world, count, rng) {
+            Some(pts) => sim.set_shape(pts),
+            None => sim.clear_shape(),
+        }
+    } else {
+        sim.clear_shape();
+        return;
+    }
+    if params.shape_tint {
+        sim.tint_shape(hue_for_index(params.shape_color));
+    }
+}
+
+/// Al cambiar de escena: reconstruye la forma SOLO si el descriptor cambió. Si la
+/// nueva escena trae el mismo texto/imagen, se mantiene la forma actual (sin
+/// re-scramblear); si trae otro, se cambia; si no trae ninguno, se suelta.
+fn apply_scene_shape(
+    sim: &mut Simulation,
+    params: &SimParams,
+    old_text: &str,
+    old_image: &str,
+    rng: &mut impl Rng,
+) {
+    if params.shape_text != old_text || params.shape_image != old_image {
+        build_shape(sim, params, rng);
     }
 }
 
@@ -330,19 +406,14 @@ impl Recorder {
         })
     }
 
-    /// Lee los píxeles del `render_target` y los vuelca a `ffmpeg`. El texture
-    /// de un render target se lee al revés en vertical, así que invertimos las
-    /// filas para que el vídeo salga derecho.
+    /// Lee los píxeles del `render_target` y los vuelca a `ffmpeg`.
+    /// `get_texture_data` ya devuelve las filas de arriba a abajo con la misma
+    /// orientación que se ve en pantalla, así que las escribimos tal cual (una
+    /// inversión extra dejaba el vídeo boca abajo, visible al formar texto).
     fn capture(&mut self) -> std::io::Result<()> {
         use std::io::Write;
         let img = self.rt.texture.get_texture_data();
-        let w = img.width as usize;
-        let h = img.height as usize;
-        let stride = w * 4;
-        for y in 0..h {
-            let row = (h - 1 - y) * stride;
-            self.stdin.write_all(&img.bytes[row..row + stride])?;
-        }
+        self.stdin.write_all(&img.bytes)?;
         self.frames += 1;
         Ok(())
     }
@@ -503,10 +574,11 @@ fn apply_local_event(
     params: &mut SimParams,
     st: &mut PanelState,
     pan_target: &mut Vec2,
+    canvas: Vec2,
     rng: &mut impl Rng,
     step_once: &mut bool,
 ) {
-    let aspect = screen_width() / screen_height();
+    let aspect = canvas.x / canvas.y;
     let world = Vec2::new(st.canvas_size * aspect, st.canvas_size);
     match ev {
         PanelEvent::Step => *step_once = true,
@@ -515,17 +587,17 @@ fn apply_local_event(
         PanelEvent::StartTransition(snap) => params.start_transition(snap),
         PanelEvent::SetSpeed(v) => params.set_speed(v),
         PanelEvent::FitCanvas => {
-            st.zoom_level = (screen_width() / world.x)
-                .min(screen_height() / world.y)
+            st.zoom_level = (canvas.x / world.x)
+                .min(canvas.y / world.y)
                 .clamp(0.02, 30.0);
             *pan_target = world * 0.5;
         }
         PanelEvent::CanvasEqualsScreen => {
-            // El mundo pasa a medir exactamente la ventana (1 unidad = 1 píxel),
-            // así llena el lienzo sea cual sea el tamaño que dé el WM (Hyprland).
-            st.canvas_size = screen_height();
+            // El mundo pasa a medir exactamente el lienzo (1 unidad = 1 píxel),
+            // así llena la región visible sea cual sea el tamaño del WM (Hyprland).
+            st.canvas_size = canvas.y;
             st.zoom_level = 1.0;
-            *pan_target = Vec2::new(screen_width(), screen_height()) * 0.5;
+            *pan_target = canvas * 0.5;
         }
         // Los maneja el bucle principal (necesitan cambiar de modo, el grabador
         // o el estado del recuadro de encuadre / carpeta de guardado).
@@ -547,7 +619,11 @@ fn apply_local_event(
         | PanelEvent::FormText(_)
         | PanelEvent::FormImagePick
         | PanelEvent::FormImagePath(_)
-        | PanelEvent::ReleaseShape => {}
+        | PanelEvent::ReleaseShape
+        | PanelEvent::SaveShape
+        | PanelEvent::ApplyShape(_)
+        | PanelEvent::DeleteShape(_)
+        | PanelEvent::HidePanel => {}
     }
 }
 
@@ -570,6 +646,10 @@ async fn main() {
     let mut last_mouse = Vec2::from(mouse_position());
 
     let mut mode = AppMode::Embedded;
+    // Panel acoplado: visible por defecto, se oculta/muestra con la tecla H.
+    // `panel_px` recuerda su ancho real (en píxeles) para reservarle el lienzo.
+    let mut panel_visible = true;
+    let mut panel_px = 310.0f32;
     let mut rec: Option<Recorder> = None;
     // Recuadro de encuadre de grabación (estado local, lo mueve el ratón).
     let mut show_frame = false;
@@ -600,6 +680,9 @@ async fn main() {
     let mut scene_morph: Option<SceneMorph> = None;
     let mut pending_apply: Option<SimParams> = None;
     let mut scenes_dirty = false;
+    // Biblioteca de formas/letras guardadas (persistida en shapes.json).
+    let mut shape_store = ShapeStore::load();
+    let mut shapes_dirty = false;
     let mut current_scene_idx = 0usize;
     let mut scene_autoplay_timer = 0.0f32;
     if let Some(def) = store.default.clone() {
@@ -618,10 +701,21 @@ async fn main() {
     let mut prev_incoming_zoom = st.zoom_level;
 
     sim.spawn_random(st.fill_count as usize, &mut rng);
+    // Si la escena predeterminada traía un mensaje/forma, reconstruirlo ya que
+    // las partículas existen.
+    build_shape(&mut sim, &params, &mut rng);
 
     loop {
-        // El lienzo mantiene el aspecto de la ventana; su alto lo fija `st`.
-        let aspect = screen_width() / screen_height();
+        // Región de la ventana donde se dibuja el mundo: con el panel acoplado y
+        // visible, se reserva su ancho a la derecha y el lienzo ocupa el resto.
+        let panel_w = if mode == AppMode::Embedded && panel_visible {
+            panel_px
+        } else {
+            0.0
+        };
+        let canvas = Rect::new(0.0, 0.0, (screen_width() - panel_w).max(1.0), screen_height());
+        // El lienzo mantiene el aspecto de su región; su alto lo fija `st`.
+        let aspect = canvas.w / canvas.h;
         let world = Vec2::new(st.canvas_size * aspect, st.canvas_size);
         sim.world = world;
         // El recentrado de zonas activas tira hacia el centro de la vista.
@@ -659,6 +753,7 @@ async fn main() {
             scene_autoplay_timer += get_frame_time();
             if scene_autoplay_timer >= st.scene_autoplay_interval.max(0.5) {
                 scene_autoplay_timer = 0.0;
+                let (old_t, old_i) = (params.shape_text.clone(), params.shape_image.clone());
                 scene_morph = cycle_scene(
                     1,
                     &store,
@@ -667,6 +762,7 @@ async fn main() {
                     st.scene_smooth,
                     st.scene_transition_duration,
                 );
+                apply_scene_shape(&mut sim, &params, &old_t, &old_i, &mut rng);
                 if scene_morph.is_none() && mode == AppMode::Detached {
                     pending_apply = Some(params.clone());
                 }
@@ -712,6 +808,8 @@ async fn main() {
                     AudioTarget::Brightness => {}
                 }
             }
+            // Aparición/disolución fluida de la forma (crece o mengua la mezcla).
+            sim.advance_shape(get_frame_time(), params.shape_transition_duration);
             sim.step(&params);
             params.time_scale = saved_ts;
             params.force = saved_force;
@@ -732,6 +830,7 @@ async fn main() {
         st.video_dir = video_dir.clone();
         st.scenes = store.names();
         st.default_scene = store.default.clone().unwrap_or_default();
+        st.saved_shapes = shape_store.shapes.clone();
 
         match mode {
             AppMode::Embedded => {
@@ -749,11 +848,18 @@ async fn main() {
                 egui_macroquad::ui(|ctx| {
                     want_pointer = ctx.wants_pointer_input();
                     want_keyboard = ctx.wants_keyboard_input();
-                    egui::SidePanel::right("panel")
-                        .default_width(310.0)
-                        .show(ctx, |ui| {
-                            events = config_panel(ui, &mut params, &mut st);
-                        });
+                    // Oculto: no dibujamos panel (egui queda vacío este frame, así
+                    // el ratón/teclado controlan el lienzo sin robar el foco).
+                    if panel_visible {
+                        let resp = egui::SidePanel::right("panel")
+                            .default_width(310.0)
+                            .show(ctx, |ui| {
+                                events = config_panel(ui, &mut params, &mut st);
+                            });
+                        // Ancho real del panel (en píxeles) para reservarle el lienzo
+                        // el próximo frame.
+                        panel_px = resp.response.rect.width() * ctx.pixels_per_point();
+                    }
                 });
             }
             AppMode::Detached => {
@@ -805,6 +911,10 @@ async fn main() {
                             if p.gradual || p.auto_randomize {
                                 p.matrix = params.matrix;
                             }
+                            // El descriptor de la forma lo posee el `sim` (se cambia
+                            // por eventos Form*/Release, no por el panel).
+                            p.shape_text = params.shape_text.clone();
+                            p.shape_image = params.shape_image.clone();
                             params = p;
                         }
                     }
@@ -862,6 +972,19 @@ async fn main() {
             }
             if is_key_pressed(KeyCode::G) {
                 show_frame = !show_frame;
+            }
+            if is_key_pressed(KeyCode::H) {
+                // Ocultar/mostrar el panel acoplado (deja el lienzo a pantalla
+                // completa). No afecta al panel separado.
+                panel_visible = !panel_visible;
+            }
+            if is_key_pressed(KeyCode::S) {
+                // Soltar la forma/texto activo (disolución fluida).
+                events.push(PanelEvent::ReleaseShape);
+            }
+            if is_key_pressed(KeyCode::Enter) && !st.shape_text.trim().is_empty() {
+                // Aplicar el texto escrito en el panel (formar la letra/mensaje).
+                events.push(PanelEvent::FormText(st.shape_text.clone()));
             }
             if is_key_pressed(KeyCode::A) {
                 params.attract_active = !params.attract_active;
@@ -938,7 +1061,7 @@ async fn main() {
                 }
                 PanelEvent::CenterFrame => {
                     frame_center = pan_target;
-                    frame_height = screen_height() * 0.8 / st.zoom_level;
+                    frame_height = canvas.h * 0.8 / st.zoom_level;
                     show_frame = true;
                 }
                 PanelEvent::PickVideoDir => {
@@ -957,12 +1080,16 @@ async fn main() {
                     if let Some(idx) = store.scenes.iter().position(|s| s.name == name) {
                         current_scene_idx = idx;
                         let target = store.scenes[idx].params.clone();
+                        let (old_t, old_i) =
+                            (params.shape_text.clone(), params.shape_image.clone());
                         scene_morph = start_scene(
                             &mut params,
                             &target,
                             st.scene_smooth,
                             st.scene_transition_duration,
                         );
+                        // Cambiar/soltar la forma solo si la escena trae otra distinta.
+                        apply_scene_shape(&mut sim, &params, &old_t, &old_i, &mut rng);
                         // Carga instantánea: avisamos ya al panel; la suave, al
                         // terminar el morph (ver `morph_done`).
                         if scene_morph.is_none() && mode == AppMode::Detached {
@@ -971,6 +1098,7 @@ async fn main() {
                     }
                 }
                 PanelEvent::NextScene => {
+                    let (old_t, old_i) = (params.shape_text.clone(), params.shape_image.clone());
                     scene_morph = cycle_scene(
                         1,
                         &store,
@@ -979,11 +1107,13 @@ async fn main() {
                         st.scene_smooth,
                         st.scene_transition_duration,
                     );
+                    apply_scene_shape(&mut sim, &params, &old_t, &old_i, &mut rng);
                     if scene_morph.is_none() && mode == AppMode::Detached {
                         pending_apply = Some(params.clone());
                     }
                 }
                 PanelEvent::PrevScene => {
+                    let (old_t, old_i) = (params.shape_text.clone(), params.shape_image.clone());
                     scene_morph = cycle_scene(
                         -1,
                         &store,
@@ -992,6 +1122,7 @@ async fn main() {
                         st.scene_smooth,
                         st.scene_transition_duration,
                     );
+                    apply_scene_shape(&mut sim, &params, &old_t, &old_i, &mut rng);
                     if scene_morph.is_none() && mode == AppMode::Detached {
                         pending_apply = Some(params.clone());
                     }
@@ -1039,33 +1170,77 @@ async fn main() {
                     scenes_dirty = true;
                 }
                 PanelEvent::FormText(text) => {
-                    // Solo una parte de las partículas forma el texto (en el
-                    // centro); el resto sigue con la animación del modo.
-                    let count = (sim.particles.len() * 7 / 10).max(1);
-                    let pts = text_to_points(&text, sim.world, count, &mut rng);
-                    sim.set_shape(pts);
-                    if params.shape_tint {
-                        sim.tint_shape(hue_for_index(params.shape_color));
-                    }
+                    params.shape_text = text;
+                    params.shape_image = String::new();
+                    build_shape(&mut sim, &params, &mut rng);
                 }
                 PanelEvent::FormImagePick => {
                     if let Some(path) = rfd::FileDialog::new()
                         .add_filter("Imagen", &["png", "jpg", "jpeg", "webp", "bmp"])
                         .pick_file()
                     {
-                        form_image(&path, &mut sim, &params, &mut rng);
+                        params.shape_image = path.to_string_lossy().into_owned();
+                        params.shape_text = String::new();
+                        build_shape(&mut sim, &params, &mut rng);
                     }
                 }
                 PanelEvent::FormImagePath(path) => {
-                    form_image(std::path::Path::new(&path), &mut sim, &params, &mut rng);
+                    params.shape_image = path;
+                    params.shape_text = String::new();
+                    build_shape(&mut sim, &params, &mut rng);
                 }
-                PanelEvent::ReleaseShape => sim.clear_shape(),
+                PanelEvent::ReleaseShape => {
+                    params.shape_text = String::new();
+                    params.shape_image = String::new();
+                    sim.clear_shape();
+                }
+                PanelEvent::SaveShape => {
+                    // Guarda el descriptor activo con un nombre derivado (el texto,
+                    // o el nombre de fichero de la imagen). Sin forma activa, no-op.
+                    let (name, text, image) = if !params.shape_text.trim().is_empty() {
+                        let t = params.shape_text.trim().to_string();
+                        (t.clone(), t, String::new())
+                    } else if !params.shape_image.is_empty() {
+                        let name = std::path::Path::new(&params.shape_image)
+                            .file_stem()
+                            .map(|s| s.to_string_lossy().into_owned())
+                            .unwrap_or_else(|| "imagen".to_string());
+                        (name, String::new(), params.shape_image.clone())
+                    } else {
+                        eprintln!("No hay forma activa que guardar.");
+                        continue;
+                    };
+                    shape_store.upsert(&name, text, image);
+                    if let Err(e) = shape_store.save() {
+                        eprintln!("No se pudo guardar la forma '{name}': {e}");
+                    }
+                    shapes_dirty = true;
+                }
+                PanelEvent::ApplyShape(name) => {
+                    if let Some(s) = shape_store.get(&name) {
+                        params.shape_text = s.text.clone();
+                        params.shape_image = s.image.clone();
+                        build_shape(&mut sim, &params, &mut rng);
+                        if mode == AppMode::Detached {
+                            pending_apply = Some(params.clone());
+                        }
+                    }
+                }
+                PanelEvent::DeleteShape(name) => {
+                    shape_store.remove(&name);
+                    if let Err(e) = shape_store.save() {
+                        eprintln!("No se pudo borrar la forma '{name}': {e}");
+                    }
+                    shapes_dirty = true;
+                }
+                PanelEvent::HidePanel => panel_visible = false,
                 other => apply_local_event(
                     other,
                     &mut sim,
                     &mut params,
                     &mut st,
                     &mut pan_target,
+                    Vec2::new(canvas.w, canvas.h),
                     &mut rng,
                     &mut step_once,
                 ),
@@ -1086,6 +1261,7 @@ async fn main() {
                     }
                     init_sent = true;
                     scenes_dirty = true; // envía la lista de escenas al panel nuevo
+                    shapes_dirty = true; // y la biblioteca de formas
                 }
                 let tele = TelemetryMsg::Stats {
                     particle_count: sim.particles.len(),
@@ -1116,6 +1292,13 @@ async fn main() {
                     }
                     scenes_dirty = false;
                 }
+                if shapes_dirty {
+                    let list = TelemetryMsg::ShapesList(shape_store.shapes.clone());
+                    if let Some(w) = ipc.writer.lock().unwrap().as_mut() {
+                        let _ = write_msg(w, &list);
+                    }
+                    shapes_dirty = false;
+                }
                 if let Some(p) = pending_apply.take() {
                     if let Some(w) = ipc.writer.lock().unwrap().as_mut() {
                         let _ = write_msg(w, &TelemetryMsg::ApplyParams(Box::new(p)));
@@ -1130,23 +1313,23 @@ async fn main() {
         // Zoom con la rueda, hacia el cursor (mantiene fijo el punto bajo él).
         let wheel = mouse_wheel().1;
         if wheel != 0.0 && !want_pointer {
-            let world_before = make_camera(st.zoom_level, pan_target).screen_to_world(mouse);
+            let world_before = cam_s2w(&make_camera(st.zoom_level, pan_target, canvas), mouse, canvas);
             let factor = if wheel > 0.0 { 1.15 } else { 1.0 / 1.15 };
             st.zoom_level = (st.zoom_level * factor).clamp(0.2, 30.0);
-            let world_after = make_camera(st.zoom_level, pan_target).screen_to_world(mouse);
+            let world_after = cam_s2w(&make_camera(st.zoom_level, pan_target, canvas), mouse, canvas);
             pan_target += world_before - world_after;
         }
 
         // Desplazamiento arrastrando con el botón derecho o central.
         if is_mouse_button_down(MouseButton::Right) || is_mouse_button_down(MouseButton::Middle) {
-            let cam = make_camera(st.zoom_level, pan_target);
-            pan_target += cam.screen_to_world(last_mouse) - cam.screen_to_world(mouse);
+            let cam = make_camera(st.zoom_level, pan_target, canvas);
+            pan_target += cam_s2w(&cam, last_mouse, canvas) - cam_s2w(&cam, mouse, canvas);
         }
 
         // --- Edición del recuadro de encuadre con el botón izquierdo ---
         // (solo si está visible; si no se agarra, el izquierdo pinta como siempre).
         if show_frame && !want_pointer {
-            let fcam = make_camera(st.zoom_level, pan_target);
+            let fcam = make_camera(st.zoom_level, pan_target, canvas);
             let hw = frame_height * frame_aspect / 2.0;
             let hh = frame_height / 2.0;
             if frame_drag.is_none() && is_mouse_button_pressed(MouseButton::Left) {
@@ -1158,8 +1341,8 @@ async fn main() {
                 ];
                 let near_corner = corners
                     .iter()
-                    .any(|c| (fcam.world_to_screen(*c) - mouse).length() < 14.0);
-                let wm = fcam.screen_to_world(mouse);
+                    .any(|c| (cam_w2s(&fcam, *c, canvas) - mouse).length() < 14.0);
+                let wm = cam_s2w(&fcam, mouse, canvas);
                 let inside = wm.x > frame_center.x - hw
                     && wm.x < frame_center.x + hw
                     && wm.y > frame_center.y - hh
@@ -1172,10 +1355,10 @@ async fn main() {
             }
             if let Some(drag) = frame_drag {
                 if is_mouse_button_down(MouseButton::Left) {
-                    let now = fcam.screen_to_world(mouse);
+                    let now = cam_s2w(&fcam, mouse, canvas);
                     match drag {
                         FrameDrag::Move => {
-                            frame_center += now - fcam.screen_to_world(last_mouse);
+                            frame_center += now - cam_s2w(&fcam, last_mouse, canvas);
                         }
                         FrameDrag::Resize => {
                             frame_height = (2.0 * (now.y - frame_center.y).abs()).max(10.0);
@@ -1191,13 +1374,13 @@ async fn main() {
 
         last_mouse = mouse;
 
-        let camera = make_camera(st.zoom_level, pan_target);
+        let camera = make_camera(st.zoom_level, pan_target, canvas);
 
         // Herramienta del ratón (fuera del panel y si no movemos el recuadro):
         // Fuerza atrae/repele el enjambre; Pincel pinta o borra.
         sim.pointer = None;
         if frame_drag.is_none() && !want_pointer && is_mouse_button_down(MouseButton::Left) {
-            let pos = camera.screen_to_world(mouse);
+            let pos = cam_s2w(&camera, mouse, canvas);
             match st.tool {
                 Tool::Force => sim.pointer = Some(pos),
                 Tool::Brush => match st.brush {
@@ -1275,12 +1458,12 @@ async fn main() {
                 trails_rt = Some(rt);
             }
             let rt = trails_rt.as_ref().unwrap();
-            let mut tcam = make_camera(st.zoom_level, pan_target);
+            let mut tcam = make_camera(st.zoom_level, pan_target, canvas);
             tcam.render_target = Some(rt.clone());
             set_camera(&tcam);
             // Desvanecido: rectángulo negro translúcido sobre el mundo visible.
-            let tl = tcam.screen_to_world(vec2(0.0, 0.0));
-            let br = tcam.screen_to_world(vec2(sw, sh));
+            let tl = cam_s2w(&tcam, vec2(canvas.x, canvas.y), canvas);
+            let br = cam_s2w(&tcam, vec2(canvas.x + canvas.w, canvas.y + canvas.h), canvas);
             draw_rectangle(
                 tl.x.min(br.x),
                 tl.y.min(br.y),
@@ -1350,6 +1533,19 @@ async fn main() {
                 40.0,
                 34.0,
                 RED,
+            );
+        }
+
+        // Con el panel oculto, un recordatorio discreto de cómo recuperarlo.
+        if mode == AppMode::Embedded && !panel_visible {
+            let hint = "H: mostrar panel";
+            let d = measure_text(hint, None, 22, 1.0);
+            draw_text(
+                hint,
+                screen_width() - d.width - 16.0,
+                28.0,
+                22.0,
+                Color::new(0.8, 0.8, 0.85, 0.7),
             );
         }
 

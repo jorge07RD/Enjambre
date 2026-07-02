@@ -112,16 +112,18 @@ pub enum Boundary {
 }
 
 /// Modo de la brocha de pintado en el lienzo.
-#[derive(Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Copy, PartialEq, Serialize, Deserialize, Default)]
 pub enum Brush {
+    #[default]
     Add,
     Erase,
 }
 
 /// Herramienta activa del botón izquierdo del ratón sobre el lienzo.
-#[derive(Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Copy, PartialEq, Serialize, Deserialize, Default)]
 pub enum Tool {
     /// Pincel: pinta o borra partículas (comportamiento clásico).
+    #[default]
     Brush,
     /// Fuerza: atrae o repele el enjambre alrededor del cursor.
     Force,
@@ -373,10 +375,19 @@ pub struct SimParams {
     /// "Fijación" de la forma: 0 = las partículas fluyen con la física (texto
     /// vivo), 1 = se fijan nítidas en la forma. Solo actúa si hay una forma.
     pub shape_strength: f32,
+    /// Duración (s) de la aparición/disolución fluida de la forma al aplicarla o
+    /// soltarla. 0 = instantáneo.
+    pub shape_transition_duration: f32,
     /// Teñir la forma de un color en vez de mantener los colores actuales.
     pub shape_tint: bool,
     /// Índice de color de la paleta para el tinte de la forma.
     pub shape_color: usize,
+    /// Descriptor de la forma activa (para poder guardarla en una escena y
+    /// reconstruirla al cargarla). Los posee el `sim`. Vacíos = sin forma.
+    /// Mensaje de texto activo (prioritario sobre la imagen).
+    pub shape_text: String,
+    /// Ruta de la imagen activa (si `shape_text` está vacío).
+    pub shape_image: String,
 
     // --- Reactivo al audio ---
     /// Si está activo, el audio del micrófono modula un parámetro.
@@ -451,8 +462,11 @@ impl Default for SimParams {
             audio_target: AudioTarget::Speed,
             audio_intensity: 1.0,
             shape_strength: 0.5,
+            shape_transition_duration: 1.5,
             shape_tint: false,
             shape_color: 0,
+            shape_text: String::new(),
+            shape_image: String::new(),
         }
     }
 }
