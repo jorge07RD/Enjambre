@@ -6,21 +6,11 @@
 // celdas son pocas, (mundo/r_max)², así que un solo hilo es despreciable
 // frente a las fuerzas; paralelizar con un scan jerárquico si creciera) y
 // `scatter` (colocar los índices, cursor atómico por celda).
-
-struct Params {
-    world: vec2f,
-    dt: f32,
-    friction: f32,
-    force: f32,
-    r_max: f32,
-    beta: f32,
-    count: u32,
-    cols: i32,
-    rows: i32,
-    inv_cell: f32,
-    _pad: u32,
-    matrix: array<vec4f, 9>,
-};
+//
+// La struct `Params` llega antepuesta desde params.wgsl; aquí solo se usan
+// `world/count/cols/rows/inv_cell` (las dimensiones actuales del grid, que
+// pueden cambiar en caliente al cambiar `r_max`; los buffers están
+// dimensionados para el peor caso, ver gpu_sim.rs).
 
 @group(0) @binding(0) var<uniform> P: Params;
 @group(0) @binding(1) var<storage, read> pos: array<vec2f>;

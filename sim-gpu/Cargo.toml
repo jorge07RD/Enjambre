@@ -9,9 +9,17 @@ path = "src/main.rs"
 
 [dependencies]
 shared = { path = "../shared" }
-# wgpu 24 = el pareado de egui-wgpu 0.31 (el panel egui llega en el hito 5).
+# wgpu 24 = el pareado de egui-wgpu 0.31 (el panel embebido del hito 5).
 wgpu = "24"
 winit = "0.30"
 pollster = "0.4"
 bytemuck = { version = "1", features = ["derive"] }
 rand.workspace = true
+egui.workspace = true
+egui-wgpu = "0.31"
+egui-winit = "0.31"
+rfd = "0.15"
+# Hito 6: rasterizado de texto (fuente del sistema) y decodificación de
+# imágenes para las formas, sin macroquad.
+ab_glyph = "0.2"
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "webp", "bmp", "gif"] }

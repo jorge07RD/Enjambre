@@ -1,33 +1,35 @@
-// Render de partículas: un quad por instancia leído directo del buffer de
-// posiciones de la simulación (cero copias CPU↔GPU), con caída radial de brillo
-// en el fragmento (estilo "glow") y mezcla ADITIVA (los solapes suman → neón).
+// Render de partículas con paridad visual con `sim/src/render.rs`: estilos
+// Brillo/Sólido/Sólido+halo (perfiles de alfa portados de `make_texture`),
+// flechas orientadas por la velocidad (mezcla continua disco↔flecha por
+// `orient`) y bloom (halo aditivo grande por partícula, como `draw_bloom`).
+// Todo se pinta sobre la textura HDR fuera de pantalla (ver gpu_sim.rs); el
+// volcado a la superficie y el desvanecido de estelas viven en post.wgsl.
 
-struct Camera {
+struct RenderParams {
     // mundo → NDC: ndc = pos * scale + offset (la Y del mundo crece hacia
     // abajo, como en la CPU; el flip vive en `scale.y`).
     scale: vec2f,
     offset: vec2f,
-    // Semitamaño del quad en unidades de mundo.
     point_size: f32,
-    _pad0: f32,
-    _pad1: f32,
-    _pad2: f32,
+    // 0 = Brillo (glow), 1 = Sólido, 2 = Sólido+halo.
+    style: u32,
+    brightness: f32,
+    orient: f32,
+    bloom_intensity: f32,
+    bloom_radius: f32,
+    trail_fade: f32,
+    _pad: f32,
 };
 
-@group(0) @binding(0) var<uniform> cam: Camera;
+@group(0) @binding(0) var<uniform> R: RenderParams;
 @group(0) @binding(1) var<storage, read> pos: array<vec2f>;
 @group(0) @binding(2) var<storage, read> hue: array<f32>;
+@group(0) @binding(3) var<storage, read> vel: array<vec2f>;
 
-struct VsOut {
-    @builtin(position) clip: vec4f,
-    @location(0) uv: vec2f,
-    @location(1) color: vec3f,
-};
-
-// Rueda de color continua (= `color_for_hue` de la CPU).
+// Matiz [0,1) a RGB vivo (= `color_for_hue` de la CPU: HSV con s=v=1).
 fn color_for_hue(h: f32) -> vec3f {
     let h6 = fract(h) * 6.0;
-    let i = i32(floor(h6));
+    let i = i32(floor(h6)) % 6;
     let f = h6 - floor(h6);
     switch i {
         case 0: { return vec3f(1.0, f, 0.0); }
@@ -39,25 +41,105 @@ fn color_for_hue(h: f32) -> vec3f {
     }
 }
 
-@vertex
-fn vs(@builtin(vertex_index) vi: u32, @builtin(instance_index) ii: u32) -> VsOut {
-    // Esquina del quad en triangle-strip: (-1,-1) (1,-1) (-1,1) (1,1).
-    let corner = vec2f(
-        f32(vi & 1u) * 2.0 - 1.0,
-        f32(vi >> 1u) * 2.0 - 1.0,
-    );
-    let world = pos[ii] + corner * cam.point_size;
+struct VsOut {
+    @builtin(position) clip: vec4f,
+    // Coordenada -1..1 dentro del quad (distancia radial en el fragmento).
+    @location(0) uv: vec2f,
+    @location(1) color: vec3f,
+    @location(2) alpha: f32,
+};
+
+// Quad instanciado en triangle-strip: esquinas (-1,-1),(1,-1),(-1,1),(1,1).
+fn quad_vertex(vi: u32, center: vec2f, s: f32, color: vec3f, alpha: f32) -> VsOut {
+    let corner = vec2f(f32(vi & 1u), f32(vi >> 1u)) * 2.0 - 1.0;
     var out: VsOut;
-    out.clip = vec4f(world * cam.scale + cam.offset, 0.0, 1.0);
+    out.clip = vec4f((center + corner * s) * R.scale + R.offset, 0.0, 1.0);
     out.uv = corner;
+    out.color = color;
+    out.alpha = alpha;
+    return out;
+}
+
+// --- Discos (estilo del punto), mezcla alfa normal ---
+
+@vertex
+fn vs_disc(@builtin(vertex_index) vi: u32, @builtin(instance_index) ii: u32) -> VsOut {
+    // El quad se extiende más allá del radio nominal según el estilo (mismos
+    // factores que las texturas de la CPU).
+    var mult = 1.6; // Brillo
+    if R.style == 1u { mult = 1.0; } else if R.style == 2u { mult = 1.8; }
+    let a = R.brightness * (1.0 - R.orient);
+    return quad_vertex(vi, pos[ii], R.point_size * mult, color_for_hue(hue[ii]), a);
+}
+
+@fragment
+fn fs_disc(in: VsOut) -> @location(0) vec4f {
+    let d = min(length(in.uv), 1.0);
+    var prof = 0.0;
+    if R.style == 1u {
+        // Disco lleno con borde antialias en el último 8%.
+        prof = clamp((0.96 - d) / 0.08, 0.0, 1.0);
+    } else if R.style == 2u {
+        // Núcleo opaco hasta el 45% del radio + halo suave alrededor.
+        if d < 0.45 {
+            prof = 1.0;
+        } else {
+            prof = pow(clamp(1.0 - (d - 0.45) / 0.55, 0.0, 1.0), 1.8);
+        }
+    } else {
+        // Caída suave: brilla más en el centro (glow).
+        prof = pow(1.0 - d, 2.2);
+    }
+    return vec4f(in.color, prof * in.alpha);
+}
+
+// --- Bloom: halo grande ADITIVO por debajo de las partículas ---
+
+@vertex
+fn vs_bloom(@builtin(vertex_index) vi: u32, @builtin(instance_index) ii: u32) -> VsOut {
+    // La intensidad va en el alfa (la mezcla aditiva pondera por alfa),
+    // atenuada ×0.5 para que se acumule con gracia (= `draw_bloom`).
+    let ga = clamp(R.brightness * R.bloom_intensity * 0.5, 0.0, 1.0);
+    let s = R.point_size * max(R.bloom_radius, 0.1);
+    return quad_vertex(vi, pos[ii], s, color_for_hue(hue[ii]), ga);
+}
+
+@fragment
+fn fs_bloom(in: VsOut) -> @location(0) vec4f {
+    let d = min(length(in.uv), 1.0);
+    return vec4f(in.color, pow(1.0 - d, 2.2) * in.alpha);
+}
+
+// --- Flechas: triángulo orientado por la velocidad ---
+
+@vertex
+fn vs_arrow(@builtin(vertex_index) vi: u32, @builtin(instance_index) ii: u32) -> VsOut {
+    let v = vel[ii];
+    let l = length(v);
+    var dir = vec2f(1.0, 0.0);
+    if l > 1e-5 {
+        dir = v / l;
+    }
+    let perp = vec2f(-dir.y, dir.x);
+    let s = R.point_size * 1.3;
+    let p = pos[ii];
+    var w: vec2f;
+    if vi == 0u {
+        w = p + dir * (s * 1.8); // punta
+    } else if vi == 1u {
+        w = p - dir * (s * 0.9) + perp * s;
+    } else {
+        w = p - dir * (s * 0.9) - perp * s;
+    }
+    var out: VsOut;
+    out.clip = vec4f(w * R.scale + R.offset, 0.0, 1.0);
+    out.uv = vec2f(0.0);
     out.color = color_for_hue(hue[ii]);
+    out.alpha = R.brightness * R.orient;
     return out;
 }
 
 @fragment
-fn fs(in: VsOut) -> @location(0) vec4f {
-    // Glow: brilla en el centro y cae suave (misma curva que la textura CPU).
-    let d = min(length(in.uv), 1.0);
-    let a = pow(1.0 - d, 2.2);
-    return vec4f(in.color * a, a);
+fn fs_arrow(in: VsOut) -> @location(0) vec4f {
+    return vec4f(in.color, in.alpha);
 }
