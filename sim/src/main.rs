@@ -11,8 +11,8 @@ use render::Renderer;
 use shared::ipc::{decode, read_frame, socket_path, write_msg, IPC_VERSION};
 use shared::{
     config_panel, example_store, hue_for_index, scenes_path, AudioTarget, Boundary, Brush,
-    ControlMsg, ControlState, InteractionMode, PanelEvent, PanelState, SceneStore, ShapeStore,
-    SimParams, TelemetryMsg, Tool, FRAME_PRESETS,
+    ControlMsg, ControlState, InteractionMode, PanelEvent, PanelState, Playlist, SceneStore,
+    SeqPlayback, ShapeStore, SimParams, TelemetryMsg, Tool, FRAME_PRESETS,
 };
 use simulation::Simulation;
 
@@ -171,6 +171,72 @@ fn cycle_scene(
     *idx = (*idx as i32 + step).rem_euclid(n as i32) as usize;
     let target = store.scenes[*idx].params.clone();
     start_scene(params, &target, smooth, dur)
+}
+
+/// Estado runtime del secuenciador de escenas: la playlist (que edita el panel
+/// y persiste en `playlist.json`) más la posición de reproducción del show.
+struct Sequencer {
+    playlist: Playlist,
+    state: SeqPlayback,
+    idx: usize,
+    timer: f32,
+}
+
+impl Sequencer {
+    /// Índice de la primera entrada cuya escena existe en `store`, empezando en
+    /// `start` (incluida) y avanzando en la dirección `dir` (+1/-1) con
+    /// envoltura, como mucho una vuelta completa. `None` = ninguna válida.
+    fn find_valid(&self, store: &SceneStore, start: usize, dir: i32) -> Option<usize> {
+        let n = self.playlist.entries.len();
+        if n == 0 {
+            return None;
+        }
+        let mut i = start.min(n - 1) as i32;
+        for _ in 0..n {
+            let idx = i.rem_euclid(n as i32) as usize;
+            if store.get(&self.playlist.entries[idx].scene).is_some() {
+                return Some(idx);
+            }
+            i += dir;
+        }
+        None
+    }
+}
+
+/// Lanza la entrada `idx` de la playlist: carga su escena con la transición
+/// propia de la entrada (o la global del panel) y reinicia el cronómetro de la
+/// entrada. Mismo camino que `LoadScene` (morph + forma + aviso al panel).
+#[allow(clippy::too_many_arguments)]
+fn seq_launch(
+    seq: &mut Sequencer,
+    idx: usize,
+    store: &SceneStore,
+    params: &mut SimParams,
+    sim: &mut Simulation,
+    st: &PanelState,
+    current_scene_idx: &mut usize,
+    scene_morph: &mut Option<SceneMorph>,
+    pending_apply: &mut Option<SimParams>,
+    detached: bool,
+    rng: &mut impl Rng,
+) {
+    seq.idx = idx;
+    seq.timer = 0.0;
+    let entry = match seq.playlist.entries.get(idx) {
+        Some(e) => e,
+        None => return,
+    };
+    let dur = entry.transition.unwrap_or(st.scene_transition_duration);
+    if let Some(pos) = store.scenes.iter().position(|s| s.name == entry.scene) {
+        *current_scene_idx = pos;
+        let target = store.scenes[pos].params.clone();
+        let (old_t, old_i) = (params.shape_text.clone(), params.shape_image.clone());
+        *scene_morph = start_scene(params, &target, st.scene_smooth, dur);
+        apply_scene_shape(sim, params, &old_t, &old_i, rng);
+        if scene_morph.is_none() && detached {
+            *pending_apply = Some(params.clone());
+        }
+    }
 }
 
 /// Cámara que mapea el rectángulo de mundo del recuadro (centro + ancho/alto)
@@ -653,6 +719,13 @@ fn apply_local_event(
         | PanelEvent::SaveShape
         | PanelEvent::ApplyShape(_)
         | PanelEvent::DeleteShape(_)
+        | PanelEvent::SeqSetPlaylist(_)
+        | PanelEvent::SeqPlay
+        | PanelEvent::SeqPause
+        | PanelEvent::SeqStop
+        | PanelEvent::SeqNext
+        | PanelEvent::SeqPrev
+        | PanelEvent::SeqJump(_)
         | PanelEvent::HidePanel => {}
     }
 }
@@ -720,6 +793,14 @@ async fn main() {
     let mut shapes_dirty = false;
     let mut current_scene_idx = 0usize;
     let mut scene_autoplay_timer = 0.0f32;
+    // Secuenciador de escenas (show). La playlist persiste en playlist.json.
+    let mut sequencer = Sequencer {
+        playlist: Playlist::load(),
+        state: SeqPlayback::Stopped,
+        idx: 0,
+        timer: 0.0,
+    };
+    let mut seq_dirty = false;
     if let Some(def) = store.default.clone() {
         if let Some(scene) = store.get(&def) {
             params = scene.params.settled();
@@ -760,11 +841,22 @@ async fn main() {
         // en pausa, para que al reanudar ya esté en el valor pedido).
         params.advance_speed(get_frame_time());
 
+        // Tiempo de "show" (secuenciador, autoplay y morphs de escena): el del
+        // frame en vivo, pero 1/60 exacto mientras se graba, porque cada frame
+        // de simulación es 1/60 s de vídeo. Así las duraciones del show y de
+        // las transiciones salen exactas en el .mp4 aunque el volcado vaya
+        // más lento que el tiempo real.
+        let show_dt = if rec.is_some() {
+            1.0 / REC_FPS as f32
+        } else {
+            get_frame_time()
+        };
+
         // Transición de escena en curso: interpola los números; el cruce de
         // interacción lo lleva el blend de `advance_transition` (más abajo).
         let mut morph_done = false;
         if let Some(m) = scene_morph.as_mut() {
-            m.blend = (m.blend + get_frame_time() / m.dur).min(1.0);
+            m.blend = (m.blend + show_dt / m.dur).min(1.0);
             let t = m.blend * m.blend * (3.0 - 2.0 * m.blend);
             params.lerp_scene_numeric(&m.from, &m.target, t);
             if m.blend >= 1.0 {
@@ -783,9 +875,56 @@ async fn main() {
             }
         }
 
+        // Secuenciador: mientras reproduce, conduce él los cambios de escena
+        // (el auto-avance simple queda en espera). La duración de cada entrada
+        // incluye su transición, así el show dura la suma de las entradas.
+        if sequencer.state == SeqPlayback::Playing && !sequencer.playlist.entries.is_empty() {
+            sequencer.timer += show_dt;
+            let n = sequencer.playlist.entries.len();
+            let cur_dur = sequencer.playlist.entries[sequencer.idx.min(n - 1)]
+                .duration
+                .max(0.1);
+            if sequencer.timer >= cur_dur {
+                let next = sequencer.idx + 1;
+                if next >= n && !sequencer.playlist.loop_at_end {
+                    // Show terminado: parar y, si la grabación la arrancó el
+                    // show (start_on_record), cerrarla también.
+                    sequencer.state = SeqPlayback::Stopped;
+                    sequencer.idx = 0;
+                    sequencer.timer = 0.0;
+                    if sequencer.playlist.start_on_record {
+                        if let Some(r) = rec.take() {
+                            r.finish();
+                        }
+                    }
+                } else if let Some(v) = sequencer.find_valid(&store, next % n, 1) {
+                    seq_launch(
+                        &mut sequencer,
+                        v,
+                        &store,
+                        &mut params,
+                        &mut sim,
+                        &st,
+                        &mut current_scene_idx,
+                        &mut scene_morph,
+                        &mut pending_apply,
+                        mode == AppMode::Detached,
+                        &mut rng,
+                    );
+                } else {
+                    // No queda ninguna entrada válida (escenas borradas).
+                    sequencer.state = SeqPlayback::Stopped;
+                }
+            }
+        }
+
         // Auto-avance de escenas (slideshow): cambia a la siguiente cada X s.
-        if st.scene_autoplay && scene_morph.is_none() && store.scenes.len() > 1 {
-            scene_autoplay_timer += get_frame_time();
+        if st.scene_autoplay
+            && sequencer.state != SeqPlayback::Playing
+            && scene_morph.is_none()
+            && store.scenes.len() > 1
+        {
+            scene_autoplay_timer += show_dt;
             if scene_autoplay_timer >= st.scene_autoplay_interval.max(0.5) {
                 scene_autoplay_timer = 0.0;
                 let (old_t, old_i) = (params.shape_text.clone(), params.shape_image.clone());
@@ -866,6 +1005,10 @@ async fn main() {
         st.scenes = store.names();
         st.default_scene = store.default.clone().unwrap_or_default();
         st.saved_shapes = shape_store.shapes.clone();
+        st.seq_playlist = sequencer.playlist.clone();
+        st.seq_state = sequencer.state;
+        st.seq_idx = sequencer.idx;
+        st.seq_elapsed = sequencer.timer;
 
         match mode {
             AppMode::Embedded => {
@@ -1120,7 +1263,29 @@ async fn main() {
                 PanelEvent::ToggleRecord => match rec.take() {
                     Some(r) => r.finish(),
                     None => match Recorder::start(preset_w, preset_h, &video_dir, &st.music_path) {
-                        Ok(r) => rec = Some(r),
+                        Ok(r) => {
+                            rec = Some(r);
+                            // Show ligado a la grabación: arranca desde el
+                            // principio junto con ella.
+                            if sequencer.playlist.start_on_record {
+                                if let Some(v) = sequencer.find_valid(&store, 0, 1) {
+                                    sequencer.state = SeqPlayback::Playing;
+                                    seq_launch(
+                                        &mut sequencer,
+                                        v,
+                                        &store,
+                                        &mut params,
+                                        &mut sim,
+                                        &st,
+                                        &mut current_scene_idx,
+                                        &mut scene_morph,
+                                        &mut pending_apply,
+                                        mode == AppMode::Detached,
+                                        &mut rng,
+                                    );
+                                }
+                            }
+                        }
                         Err(e) => {
                             eprintln!("No se pudo iniciar la grabación (¿está ffmpeg?): {e}")
                         }
@@ -1315,6 +1480,118 @@ async fn main() {
                     }
                     shapes_dirty = true;
                 }
+                PanelEvent::SeqSetPlaylist(pl) => {
+                    sequencer.playlist = pl;
+                    let n = sequencer.playlist.entries.len();
+                    if n == 0 {
+                        sequencer.state = SeqPlayback::Stopped;
+                        sequencer.idx = 0;
+                        sequencer.timer = 0.0;
+                    } else if sequencer.idx >= n {
+                        sequencer.idx = n - 1;
+                    }
+                    if let Err(e) = sequencer.playlist.save() {
+                        eprintln!("No se pudo guardar la playlist: {e}");
+                    }
+                }
+                PanelEvent::SeqPlay => match sequencer.state {
+                    SeqPlayback::Paused => sequencer.state = SeqPlayback::Playing,
+                    SeqPlayback::Stopped => {
+                        if let Some(v) = sequencer.find_valid(&store, 0, 1) {
+                            sequencer.state = SeqPlayback::Playing;
+                            seq_launch(
+                                &mut sequencer,
+                                v,
+                                &store,
+                                &mut params,
+                                &mut sim,
+                                &st,
+                                &mut current_scene_idx,
+                                &mut scene_morph,
+                                &mut pending_apply,
+                                mode == AppMode::Detached,
+                                &mut rng,
+                            );
+                        } else {
+                            eprintln!("Secuenciador: no hay entradas válidas que reproducir.");
+                        }
+                    }
+                    SeqPlayback::Playing => {}
+                },
+                PanelEvent::SeqPause => {
+                    if sequencer.state == SeqPlayback::Playing {
+                        sequencer.state = SeqPlayback::Paused;
+                    }
+                }
+                PanelEvent::SeqStop => {
+                    sequencer.state = SeqPlayback::Stopped;
+                    sequencer.idx = 0;
+                    sequencer.timer = 0.0;
+                }
+                PanelEvent::SeqNext => {
+                    let n = sequencer.playlist.entries.len();
+                    if n > 0 {
+                        if let Some(v) = sequencer.find_valid(&store, (sequencer.idx + 1) % n, 1) {
+                            seq_launch(
+                                &mut sequencer,
+                                v,
+                                &store,
+                                &mut params,
+                                &mut sim,
+                                &st,
+                                &mut current_scene_idx,
+                                &mut scene_morph,
+                                &mut pending_apply,
+                                mode == AppMode::Detached,
+                                &mut rng,
+                            );
+                        }
+                    }
+                }
+                PanelEvent::SeqPrev => {
+                    let n = sequencer.playlist.entries.len();
+                    if n > 0 {
+                        if let Some(v) =
+                            sequencer.find_valid(&store, (sequencer.idx + n - 1) % n, -1)
+                        {
+                            seq_launch(
+                                &mut sequencer,
+                                v,
+                                &store,
+                                &mut params,
+                                &mut sim,
+                                &st,
+                                &mut current_scene_idx,
+                                &mut scene_morph,
+                                &mut pending_apply,
+                                mode == AppMode::Detached,
+                                &mut rng,
+                            );
+                        }
+                    }
+                }
+                PanelEvent::SeqJump(i) => {
+                    let valid = sequencer
+                        .playlist
+                        .entries
+                        .get(i)
+                        .is_some_and(|e| store.get(&e.scene).is_some());
+                    if valid {
+                        seq_launch(
+                            &mut sequencer,
+                            i,
+                            &store,
+                            &mut params,
+                            &mut sim,
+                            &st,
+                            &mut current_scene_idx,
+                            &mut scene_morph,
+                            &mut pending_apply,
+                            mode == AppMode::Detached,
+                            &mut rng,
+                        );
+                    }
+                }
                 PanelEvent::HidePanel => panel_visible = false,
                 other => apply_local_event(
                     other,
@@ -1346,6 +1623,7 @@ async fn main() {
                     init_sent = true;
                     scenes_dirty = true; // envía la lista de escenas al panel nuevo
                     shapes_dirty = true; // y la biblioteca de formas
+                    seq_dirty = true; // y la playlist del secuenciador
                 }
                 let tele = TelemetryMsg::Stats {
                     particle_count: sim.particles.len(),
@@ -1382,6 +1660,22 @@ async fn main() {
                         let _ = write_msg(w, &list);
                     }
                     shapes_dirty = false;
+                }
+                if seq_dirty {
+                    let msg = TelemetryMsg::SeqPlaylist(sequencer.playlist.clone());
+                    if let Some(w) = ipc.writer.lock().unwrap().as_mut() {
+                        let _ = write_msg(w, &msg);
+                    }
+                    seq_dirty = false;
+                }
+                // Posición de reproducción del show (continuo, como Stats).
+                let seq_tele = TelemetryMsg::SeqStatus {
+                    state: sequencer.state,
+                    idx: sequencer.idx,
+                    elapsed: sequencer.timer,
+                };
+                if let Some(w) = ipc.writer.lock().unwrap().as_mut() {
+                    let _ = write_msg(w, &seq_tele);
                 }
                 if let Some(p) = pending_apply.take() {
                     if let Some(w) = ipc.writer.lock().unwrap().as_mut() {

@@ -7,7 +7,7 @@ use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
 /// Una parada del show: qué escena y cuánto tiempo (transición incluida).
-#[derive(Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct PlaylistEntry {
     /// Nombre de la escena en el `SceneStore`.
@@ -31,7 +31,7 @@ impl Default for PlaylistEntry {
 }
 
 /// La playlist completa más sus opciones de reproducción.
-#[derive(Default, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Default, Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Playlist {
     pub entries: Vec<PlaylistEntry>,
@@ -43,7 +43,7 @@ pub struct Playlist {
 }
 
 /// Estado de reproducción del secuenciador (viaja por IPC en la telemetría).
-#[derive(Clone, Copy, PartialEq, Serialize, Deserialize, Default)]
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize, Default)]
 pub enum SeqPlayback {
     #[default]
     Stopped,
@@ -88,6 +88,7 @@ mod tests {
 
     #[test]
     fn roundtrip_persistencia() {
+        let _env = crate::TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         // Aísla el fichero en un directorio temporal para no tocar la config real.
         let dir = std::env::temp_dir().join(format!("enjambre_pl_test_{}", std::process::id()));
         std::env::set_var("XDG_CONFIG_HOME", &dir);

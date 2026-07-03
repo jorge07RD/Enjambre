@@ -7,9 +7,11 @@
 //! que cada proceso las resuelva a su manera (localmente o por IPC).
 
 use crate::config::{
-    palette, AudioTarget, BoidsScope, Boundary, Brush, InteractionMode, InteractionSnapshot,
-    RenderStyle, SimParams, Tool, COLOR_NAMES, FRAME_PRESETS, NUM_COLORS,
+    palette, AudioTarget, BeatAction, BoidsScope, Boundary, Brush, InteractionMode,
+    InteractionSnapshot, MusicSync, RenderStyle, SimParams, Tool, COLOR_NAMES, FRAME_PRESETS,
+    NUM_COLORS,
 };
+use crate::playlist::{Playlist, PlaylistEntry, SeqPlayback};
 use crate::shapes::SavedShape;
 use crate::ui_theme::icon;
 use serde::{Deserialize, Serialize};
@@ -33,6 +35,17 @@ pub struct PanelState {
     /// Pista de música a mezclar en el vídeo (vacío = sin audio).
     pub music_path: String,
 
+    // --- Sincronía con la música ---
+    /// Configuración de la sincronía (viaja en `ControlState`).
+    pub music_sync: MusicSync,
+    /// Resultado del análisis de la pista (telemetría, solo para mostrar).
+    pub music_analyzed: bool,
+    pub music_duration: f32,
+    pub music_onsets: usize,
+    pub music_bpm: Option<f32>,
+    /// `true` mientras la preescucha está sonando en el `sim`.
+    pub music_previewing: bool,
+
     /// Texto en edición para formar con las partículas.
     pub shape_text: String,
     /// Biblioteca de formas/letras guardadas (la gobierna el `sim`, llega por
@@ -53,6 +66,17 @@ pub struct PanelState {
     /// Lista de escenas y predeterminada (las gobierna el `sim` por telemetría).
     pub scenes: Vec<String>,
     pub default_scene: String,
+
+    // --- Secuenciador ---
+    /// Playlist en edición. En el panel separado es la copia local (viaja al
+    /// `sim` completa con `SeqSetPlaylist`); embebido, refleja la del `sim`.
+    pub seq_playlist: Playlist,
+    /// Estado de reproducción (telemetría del `sim`, solo para mostrar).
+    pub seq_state: SeqPlayback,
+    pub seq_idx: usize,
+    pub seq_elapsed: f32,
+    /// Índice del combo "añadir escena al show".
+    pub seq_scene_pick: usize,
 
     // Telemetría que llega de la simulación (solo para mostrar).
     pub particle_count: usize,
@@ -94,6 +118,11 @@ impl Default for PanelState {
             scene_autoplay_interval: 10.0,
             scenes: Vec::new(),
             default_scene: String::new(),
+            seq_playlist: Playlist::default(),
+            seq_state: SeqPlayback::Stopped,
+            seq_idx: 0,
+            seq_elapsed: 0.0,
+            seq_scene_pick: 0,
             particle_count: 0,
             fps: 0,
             recording: false,
@@ -170,6 +199,18 @@ pub enum PanelEvent {
     DeleteShape(String),
     /// Ocultar el panel acoplado (se recupera con la tecla H).
     HidePanel,
+    /// Reemplazar la playlist del secuenciador (edición completa: añadir,
+    /// borrar, reordenar, duraciones y opciones). El `sim` la persiste.
+    SeqSetPlaylist(Playlist),
+    /// Transporte del secuenciador.
+    SeqPlay,
+    SeqPause,
+    SeqStop,
+    /// Saltar a la entrada siguiente/anterior de la playlist (con envoltura).
+    SeqNext,
+    SeqPrev,
+    /// Saltar a la entrada `i` de la playlist.
+    SeqJump(usize),
 }
 
 /// Selecciona la forma `idx` de la biblioteca: la resalta, carga su texto en el
@@ -802,6 +843,206 @@ pub fn config_panel(
                         ui.label(&name);
                     });
                 }
+            }
+        });
+
+        // ===================== Secuenciador =====================
+        // Playlist de escenas con duración propia por entrada, para montar un
+        // "show" reproducible y grabable. La lista la edita el panel y viaja
+        // completa al `sim` (`SeqSetPlaylist`); el estado de reproducción llega
+        // de vuelta por telemetría (`seq_state`/`seq_idx`/`seq_elapsed`).
+        egui::CollapsingHeader::new(format!("{} Secuenciador", icon::H_SEQ)).show(ui, |ui| {
+            let mut changed = false;
+
+            // Transporte del show.
+            ui.horizontal(|ui| {
+                if st.seq_state == SeqPlayback::Playing {
+                    if ui.button(icon::PAUSE).on_hover_text("Pausar el show").clicked() {
+                        events.push(PanelEvent::SeqPause);
+                    }
+                } else if ui.button(icon::PLAY).on_hover_text("Reproducir el show").clicked() {
+                    events.push(PanelEvent::SeqPlay);
+                }
+                if ui
+                    .button(icon::STOP)
+                    .on_hover_text("Detener (vuelve al principio)")
+                    .clicked()
+                {
+                    events.push(PanelEvent::SeqStop);
+                }
+                if ui.button(icon::PREV).on_hover_text("Entrada anterior").clicked() {
+                    events.push(PanelEvent::SeqPrev);
+                }
+                if ui.button(icon::NEXT).on_hover_text("Entrada siguiente").clicked() {
+                    events.push(PanelEvent::SeqNext);
+                }
+            });
+
+            let n = st.seq_playlist.entries.len();
+            if n > 0 {
+                let dur = st
+                    .seq_playlist
+                    .entries
+                    .get(st.seq_idx)
+                    .map_or(0.0, |e| e.duration);
+                ui.label(
+                    egui::RichText::new(format!(
+                        "Entrada {}/{} · {:.0} / {:.0} s · show {:.0} s",
+                        (st.seq_idx + 1).min(n),
+                        n,
+                        st.seq_elapsed,
+                        dur,
+                        st.seq_playlist.total_duration()
+                    ))
+                    .weak()
+                    .small(),
+                );
+            }
+            if st.scene_autoplay && st.seq_state == SeqPlayback::Playing {
+                ui.label(
+                    egui::RichText::new("El auto-avance simple queda en espera mientras el show suena.")
+                        .color(egui::Color32::from_rgb(230, 180, 60))
+                        .small(),
+                );
+            }
+
+            // Lista de entradas (editable). Las operaciones estructurales se
+            // recogen y aplican tras el bucle para no mover índices en medio.
+            let scenes = st.scenes.clone();
+            let mut swap: Option<(usize, usize)> = None;
+            let mut delete: Option<usize> = None;
+            for i in 0..n {
+                ui.horizontal(|ui| {
+                    if ui
+                        .add_enabled(i > 0, egui::Button::new(icon::UP))
+                        .on_hover_text("Subir")
+                        .clicked()
+                    {
+                        swap = Some((i, i - 1));
+                    }
+                    if ui
+                        .add_enabled(i + 1 < n, egui::Button::new(icon::DOWN))
+                        .on_hover_text("Bajar")
+                        .clicked()
+                    {
+                        swap = Some((i, i + 1));
+                    }
+                    if ui
+                        .add(
+                            egui::DragValue::new(&mut st.seq_playlist.entries[i].duration)
+                                .speed(0.5)
+                                .range(0.5..=600.0)
+                                .suffix(" s"),
+                        )
+                        .on_hover_text("Duración total de la entrada (transición incluida)")
+                        .changed()
+                    {
+                        changed = true;
+                    }
+                    // Transición propia opcional (si no, la global de Escenas).
+                    let mut own = st.seq_playlist.entries[i].transition.is_some();
+                    if ui
+                        .checkbox(&mut own, "")
+                        .on_hover_text("Transición propia (si no, la global de Escenas)")
+                        .changed()
+                    {
+                        st.seq_playlist.entries[i].transition =
+                            own.then_some(st.scene_transition_duration);
+                        changed = true;
+                    }
+                    if let Some(t) = st.seq_playlist.entries[i].transition.as_mut() {
+                        if ui
+                            .add(egui::DragValue::new(t).speed(0.1).range(0.05..=30.0).suffix(" s"))
+                            .on_hover_text("Duración de la transición")
+                            .changed()
+                        {
+                            changed = true;
+                        }
+                    }
+                    if ui.button(icon::TRASH).on_hover_text("Quitar del show").clicked() {
+                        delete = Some(i);
+                    }
+                    let name = st.seq_playlist.entries[i].scene.clone();
+                    let exists = scenes.contains(&name);
+                    let mut text = egui::RichText::new(&name);
+                    if !exists {
+                        text = text.color(egui::Color32::from_rgb(220, 80, 80));
+                    }
+                    let active = st.seq_idx == i && st.seq_state != SeqPlayback::Stopped;
+                    if ui
+                        .selectable_label(active, text)
+                        .on_hover_text(if exists {
+                            "Saltar a esta entrada"
+                        } else {
+                            "La escena ya no existe (se salta al reproducir)"
+                        })
+                        .clicked()
+                    {
+                        events.push(PanelEvent::SeqJump(i));
+                    }
+                });
+            }
+            if let Some((a, b)) = swap {
+                st.seq_playlist.entries.swap(a, b);
+                changed = true;
+            }
+            if let Some(i) = delete {
+                st.seq_playlist.entries.remove(i);
+                changed = true;
+            }
+
+            // Añadir una escena al show.
+            if scenes.is_empty() {
+                ui.label(
+                    egui::RichText::new("Guarda escenas primero para poder añadirlas al show.")
+                        .weak()
+                        .small(),
+                );
+            } else {
+                st.seq_scene_pick = st.seq_scene_pick.min(scenes.len() - 1);
+                ui.horizontal(|ui| {
+                    egui::ComboBox::from_id_salt("seq_add")
+                        .selected_text(scenes[st.seq_scene_pick].clone())
+                        .show_ui(ui, |ui| {
+                            for (i, name) in scenes.iter().enumerate() {
+                                ui.selectable_value(&mut st.seq_scene_pick, i, name);
+                            }
+                        });
+                    if ui.button(format!("{} Añadir", icon::FILL)).clicked() {
+                        st.seq_playlist.entries.push(PlaylistEntry {
+                            scene: scenes[st.seq_scene_pick].clone(),
+                            ..PlaylistEntry::default()
+                        });
+                        changed = true;
+                    }
+                });
+            }
+
+            if ui
+                .checkbox(&mut st.seq_playlist.loop_at_end, "Repetir al terminar (loop)")
+                .changed()
+            {
+                changed = true;
+            }
+            if ui
+                .checkbox(
+                    &mut st.seq_playlist.start_on_record,
+                    "Al grabar: empezar el show desde el principio",
+                )
+                .changed()
+            {
+                changed = true;
+            }
+            if st.seq_playlist.start_on_record && !st.seq_playlist.loop_at_end {
+                ui.label(
+                    egui::RichText::new("Sin loop: la grabación se detiene sola al acabar el show.")
+                        .weak()
+                        .small(),
+                );
+            }
+
+            if changed {
+                events.push(PanelEvent::SeqSetPlaylist(st.seq_playlist.clone()));
             }
         });
 

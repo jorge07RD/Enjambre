@@ -137,6 +137,55 @@ pub enum AudioTarget {
     Brightness,
 }
 
+/// Acción que dispara cada beat de la música analizada (ver `MusicSync`).
+#[derive(Clone, Copy, PartialEq, Serialize, Deserialize, Default)]
+pub enum BeatAction {
+    /// Nada (solo la envolvente, si está activa).
+    None,
+    /// Pulso transitorio sobre el objetivo de audio (destello/empujón).
+    #[default]
+    Pulse,
+    /// Aleatorizar la matriz de atracción (con transición fluida).
+    RandomizeMatrix,
+    /// Avanzar el show del secuenciador (o la escena siguiente si no suena).
+    NextScene,
+}
+
+/// Sincronía con la pista de música elegida para el vídeo: la envolvente y los
+/// beats salen de un análisis offline de la pista (`sim/src/music.rs`), no del
+/// micrófono. Grabando, el reloj musical es el frame de vídeo (k/60 s), así el
+/// resultado queda clavado al audio del `.mp4` por construcción.
+#[derive(Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct MusicSync {
+    /// Activar la sincronía (grabando y/o en preescucha).
+    pub enabled: bool,
+    /// La envolvente de la pista sustituye al micrófono como nivel de audio
+    /// (usa el mismo `audio_target`/`audio_intensity` de la sección de audio).
+    pub envelope_drive: bool,
+    pub beat_action: BeatAction,
+    /// Actuar cada N beats (1 = todos).
+    pub beat_divisor: u32,
+    /// Amplitud del pulso de beat sobre la ganancia de audio.
+    pub pulse_gain: f32,
+    /// Compensación de latencia (s) de la preescucha en vivo (no afecta a la
+    /// grabación, que es exacta por construcción).
+    pub latency_offset: f32,
+}
+
+impl Default for MusicSync {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            envelope_drive: true,
+            beat_action: BeatAction::Pulse,
+            beat_divisor: 1,
+            pulse_gain: 1.5,
+            latency_offset: 0.15,
+        }
+    }
+}
+
 /// Aspecto visual de cada punto.
 #[derive(Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub enum RenderStyle {

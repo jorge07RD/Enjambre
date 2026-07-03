@@ -201,6 +201,16 @@ impl PanelApp {
                 // pausa para que nuestro `State` no la revierta.
                 self.st.paused = p;
             }
+            TelemetryMsg::SeqPlaylist(pl) => {
+                // Solo llega al conectar (los cambios posteriores nacen aquí y
+                // el sim no los devuelve en eco).
+                self.st.seq_playlist = pl;
+            }
+            TelemetryMsg::SeqStatus { state, idx, elapsed } => {
+                self.st.seq_state = state;
+                self.st.seq_idx = idx;
+                self.st.seq_elapsed = elapsed;
+            }
             TelemetryMsg::Version(v) => {
                 if v != IPC_VERSION {
                     eprintln!(

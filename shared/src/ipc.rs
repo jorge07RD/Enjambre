@@ -4,8 +4,9 @@
 //! seguida del cuerpo JSON (`serde_json`). Simple y depurable; suficiente para
 //! la frecuencia de un panel de control.
 
-use crate::config::{Brush, SimParams, Tool, NUM_COLORS};
+use crate::config::{Brush, MusicSync, SimParams, Tool, NUM_COLORS};
 use crate::panel_ui::PanelEvent;
+use crate::playlist::{Playlist, SeqPlayback};
 use crate::shapes::SavedShape;
 use serde::{Deserialize, Serialize};
 use std::io::{self, Read, Write};
@@ -46,6 +47,8 @@ pub struct ControlState {
     /// Auto-avance (slideshow) entre escenas y su intervalo (s).
     pub scene_autoplay: bool,
     pub scene_autoplay_interval: f32,
+    /// Sincronía con la música analizada (envolvente + beats).
+    pub music_sync: MusicSync,
 }
 
 /// Mensajes panel → sim.
@@ -105,6 +108,25 @@ pub enum TelemetryMsg {
     /// el `State` del panel pisaría el cambio local). No es continuo, así que no
     /// interfiere con el botón de pausa del panel.
     SetPaused(bool),
+    /// Playlist del secuenciador (el `sim` es su dueño). Solo se envía al
+    /// conectar: los cambios posteriores nacen en el panel (`SeqSetPlaylist`),
+    /// así que devolverlos en eco pisaría una edición en curso.
+    SeqPlaylist(Playlist),
+    /// Estado de reproducción del secuenciador (continuo, junto a `Stats`).
+    SeqStatus {
+        state: SeqPlayback,
+        idx: usize,
+        elapsed: f32,
+    },
+    /// Resultado del análisis de la pista de música (al conectar y cuando
+    /// termina un análisis) y si la preescucha está sonando.
+    MusicInfo {
+        analyzed: bool,
+        duration: f32,
+        onsets: usize,
+        bpm: Option<f32>,
+        previewing: bool,
+    },
 }
 
 /// Ruta del socket. Usa `$XDG_RUNTIME_DIR` (efímero por sesión) y cae a `/tmp`.

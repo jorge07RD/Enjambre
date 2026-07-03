@@ -212,6 +212,7 @@ mod tests {
 
     #[test]
     fn upsert_default_and_persist_roundtrip() {
+        let _env = crate::TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         // Aísla el fichero en un directorio temporal para no tocar la config real.
         let dir = std::env::temp_dir().join(format!("enjambre_test_{}", std::process::id()));
         std::env::set_var("XDG_CONFIG_HOME", &dir);

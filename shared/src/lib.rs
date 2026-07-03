@@ -16,3 +16,8 @@ pub use panel_ui::{config_panel, PanelEvent, PanelState};
 pub use playlist::{playlist_path, Playlist, PlaylistEntry, SeqPlayback};
 pub use scenes::{example_store, scenes_path, Scene, SceneStore};
 pub use shapes::{shapes_path, SavedShape, ShapeStore};
+
+/// Serializa los tests que mutan `XDG_CONFIG_HOME` (variable de proceso
+/// global): sin esto, correr en paralelo los hace pisarse los directorios.
+#[cfg(test)]
+pub(crate) static TEST_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
