@@ -7,6 +7,7 @@ pub mod ipc;
 pub mod panel_ui;
 pub mod scenes;
 pub mod shapes;
+pub mod ui_theme;
 
 pub use config::*;
 pub use ipc::{ControlMsg, ControlState, TelemetryMsg};

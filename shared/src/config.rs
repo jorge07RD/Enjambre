@@ -396,6 +396,14 @@ pub struct SimParams {
     pub audio_target: AudioTarget,
     /// Intensidad de la modulación (cuánto empuja la amplitud del sonido).
     pub audio_intensity: f32,
+
+    // --- Bloom (resplandor cinematográfico) ---
+    /// Añade un halo aditivo alrededor de cada partícula (look de neón/brillo).
+    pub bloom: bool,
+    /// Intensidad del resplandor (0 = nada).
+    pub bloom_intensity: f32,
+    /// Radio del halo como múltiplo del tamaño de punto.
+    pub bloom_radius: f32,
 }
 
 impl Default for SimParams {
@@ -467,6 +475,9 @@ impl Default for SimParams {
             shape_color: 0,
             shape_text: String::new(),
             shape_image: String::new(),
+            bloom: false,
+            bloom_intensity: 0.6,
+            bloom_radius: 4.0,
         }
     }
 }
@@ -601,6 +612,8 @@ impl SimParams {
         self.pointer_radius = l(from.pointer_radius, target.pointer_radius);
         self.audio_intensity = l(from.audio_intensity, target.audio_intensity);
         self.shape_strength = l(from.shape_strength, target.shape_strength);
+        self.bloom_intensity = l(from.bloom_intensity, target.bloom_intensity);
+        self.bloom_radius = l(from.bloom_radius, target.bloom_radius);
     }
 
     /// Rellena la matriz con coeficientes aleatorios en [-1, 1].

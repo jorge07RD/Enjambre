@@ -1,4 +1,5 @@
 use crate::simulation::Simulation;
+use macroquad::miniquad::{BlendFactor, BlendState, BlendValue, Equation};
 use macroquad::prelude::*;
 use shared::{color_for_hue, RenderStyle, SimParams};
 
@@ -11,6 +12,9 @@ pub struct Renderer {
     solid: Texture2D,
     solid_halo: Texture2D,
     mesh: Mesh,
+    /// Material de mezcla ADITIVA para el resplandor (bloom). `None` si el
+    /// backend no pudo compilar el shader (el bloom se omite).
+    additive: Option<Material>,
 }
 
 impl Renderer {
@@ -24,6 +28,7 @@ impl Renderer {
                 indices: Vec::new(),
                 texture: None,
             },
+            additive: make_additive_material(),
         }
     }
 
@@ -40,6 +45,10 @@ impl Renderer {
     /// escenas). Agrupa los vértices en pocos `draw_mesh` para eficiencia.
     pub fn draw_particles(&mut self, sim: &Simulation, params: &SimParams) {
         let alpha = params.brightness.clamp(0.0, 1.0);
+        // Resplandor (bloom): halo aditivo POR DEBAJO de las partículas.
+        if params.bloom && params.bloom_intensity > 0.001 {
+            self.draw_bloom(sim, params, alpha);
+        }
         let arrow_amt = params.orient.clamp(0.0, 1.0);
         let disc_amt = 1.0 - arrow_amt;
         if disc_amt > 0.003 {
@@ -48,6 +57,40 @@ impl Renderer {
         if arrow_amt > 0.003 {
             self.draw_arrows(sim, params, alpha * arrow_amt);
         }
+    }
+
+    /// Dibuja un halo suave y grande por partícula con mezcla ADITIVA (los
+    /// solapes se suman → brillo tipo neón). Reutiliza la textura de glow. Si el
+    /// material aditivo no está disponible, no hace nada.
+    fn draw_bloom(&mut self, sim: &Simulation, params: &SimParams, a: f32) {
+        let Some(mat) = self.additive.as_ref() else {
+            return;
+        };
+        let s = params.point_size * params.bloom_radius.max(0.1);
+        // La intensidad va en el alfa del vértice (la mezcla aditiva pondera por
+        // alfa), atenuada para que se acumule con gracia.
+        let ga = (a * params.bloom_intensity * 0.5).clamp(0.0, 1.0);
+        self.mesh.texture = Some(self.glow.clone());
+        gl_use_material(mat);
+        for chunk in sim.particles.chunks(CHUNK) {
+            let verts = &mut self.mesh.vertices;
+            let inds = &mut self.mesh.indices;
+            verts.clear();
+            inds.clear();
+            for p in chunk {
+                let base = verts.len() as u16;
+                let [r, g, b] = color_for_hue(p.hue);
+                let c = Color::new(r, g, b, ga);
+                let (x, y) = (p.pos.x, p.pos.y);
+                verts.push(Vertex::new(x - s, y - s, 0.0, 0.0, 0.0, c));
+                verts.push(Vertex::new(x + s, y - s, 0.0, 1.0, 0.0, c));
+                verts.push(Vertex::new(x + s, y + s, 0.0, 1.0, 1.0, c));
+                verts.push(Vertex::new(x - s, y + s, 0.0, 0.0, 1.0, c));
+                inds.extend_from_slice(&[base, base + 1, base + 2, base, base + 2, base + 3]);
+            }
+            draw_mesh(&self.mesh);
+        }
+        gl_use_default_material();
     }
 
     /// Discos texturizados según el estilo, con alfa `a`.
@@ -116,6 +159,53 @@ impl Renderer {
             draw_mesh(&self.mesh);
         }
     }
+}
+
+/// Crea un material igual al de dibujo 2D por defecto (usa `Model`/`Projection`/
+/// `Texture` que macroquad rellena solo) pero con mezcla ADITIVA, para el bloom.
+/// Devuelve `None` si el shader no compila (se omite el bloom).
+fn make_additive_material() -> Option<Material> {
+    // Shaders idénticos al pipeline 2D por defecto de macroquad.
+    const VERTEX: &str = r#"#version 100
+    attribute vec3 position;
+    attribute vec2 texcoord;
+    attribute vec4 color0;
+    varying lowp vec2 uv;
+    varying lowp vec4 color;
+    uniform mat4 Model;
+    uniform mat4 Projection;
+    void main() {
+        gl_Position = Projection * Model * vec4(position, 1);
+        color = color0 / 255.0;
+        uv = texcoord;
+    }"#;
+    const FRAGMENT: &str = r#"#version 100
+    varying lowp vec4 color;
+    varying lowp vec2 uv;
+    uniform sampler2D Texture;
+    void main() {
+        gl_FragColor = color * texture2D(Texture, uv);
+    }"#;
+
+    load_material(
+        ShaderSource::Glsl {
+            vertex: VERTEX,
+            fragment: FRAGMENT,
+        },
+        MaterialParams {
+            pipeline_params: PipelineParams {
+                color_blend: Some(BlendState::new(
+                    Equation::Add,
+                    BlendFactor::Value(BlendValue::SourceAlpha),
+                    BlendFactor::One,
+                )),
+                ..Default::default()
+            },
+            ..Default::default()
+        },
+    )
+    .map_err(|e| eprintln!("Bloom desactivado (no compiló el shader): {e}"))
+    .ok()
 }
 
 /// Genera la textura del punto según el estilo. El color lo pone el vértice;

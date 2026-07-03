@@ -8,11 +8,11 @@ use macroquad::prelude::*;
 use ::rand::Rng;
 
 use render::Renderer;
-use shared::ipc::{read_msg, socket_path, write_msg};
+use shared::ipc::{decode, read_frame, socket_path, write_msg, IPC_VERSION};
 use shared::{
-    config_panel, example_store, hue_for_index, scenes_path, AudioTarget, Brush, ControlMsg,
-    ControlState, InteractionMode, PanelEvent, PanelState, SceneStore, ShapeStore, SimParams,
-    TelemetryMsg, Tool, FRAME_PRESETS,
+    config_panel, example_store, hue_for_index, scenes_path, AudioTarget, Boundary, Brush,
+    ControlMsg, ControlState, InteractionMode, PanelEvent, PanelState, SceneStore, ShapeStore,
+    SimParams, TelemetryMsg, Tool, FRAME_PRESETS,
 };
 use simulation::Simulation;
 
@@ -81,13 +81,16 @@ fn cam_w2s(cam: &Camera2D, p: Vec2, canvas: Rect) -> Vec2 {
 }
 
 // ----------------------------------------------------------------------------
-// Grabación de vídeo vertical (TikTok): render offline a un `render_target` de
-// 1080×1920 y volcado crudo (RGBA) a `ffmpeg` por stdin. Cada frame de la
-// simulación es un frame del vídeo, así que el `.mp4` sale exacto a 120 fps
-// aunque el volcado vaya más lento que el tiempo real.
+// Grabación de vídeo vertical (TikTok): render offline a un `render_target` y
+// volcado crudo (RGBA) a `ffmpeg` por stdin. Cada frame de la simulación es un
+// frame del vídeo, así que el `.mp4` sale exacto a `REC_FPS` aunque el volcado
+// vaya más lento que el tiempo real. El render se hace a `SSAA`× la resolución
+// de salida (supersampling) y `ffmpeg` la reduce para bordes más nítidos.
 // ----------------------------------------------------------------------------
 
-const REC_FPS: i32 = 120;
+const REC_FPS: i32 = 60;
+/// Factor de supersampling de la grabación (antialias). 2 = 4× de píxeles.
+const SSAA: u32 = 2;
 
 /// Arrastre en curso del recuadro de encuadre.
 #[derive(Clone, Copy)]
@@ -351,10 +354,17 @@ struct Recorder {
 }
 
 impl Recorder {
-    /// Arranca `ffmpeg` y el destino de render a la resolución `w×h`, guardando
-    /// en `dir` (o el directorio actual si está vacío). Falla si `ffmpeg` no está.
-    fn start(w: u32, h: u32, dir: &str) -> std::io::Result<Recorder> {
-        let rt = render_target(w, h);
+    /// Arranca `ffmpeg` y el destino de render a la resolución de salida `w×h`,
+    /// guardando en `dir` (o el directorio actual si está vacío). Si `music` no
+    /// está vacío, se mezcla esa pista de audio en el vídeo (recortada a la
+    /// duración con `-shortest`). Falla si `ffmpeg` no está.
+    ///
+    /// Para nitidez, el render se hace al doble de resolución (supersampling) y
+    /// `ffmpeg` la baja a `w×h` con Lanczos.
+    fn start(w: u32, h: u32, dir: &str, music: &str) -> std::io::Result<Recorder> {
+        // Supersampling: el RT se dibuja a 2× y se reduce en la codificación.
+        let (sw, sh) = (w * SSAA, h * SSAA);
+        let rt = render_target(sw, sh);
         rt.texture.set_filter(FilterMode::Linear);
         let ts = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -366,37 +376,50 @@ impl Recorder {
         } else {
             format!("{}/{}", dir.trim_end_matches('/'), name)
         };
+
+        // Construimos los argumentos dinámicamente (la música añade un 2º input).
+        let mut args: Vec<String> = vec![
+            "-y".into(),
+            // Input 0: vídeo crudo por la tubería, a la resolución supersampleada.
+            "-f".into(), "rawvideo".into(),
+            "-pix_fmt".into(), "rgba".into(),
+            "-s".into(), format!("{sw}x{sh}"),
+            "-r".into(), REC_FPS.to_string(),
+            "-i".into(), "-".into(),
+        ];
+        let has_music = !music.is_empty();
+        if has_music {
+            // Input 1: la pista de música.
+            args.extend(["-i".into(), music.to_string()]);
+        }
+        // Vídeo: reducir a la resolución de salida con Lanczos (antialias).
+        args.extend([
+            "-vf".into(), format!("scale={w}:{h}:flags=lanczos"),
+            "-c:v".into(), "libx264".into(),
+            "-preset".into(), "medium".into(),
+            "-crf".into(), "18".into(),
+            "-pix_fmt".into(), "yuv420p".into(),
+        ]);
+        if has_music {
+            args.extend([
+                "-map".into(), "0:v:0".into(),
+                "-map".into(), "1:a:0".into(),
+                "-c:a".into(), "aac".into(),
+                "-b:a".into(), "192k".into(),
+                "-shortest".into(),
+            ]);
+        }
+        args.extend(["-movflags".into(), "+faststart".into(), path.clone()]);
+
         let mut child = std::process::Command::new("ffmpeg")
-            .args([
-                "-y",
-                "-f",
-                "rawvideo",
-                "-pix_fmt",
-                "rgba",
-                "-s",
-                &format!("{w}x{h}"),
-                "-r",
-                &REC_FPS.to_string(),
-                "-i",
-                "-",
-                "-c:v",
-                "libx264",
-                "-preset",
-                "medium",
-                "-crf",
-                "18",
-                "-pix_fmt",
-                "yuv420p",
-                "-movflags",
-                "+faststart",
-                &path,
-            ])
+            .args(&args)
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
             .spawn()?;
         let stdin = child.stdin.take().expect("stdin de ffmpeg");
-        eprintln!("● Grabando en {path} ({w}×{h}, pulsa R para parar)");
+        let music_note = if has_music { " + música" } else { "" };
+        eprintln!("● Grabando en {path} ({w}×{h} @{REC_FPS}fps{music_note}, pulsa R para parar)");
         Ok(Recorder {
             child,
             stdin,
@@ -478,9 +501,14 @@ impl Ipc {
 
                 let mut reader = stream;
                 loop {
-                    match read_msg::<ControlMsg, _>(&mut reader) {
-                        Ok(Some(ControlMsg::State(s))) => inbox_t.lock().unwrap().state = Some(s),
-                        Ok(Some(ControlMsg::Event(e))) => inbox_t.lock().unwrap().events.push(e),
+                    match read_frame(&mut reader) {
+                        // Frame recibido: si no lo sabemos decodificar (evento de
+                        // otra versión), lo ignoramos y seguimos.
+                        Ok(Some(body)) => match decode::<ControlMsg>(&body) {
+                            Some(ControlMsg::State(s)) => inbox_t.lock().unwrap().state = Some(s),
+                            Some(ControlMsg::Event(e)) => inbox_t.lock().unwrap().events.push(e),
+                            None => {}
+                        },
                         Ok(None) | Err(_) => break,
                     }
                 }
@@ -559,6 +587,7 @@ fn control_state(params: &SimParams, st: &PanelState) -> ControlState {
         active_color: st.active_color,
         fill_count: st.fill_count,
         video_dir: st.video_dir.clone(),
+        music_path: st.music_path.clone(),
         scene_smooth: st.scene_smooth,
         scene_transition_duration: st.scene_transition_duration,
         scene_autoplay: st.scene_autoplay,
@@ -608,6 +637,7 @@ fn apply_local_event(
         | PanelEvent::SetFramePreset(_)
         | PanelEvent::CenterFrame
         | PanelEvent::PickVideoDir
+        | PanelEvent::PickMusic
         | PanelEvent::SaveScene(_)
         | PanelEvent::LoadScene(_)
         | PanelEvent::SetDefaultScene(_)
@@ -650,6 +680,8 @@ async fn main() {
     // `panel_px` recuerda su ancho real (en píxeles) para reservarle el lienzo.
     let mut panel_visible = true;
     let mut panel_px = 310.0f32;
+    // El tema egui (visuales + fuente de iconos) se instala una vez.
+    let mut theme_applied = false;
     let mut rec: Option<Recorder> = None;
     // Recuadro de encuadre de grabación (estado local, lo mueve el ratón).
     let mut show_frame = false;
@@ -679,6 +711,9 @@ async fn main() {
     };
     let mut scene_morph: Option<SceneMorph> = None;
     let mut pending_apply: Option<SimParams> = None;
+    // Pausa cambiada con el teclado en la ventana del lienzo, pendiente de
+    // empujar al panel separado (ver TelemetryMsg::SetPaused).
+    let mut pending_paused: Option<bool> = None;
     let mut scenes_dirty = false;
     // Biblioteca de formas/letras guardadas (persistida en shapes.json).
     let mut shape_store = ShapeStore::load();
@@ -846,6 +881,11 @@ async fn main() {
                     }
                 }
                 egui_macroquad::ui(|ctx| {
+                    // Aplica el tema neón + fuente de iconos una sola vez.
+                    if !theme_applied {
+                        shared::ui_theme::apply(ctx);
+                        theme_applied = true;
+                    }
                     want_pointer = ctx.wants_pointer_input();
                     want_keyboard = ctx.wants_keyboard_input();
                     // Oculto: no dibujamos panel (egui queda vacío este frame, así
@@ -880,8 +920,9 @@ async fn main() {
                         st.scene_transition_duration = state.scene_transition_duration;
                         st.scene_autoplay = state.scene_autoplay;
                         st.scene_autoplay_interval = state.scene_autoplay_interval;
-                        // La carpeta de guardado la elige el usuario en el panel.
+                        // La carpeta de guardado y la música las elige el panel.
                         video_dir = state.video_dir.clone();
+                        st.music_path = state.music_path.clone();
                         // El zoom lo puede mover tanto el slider del panel como
                         // la rueda en esta ventana: solo adoptamos el del panel
                         // cuando cambia de verdad.
@@ -936,6 +977,9 @@ async fn main() {
         if !want_keyboard {
             if is_key_pressed(KeyCode::Space) {
                 st.paused = !st.paused;
+                // Estando separado, empuja la pausa al panel (si no, su State la
+                // revertiría al instante).
+                pending_paused = Some(st.paused);
             }
             if is_key_pressed(KeyCode::Period) {
                 st.paused = true;
@@ -953,6 +997,7 @@ async fn main() {
                 let snap = params.current_snapshot();
                 params.randomize_matrix(&mut rng);
                 params.start_transition(snap);
+                pending_apply = Some(params.clone());
             }
             if is_key_pressed(KeyCode::L) {
                 events.push(PanelEvent::CanvasEqualsScreen);
@@ -988,12 +1033,41 @@ async fn main() {
             }
             if is_key_pressed(KeyCode::A) {
                 params.attract_active = !params.attract_active;
+                pending_apply = Some(params.clone());
             }
             if is_key_pressed(KeyCode::N) {
                 events.push(PanelEvent::NextScene);
             }
             if is_key_pressed(KeyCode::P) {
                 events.push(PanelEvent::PrevScene);
+            }
+            if is_key_pressed(KeyCode::B) {
+                // Alternar el comportamiento en los bordes del lienzo.
+                params.boundary = match params.boundary {
+                    Boundary::Wrap => Boundary::Bounce,
+                    Boundary::Bounce => Boundary::Wrap,
+                };
+                pending_apply = Some(params.clone());
+            }
+            if is_key_pressed(KeyCode::X) {
+                // Aleatorizar la matriz sola cada cierto tiempo (on/off).
+                params.auto_randomize = !params.auto_randomize;
+                pending_apply = Some(params.clone());
+            }
+            if is_key_pressed(KeyCode::V) {
+                // Deriva lenta y gradual del color y de la atracción (on/off).
+                params.gradual = !params.gradual;
+                pending_apply = Some(params.clone());
+            }
+            if is_key_pressed(KeyCode::E) {
+                // Estelas de movimiento (on/off).
+                params.trails = !params.trails;
+                pending_apply = Some(params.clone());
+            }
+            if is_key_pressed(KeyCode::Y) {
+                // Resplandor cinematográfico (on/off).
+                params.bloom = !params.bloom;
+                pending_apply = Some(params.clone());
             }
             // Velocidad: teclas 1..9 = 10..90 %, tecla 0 = 100 %.
             for (key, pct) in [
@@ -1045,7 +1119,7 @@ async fn main() {
                 }
                 PanelEvent::ToggleRecord => match rec.take() {
                     Some(r) => r.finish(),
-                    None => match Recorder::start(preset_w, preset_h, &video_dir) {
+                    None => match Recorder::start(preset_w, preset_h, &video_dir, &st.music_path) {
                         Ok(r) => rec = Some(r),
                         Err(e) => {
                             eprintln!("No se pudo iniciar la grabación (¿está ffmpeg?): {e}")
@@ -1067,6 +1141,14 @@ async fn main() {
                 PanelEvent::PickVideoDir => {
                     if let Some(dir) = rfd::FileDialog::new().pick_folder() {
                         video_dir = dir.to_string_lossy().into_owned();
+                    }
+                }
+                PanelEvent::PickMusic => {
+                    if let Some(path) = rfd::FileDialog::new()
+                        .add_filter("Audio", &["mp3", "wav", "flac", "m4a", "ogg", "aac"])
+                        .pick_file()
+                    {
+                        st.music_path = path.to_string_lossy().into_owned();
                     }
                 }
                 PanelEvent::SaveScene(name) => {
@@ -1254,9 +1336,11 @@ async fn main() {
                 if !connected {
                     init_sent = false;
                 } else if !init_sent {
-                    // Sincronización inicial: el panel adopta nuestro estado real.
+                    // Sincronización inicial: primero anunciamos la versión del
+                    // protocolo, luego el estado real que el panel adopta.
                     let state = control_state(&params, &st);
                     if let Some(w) = ipc.writer.lock().unwrap().as_mut() {
+                        let _ = write_msg(w, &TelemetryMsg::Version(IPC_VERSION));
                         let _ = write_msg(w, &TelemetryMsg::Init(Box::new(state)));
                     }
                     init_sent = true;
@@ -1302,6 +1386,11 @@ async fn main() {
                 if let Some(p) = pending_apply.take() {
                     if let Some(w) = ipc.writer.lock().unwrap().as_mut() {
                         let _ = write_msg(w, &TelemetryMsg::ApplyParams(Box::new(p)));
+                    }
+                }
+                if let Some(p) = pending_paused.take() {
+                    if let Some(w) = ipc.writer.lock().unwrap().as_mut() {
+                        let _ = write_msg(w, &TelemetryMsg::SetPaused(p));
                     }
                 }
             }

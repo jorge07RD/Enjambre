@@ -3,7 +3,7 @@
 //! controles y muestra la telemetría que recibe. Al ser una ventana nativa,
 //! Hyprland puede tilearla y redimensionarla por separado del lienzo.
 
-use shared::ipc::{read_msg, socket_path, write_msg};
+use shared::ipc::{decode, read_frame, socket_path, write_msg, IPC_VERSION};
 use shared::{config_panel, ControlMsg, ControlState, PanelEvent, PanelState, SimParams, TelemetryMsg};
 
 use std::os::unix::net::UnixStream;
@@ -25,7 +25,10 @@ fn main() -> eframe::Result<()> {
     eframe::run_native(
         "puntos_atraccion_panel",
         options,
-        Box::new(|_cc| Ok(Box::new(PanelApp::new(stream)))),
+        Box::new(|cc| {
+            shared::ui_theme::apply(&cc.egui_ctx);
+            Ok(Box::new(PanelApp::new(stream)))
+        }),
     )
 }
 
@@ -67,12 +70,17 @@ impl PanelApp {
         std::thread::spawn(move || {
             let mut r = read_stream;
             loop {
-                match read_msg::<TelemetryMsg, _>(&mut r) {
-                    Ok(Some(m)) => {
-                        if tele_tx.send(m).is_err() {
-                            break;
+                match read_frame(&mut r) {
+                    // Frame recibido: si no sabemos decodificarlo (mensaje de otra
+                    // versión), lo ignoramos y seguimos, en vez de cerrar.
+                    Ok(Some(body)) => {
+                        if let Some(m) = decode::<TelemetryMsg>(&body) {
+                            if tele_tx.send(m).is_err() {
+                                break;
+                            }
                         }
                     }
+                    // Fin real de conexión o fallo del socket.
                     Ok(None) | Err(_) => break,
                 }
             }
@@ -123,6 +131,7 @@ impl PanelApp {
                     active_color,
                     fill_count,
                     video_dir,
+                    music_path,
                     scene_smooth,
                     scene_transition_duration,
                     scene_autoplay,
@@ -138,6 +147,7 @@ impl PanelApp {
                 self.st.active_color = active_color;
                 self.st.fill_count = fill_count;
                 self.st.video_dir = video_dir;
+                self.st.music_path = music_path;
                 self.st.scene_smooth = scene_smooth;
                 self.st.scene_transition_duration = scene_transition_duration;
                 self.st.scene_autoplay = scene_autoplay;
@@ -186,6 +196,20 @@ impl PanelApp {
             TelemetryMsg::ShapesList(shapes) => {
                 self.st.saved_shapes = shapes;
             }
+            TelemetryMsg::SetPaused(p) => {
+                // El usuario pulsó Espacio en la ventana del lienzo: adoptamos la
+                // pausa para que nuestro `State` no la revierta.
+                self.st.paused = p;
+            }
+            TelemetryMsg::Version(v) => {
+                if v != IPC_VERSION {
+                    eprintln!(
+                        "Aviso: el panel (v{IPC_VERSION}) y la simulación (v{v}) son de \
+                         compilaciones distintas. Recompila ambos con `cargo build` para \
+                         evitar comportamientos raros."
+                    );
+                }
+            }
         }
     }
 }
@@ -217,6 +241,7 @@ impl eframe::App for PanelApp {
                 active_color: self.st.active_color,
                 fill_count: self.st.fill_count,
                 video_dir: self.st.video_dir.clone(),
+                music_path: self.st.music_path.clone(),
                 scene_smooth: self.st.scene_smooth,
                 scene_transition_duration: self.st.scene_transition_duration,
                 scene_autoplay: self.st.scene_autoplay,
@@ -233,6 +258,16 @@ impl eframe::App for PanelApp {
                     PanelEvent::PickVideoDir => {
                         if let Some(dir) = rfd::FileDialog::new().pick_folder() {
                             self.st.video_dir = dir.to_string_lossy().into_owned();
+                        }
+                    }
+                    // La música también se elige en ESTE proceso; la ruta viaja al
+                    // sim por el `State` (campo music_path de ControlState).
+                    PanelEvent::PickMusic => {
+                        if let Some(path) = rfd::FileDialog::new()
+                            .add_filter("Audio", &["mp3", "wav", "flac", "m4a", "ogg", "aac"])
+                            .pick_file()
+                        {
+                            self.st.music_path = path.to_string_lossy().into_owned();
                         }
                     }
                     // El diálogo de imagen se abre aquí; la ruta viaja al sim, que

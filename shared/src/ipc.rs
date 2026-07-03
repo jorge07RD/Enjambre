@@ -11,6 +11,11 @@ use serde::{Deserialize, Serialize};
 use std::io::{self, Read, Write};
 use std::path::PathBuf;
 
+/// Versión del protocolo IPC. Sube cuando cambian los mensajes de forma
+/// incompatible. El `sim` la anuncia (`TelemetryMsg::Version`) y el panel avisa
+/// si no coincide (indicio de binarios de compilaciones distintas).
+pub const IPC_VERSION: u32 = 1;
+
 /// Estado completo que el panel envía a la simulación (una vez por frame del
 /// panel). La simulación adopta estos campos, salvo los que evoluciona ella
 /// misma (ver `sim`: `blend`/`from_state` y la matriz mientras `gradual`).
@@ -32,6 +37,8 @@ pub struct ControlState {
     pub fill_count: i32,
     /// Carpeta donde guardar los vídeos (vacío = directorio de trabajo).
     pub video_dir: String,
+    /// Pista de música a mezclar en el vídeo grabado (vacío = sin audio).
+    pub music_path: String,
     /// Si la transición entre escenas debe ser suave.
     pub scene_smooth: bool,
     /// Duración (s) de esa transición.
@@ -53,6 +60,10 @@ pub enum ControlMsg {
 /// Mensajes sim → panel.
 #[derive(Clone, Serialize, Deserialize)]
 pub enum TelemetryMsg {
+    /// Anuncio de versión del protocolo (se envía el primero al conectar). Un
+    /// panel de otra versión lo usa para avisar; los binarios muy viejos que no
+    /// conozcan esta variante simplemente la ignoran (ver `read_frame`).
+    Version(u32),
     /// Estado completo enviado una vez al conectar, para que el panel arranque
     /// sincronizado con la simulación (y no la pise con sus valores por defecto).
     Init(Box<ControlState>),
@@ -89,6 +100,11 @@ pub enum TelemetryMsg {
     /// Biblioteca de formas/letras guardadas (se envía al conectar y cuando
     /// cambia). El `sim` es su dueño.
     ShapesList(Vec<SavedShape>),
+    /// El `sim` fija la pausa en el panel. Se envía UNA vez cuando el usuario
+    /// pulsa Espacio en la ventana del lienzo estando el panel separado (si no,
+    /// el `State` del panel pisaría el cambio local). No es continuo, así que no
+    /// interfiere con el botón de pausa del panel.
+    SetPaused(bool),
 }
 
 /// Ruta del socket. Usa `$XDG_RUNTIME_DIR` (efímero por sesión) y cae a `/tmp`.
@@ -108,8 +124,10 @@ pub fn write_msg<T: Serialize, W: Write>(w: &mut W, msg: &T) -> io::Result<()> {
     w.flush()
 }
 
-/// Lee un mensaje con encuadre longitud+JSON. `Ok(None)` = fin de conexión.
-pub fn read_msg<T: for<'de> Deserialize<'de>, R: Read>(r: &mut R) -> io::Result<Option<T>> {
+/// Lee un frame crudo (longitud + cuerpo JSON) del transporte. `Ok(None)` = fin
+/// de conexión. Un `Err` aquí es un fallo real del socket (no de decodificación),
+/// así el llamante distingue "se cerró" de "no entiendo este mensaje".
+pub fn read_frame<R: Read>(r: &mut R) -> io::Result<Option<Vec<u8>>> {
     let mut len_buf = [0u8; 4];
     match r.read_exact(&mut len_buf) {
         Ok(()) => {}
@@ -119,6 +137,25 @@ pub fn read_msg<T: for<'de> Deserialize<'de>, R: Read>(r: &mut R) -> io::Result<
     let len = u32::from_le_bytes(len_buf) as usize;
     let mut body = vec![0u8; len];
     r.read_exact(&mut body)?;
-    let msg = serde_json::from_slice(&body).map_err(io::Error::other)?;
-    Ok(Some(msg))
+    Ok(Some(body))
+}
+
+/// Decodifica el cuerpo de un frame. `None` si no encaja con `T` (p. ej. una
+/// variante que este binario no conoce): el llamante debe **ignorarlo y seguir**,
+/// no cerrar la conexión (el encuadre por longitud mantiene el flujo alineado).
+pub fn decode<T: for<'de> Deserialize<'de>>(body: &[u8]) -> Option<T> {
+    serde_json::from_slice(body).ok()
+}
+
+/// Lee un mensaje con encuadre longitud+JSON. `Ok(None)` = fin de conexión.
+/// Azúcar sobre `read_frame`+`decode`; los bucles que quieran tolerar mensajes
+/// desconocidos deben usar directamente esas dos piezas.
+pub fn read_msg<T: for<'de> Deserialize<'de>, R: Read>(r: &mut R) -> io::Result<Option<T>> {
+    match read_frame(r)? {
+        None => Ok(None),
+        Some(body) => match serde_json::from_slice(&body) {
+            Ok(msg) => Ok(Some(msg)),
+            Err(e) => Err(io::Error::other(e)),
+        },
+    }
 }

@@ -11,6 +11,7 @@ use crate::config::{
     RenderStyle, SimParams, Tool, COLOR_NAMES, FRAME_PRESETS, NUM_COLORS,
 };
 use crate::shapes::SavedShape;
+use crate::ui_theme::icon;
 use serde::{Deserialize, Serialize};
 
 /// Estado de UI no contenido en `SimParams`, más telemetría de solo lectura.
@@ -29,6 +30,8 @@ pub struct PanelState {
 
     /// Carpeta de guardado de los vídeos (vacío = directorio de trabajo).
     pub video_dir: String,
+    /// Pista de música a mezclar en el vídeo (vacío = sin audio).
+    pub music_path: String,
 
     /// Texto en edición para formar con las partículas.
     pub shape_text: String,
@@ -80,6 +83,7 @@ impl Default for PanelState {
             zoom_level: 1.0,
             paused: false,
             video_dir: String::new(),
+            music_path: String::new(),
             shape_text: String::new(),
             saved_shapes: Vec::new(),
             shape_sel: None,
@@ -125,6 +129,8 @@ pub enum PanelEvent {
     CenterFrame,
     /// Abrir un diálogo nativo para elegir la carpeta de guardado.
     PickVideoDir,
+    /// Abrir un diálogo nativo para elegir la pista de música del vídeo.
+    PickMusic,
     /// Guardar la configuración actual como escena con este nombre.
     SaveScene(String),
     /// Cargar una escena (transición suave si está activada).
@@ -205,13 +211,13 @@ pub fn config_panel(
         // Título + estado en vivo + transporte + velocidad: lo más usado, sin
         // colapsar. El resto de ajustes van en secciones plegables debajo.
         ui.horizontal(|ui| {
-            ui.heading("🐝 Enjambre");
+            ui.heading(egui::RichText::new("Enjambre").color(crate::ui_theme::ACCENT));
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 // Solo el panel acoplado se puede ocultar (el separado es su
                 // propia ventana del SO: basta cerrarla).
                 if !st.standalone
                     && ui
-                        .button("🙈")
+                        .button(icon::HIDE)
                         .on_hover_text("Ocultar panel (H)")
                         .clicked()
                 {
@@ -219,7 +225,7 @@ pub fn config_panel(
                 }
                 if st.recording {
                     ui.label(
-                        egui::RichText::new("● REC")
+                        egui::RichText::new(format!("{} REC", icon::REC))
                             .color(egui::Color32::from_rgb(230, 70, 70))
                             .strong(),
                     );
@@ -233,10 +239,16 @@ pub fn config_panel(
 
         // Separar / reacoplar el panel en su propia ventana.
         if st.standalone {
-            if ui.button("⮌ Reacoplar en la ventana (D)").clicked() {
+            if ui
+                .button(format!("{} Reacoplar en la ventana (D)", icon::REATTACH))
+                .clicked()
+            {
                 events.push(PanelEvent::Reattach);
             }
-        } else if ui.button("🗗 Separar panel en otra ventana (D)").clicked() {
+        } else if ui
+            .button(format!("{} Separar panel en otra ventana (D)", icon::DETACH))
+            .clicked()
+        {
             events.push(PanelEvent::Detach);
         }
 
@@ -244,20 +256,28 @@ pub fn config_panel(
         ui.horizontal(|ui| {
             if ui
                 .button(if st.paused {
-                    "▶ Reanudar"
+                    format!("{} Reanudar", icon::PLAY)
                 } else {
-                    "⏸ Pausa"
+                    format!("{} Pausa", icon::PAUSE)
                 })
                 .on_hover_text("Espacio")
                 .clicked()
             {
                 st.paused = !st.paused;
             }
-            if ui.button("⏭ Paso").on_hover_text(".").clicked() {
+            if ui
+                .button(format!("{} Paso", icon::STEP))
+                .on_hover_text(".")
+                .clicked()
+            {
                 st.paused = true;
                 events.push(PanelEvent::Step);
             }
-            if ui.button("⟲ Reiniciar").on_hover_text("C").clicked() {
+            if ui
+                .button(format!("{} Reiniciar", icon::RESET))
+                .on_hover_text("C")
+                .clicked()
+            {
                 events.push(PanelEvent::Clear);
             }
         });
@@ -306,7 +326,7 @@ pub fn config_panel(
         ui.add_space(2.0);
 
         // ===================== Interacción =====================
-        egui::CollapsingHeader::new("✨ Interacción")
+        egui::CollapsingHeader::new(format!("{} Interacción", icon::H_INTERACT))
             .default_open(true)
             .show(ui, |ui| {
                 ui.checkbox(&mut params.smooth, "Transición fluida");
@@ -356,14 +376,15 @@ pub fn config_panel(
                     ui.add(egui::Slider::new(&mut params.sim_range, 0.02..=0.5).text("Tolerancia de color"));
                 }
                 if params.mode == InteractionMode::Matrix {
-                    if ui.button("🎲 Aleatorizar reglas (M)").clicked() {
+                    if ui.button(format!("{} Aleatorizar reglas (M)", icon::RANDOM)).clicked() {
                         // La matriz es propiedad del panel: la aleatorizamos aquí
                         // mismo para que el nuevo estado fluya al `sim` por `State`
                         // y no lo pise el eco de la matriz anterior.
                         params.randomize_matrix(&mut ::rand::thread_rng());
                         trigger = true;
                     }
-                    ui.checkbox(&mut params.auto_randomize, "Auto-aleatorizar sola");
+                    ui.checkbox(&mut params.auto_randomize, "Auto-aleatorizar sola")
+                        .on_hover_text("X");
                     if params.auto_randomize {
                         ui.add(
                             egui::Slider::new(&mut params.auto_randomize_interval, 1.0..=60.0)
@@ -436,13 +457,13 @@ pub fn config_panel(
             });
 
         // ===================== Física =====================
-        egui::CollapsingHeader::new("🌡 Física").show(ui, |ui| {
+        egui::CollapsingHeader::new(format!("{} Física", icon::H_PHYSICS)).show(ui, |ui| {
             ui.add(egui::Slider::new(&mut params.force, 0.0..=5.0).text("Fuerza"));
             ui.add(egui::Slider::new(&mut params.r_max, 20.0..=200.0).text("Radio (r_max)"));
             ui.add(egui::Slider::new(&mut params.beta, 0.05..=0.9).text("Repulsión (β)"));
             ui.add(egui::Slider::new(&mut params.friction, 0.50..=0.99).text("Fricción"));
             ui.horizontal(|ui| {
-                ui.label("Bordes:");
+                ui.label("Bordes:").on_hover_text("Alternar con B");
                 ui.selectable_value(&mut params.boundary, Boundary::Wrap, "Toroidal");
                 ui.selectable_value(&mut params.boundary, Boundary::Bounce, "Rebote");
             });
@@ -460,7 +481,7 @@ pub fn config_panel(
         });
 
         // ===================== Apariencia =====================
-        egui::CollapsingHeader::new("💡 Apariencia").show(ui, |ui| {
+        egui::CollapsingHeader::new(format!("{} Apariencia", icon::H_LOOK)).show(ui, |ui| {
             ui.add(egui::Slider::new(&mut params.point_size, 1.0..=40.0).text("Tamaño punto"));
             ui.add(egui::Slider::new(&mut params.brightness, 0.1..=1.0).text("Brillo"));
             ui.horizontal(|ui| {
@@ -469,7 +490,8 @@ pub fn config_panel(
                 ui.selectable_value(&mut params.style, RenderStyle::Glow, "Brillo");
                 ui.selectable_value(&mut params.style, RenderStyle::SolidHalo, "Sólido+halo");
             });
-            ui.checkbox(&mut params.trails, "Estelas de movimiento");
+            ui.checkbox(&mut params.trails, "Estelas de movimiento")
+                .on_hover_text("E");
             if params.trails {
                 // Menor desvanecido = estela más larga; invertimos el slider para
                 // que "Longitud" crezca hacia la derecha.
@@ -488,15 +510,24 @@ pub fn config_panel(
             {
                 params.orient = if orient_on { 1.0 } else { 0.0 };
             }
+            ui.checkbox(&mut params.bloom, "Bloom (resplandor)")
+                .on_hover_text("Y");
+            if params.bloom {
+                ui.add(
+                    egui::Slider::new(&mut params.bloom_intensity, 0.0..=2.0).text("Intensidad bloom"),
+                );
+                ui.add(egui::Slider::new(&mut params.bloom_radius, 1.5..=12.0).text("Radio bloom"));
+            }
         });
 
         // ===================== Dinámica del color =====================
-        egui::CollapsingHeader::new("🌈 Dinámica del color").show(ui, |ui| {
+        egui::CollapsingHeader::new(format!("{} Dinámica del color", icon::H_COLOR)).show(ui, |ui| {
             ui.checkbox(&mut params.random_color, "Cambio aleatorio de color");
             if params.random_color {
                 ui.add(egui::Slider::new(&mut params.random_color_rate, 0.0..=0.5).text("Ritmo"));
             }
-            ui.checkbox(&mut params.gradual, "Deriva lenta (color y atracción)");
+            ui.checkbox(&mut params.gradual, "Deriva lenta (color y atracción)")
+                .on_hover_text("V");
             if params.gradual {
                 ui.add(egui::Slider::new(&mut params.gradual_color_speed, 0.0..=0.1).text("Vel. color"));
                 ui.add(
@@ -514,7 +545,7 @@ pub fn config_panel(
         });
 
         // ===================== Audio =====================
-        egui::CollapsingHeader::new("🔊 Reactivo al audio").show(ui, |ui| {
+        egui::CollapsingHeader::new(format!("{} Reactivo al audio", icon::H_AUDIO)).show(ui, |ui| {
             ui.checkbox(&mut params.audio_reactive, "Reaccionar al sonido");
             if params.audio_reactive {
                 ui.horizontal(|ui| {
@@ -529,13 +560,13 @@ pub fn config_panel(
         });
 
         // ===================== Partículas y herramienta =====================
-        egui::CollapsingHeader::new("🖱 Partículas y herramienta").show(ui, |ui| {
+        egui::CollapsingHeader::new(format!("{} Partículas y herramienta", icon::H_TOOL)).show(ui, |ui| {
             ui.add(egui::Slider::new(&mut st.fill_count, 100..=20000).text("Cantidad"));
             ui.horizontal(|ui| {
-                if ui.button("Llenar (F)").clicked() {
+                if ui.button(format!("{} Llenar (F)", icon::FILL)).clicked() {
                     events.push(PanelEvent::Fill(st.fill_count as usize));
                 }
-                if ui.button("Vaciar (C)").clicked() {
+                if ui.button(format!("{} Vaciar (C)", icon::ERASE)).clicked() {
                     events.push(PanelEvent::Clear);
                 }
             });
@@ -576,7 +607,7 @@ pub fn config_panel(
         });
 
         // ===================== Mensaje / Forma =====================
-        egui::CollapsingHeader::new("💬 Mensaje / Forma").show(ui, |ui| {
+        egui::CollapsingHeader::new(format!("{} Mensaje / Forma", icon::H_SHAPE)).show(ui, |ui| {
             // Escribir un texto y aplicarlo (Enter o el botón).
             ui.horizontal(|ui| {
                 let te = ui.add(
@@ -586,18 +617,18 @@ pub fn config_panel(
                 );
                 let enter =
                     te.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
-                if (ui.button("✍ Aplicar").clicked() || enter)
+                if (ui.button(format!("{} Aplicar", icon::APPLY)).clicked() || enter)
                     && !st.shape_text.trim().is_empty()
                 {
                     events.push(PanelEvent::FormText(st.shape_text.clone()));
                 }
             });
             ui.horizontal(|ui| {
-                if ui.button("🖼 Imagen…").clicked() {
+                if ui.button(format!("{} Imagen…", icon::IMAGE)).clicked() {
                     events.push(PanelEvent::FormImagePick);
                 }
                 if ui
-                    .button("💾 Guardar")
+                    .button(format!("{} Guardar", icon::SAVE))
                     .on_hover_text("Guardar en la biblioteca lo que haya en el campo")
                     .clicked()
                 {
@@ -608,7 +639,7 @@ pub fn config_panel(
                     }
                     events.push(PanelEvent::SaveShape);
                 }
-                if ui.button("💨 Soltar (S)").clicked() {
+                if ui.button(format!("{} Soltar (S)", icon::RELEASE)).clicked() {
                     events.push(PanelEvent::ReleaseShape);
                 }
             });
@@ -650,12 +681,12 @@ pub fn config_panel(
                 if n > 0 {
                     // Recorrer la biblioteca: carga y aplica el ítem, para ir
                     // preparando frases una tras otra.
-                    if ui.button("⏮").on_hover_text("Anterior").clicked() {
+                    if ui.button(icon::PREV).on_hover_text("Anterior").clicked() {
                         let cur = st.shape_sel.unwrap_or(0);
                         let idx = (cur + n - 1) % n;
                         select_shape(st, &mut events, &shapes, idx);
                     }
-                    if ui.button("⏭").on_hover_text("Siguiente").clicked() {
+                    if ui.button(icon::NEXT).on_hover_text("Siguiente").clicked() {
                         let idx = st.shape_sel.map(|c| (c + 1) % n).unwrap_or(0);
                         select_shape(st, &mut events, &shapes, idx);
                     }
@@ -663,24 +694,27 @@ pub fn config_panel(
             });
             if n == 0 {
                 ui.label(
-                    egui::RichText::new("Vacía. Aplica un texto/imagen y pulsa 💾 Guardar.")
-                        .weak()
-                        .small(),
+                    egui::RichText::new(format!(
+                        "Vacía. Aplica un texto/imagen y pulsa {} Guardar.",
+                        icon::SAVE
+                    ))
+                    .weak()
+                    .small(),
                 );
             } else {
                 for (i, s) in shapes.iter().enumerate() {
                     ui.horizontal(|ui| {
-                        let icon = if s.is_image() { "🖼" } else { "✍" };
+                        let ic = if s.is_image() { icon::IMAGE } else { icon::TEXT };
                         // Clic en el ítem: lo selecciona, lo carga en el campo
                         // (para editarlo) y lo aplica.
                         if ui
-                            .selectable_label(st.shape_sel == Some(i), format!("{icon} {}", s.name))
+                            .selectable_label(st.shape_sel == Some(i), format!("{ic} {}", s.name))
                             .on_hover_text("Cargar y aplicar")
                             .clicked()
                         {
                             select_shape(st, &mut events, &shapes, i);
                         }
-                        if ui.button("🗑").on_hover_text("Borrar").clicked() {
+                        if ui.button(icon::TRASH).on_hover_text("Borrar").clicked() {
                             events.push(PanelEvent::DeleteShape(s.name.clone()));
                             if st.shape_sel == Some(i) {
                                 st.shape_sel = None;
@@ -692,14 +726,16 @@ pub fn config_panel(
         });
 
         // ===================== Escenas =====================
-        egui::CollapsingHeader::new("🎞 Escenas").show(ui, |ui| {
+        egui::CollapsingHeader::new(format!("{} Escenas", icon::H_SCENES)).show(ui, |ui| {
             ui.horizontal(|ui| {
                 ui.add(
                     egui::TextEdit::singleline(&mut st.scene_name_input)
                         .hint_text("nombre")
                         .desired_width(120.0),
                 );
-                if ui.button("📸 Guardar").clicked() && !st.scene_name_input.trim().is_empty() {
+                if ui.button(format!("{} Guardar", icon::CAMERA)).clicked()
+                    && !st.scene_name_input.trim().is_empty()
+                {
                     events.push(PanelEvent::SaveScene(st.scene_name_input.trim().to_string()));
                 }
             });
@@ -712,10 +748,10 @@ pub fn config_panel(
                 );
             }
             ui.horizontal(|ui| {
-                if ui.button("⏮ Anterior (P)").clicked() {
+                if ui.button(format!("{} Anterior (P)", icon::PREV)).clicked() {
                     events.push(PanelEvent::PrevScene);
                 }
-                if ui.button("Siguiente ⏭ (N)").clicked() {
+                if ui.button(format!("Siguiente {} (N)", icon::NEXT)).clicked() {
                     events.push(PanelEvent::NextScene);
                 }
             });
@@ -728,10 +764,10 @@ pub fn config_panel(
                 );
             }
             ui.horizontal(|ui| {
-                if ui.button("⬆ Exportar todas").clicked() {
+                if ui.button(format!("{} Exportar todas", icon::UPLOAD)).clicked() {
                     events.push(PanelEvent::ExportScenes);
                 }
-                if ui.button("⬇ Importar…").clicked() {
+                if ui.button(format!("{} Importar…", icon::DOWNLOAD)).clicked() {
                     events.push(PanelEvent::ImportScenes);
                 }
             });
@@ -742,11 +778,11 @@ pub fn config_panel(
                 for name in st.scenes.clone() {
                     let is_def = st.default_scene == name;
                     ui.horizontal(|ui| {
-                        if ui.button("▶").on_hover_text("Cargar").clicked() {
+                        if ui.button(icon::PLAY).on_hover_text("Cargar").clicked() {
                             events.push(PanelEvent::LoadScene(name.clone()));
                         }
                         if ui
-                            .button("⟳")
+                            .button(icon::REPEAT)
                             .on_hover_text("Actualizar con la configuración actual")
                             .clicked()
                         {
@@ -754,13 +790,13 @@ pub fn config_panel(
                             events.push(PanelEvent::SaveScene(name.clone()));
                         }
                         if ui
-                            .selectable_label(is_def, "★")
+                            .selectable_label(is_def, icon::STAR)
                             .on_hover_text("Predeterminada")
                             .clicked()
                         {
                             events.push(PanelEvent::SetDefaultScene(name.clone()));
                         }
-                        if ui.button("🗑").on_hover_text("Borrar").clicked() {
+                        if ui.button(icon::TRASH).on_hover_text("Borrar").clicked() {
                             events.push(PanelEvent::DeleteScene(name.clone()));
                         }
                         ui.label(&name);
@@ -770,12 +806,12 @@ pub fn config_panel(
         });
 
         // ===================== Grabación =====================
-        egui::CollapsingHeader::new("⏺ Grabación").show(ui, |ui| {
+        egui::CollapsingHeader::new(format!("{} Grabación", icon::H_REC)).show(ui, |ui| {
             if ui
                 .button(if st.recording {
-                    "⏹ Detener grabación (R)"
+                    format!("{} Detener grabación (R)", icon::STOP)
                 } else {
-                    "⏺ Grabar vídeo (R)"
+                    format!("{} Grabar vídeo (R)", icon::REC)
                 })
                 .clicked()
             {
@@ -800,12 +836,18 @@ pub fn config_panel(
                 }
             });
             ui.label(format!("Salida: {}×{} px", st.frame_w, st.frame_h));
-            if ui.button("⊹ Centrar encuadre en la vista").clicked() {
+            if ui
+                .button(format!("{} Centrar encuadre en la vista", icon::CROSSHAIRS))
+                .clicked()
+            {
                 events.push(PanelEvent::CenterFrame);
             }
             ui.label("Arrastra el recuadro (mover) o una esquina (redimensionar) en el lienzo.");
             ui.separator();
-            if ui.button("📁 Carpeta de guardado…").clicked() {
+            if ui
+                .button(format!("{} Carpeta de guardado…", icon::FOLDER))
+                .clicked()
+            {
                 events.push(PanelEvent::PickVideoDir);
             }
             ui.label(if st.video_dir.is_empty() {
@@ -813,16 +855,39 @@ pub fn config_panel(
             } else {
                 format!("Carpeta: {}", st.video_dir)
             });
+            ui.separator();
+            // Música: se mezcla en el .mp4 al grabar (recortada a la duración).
+            ui.horizontal(|ui| {
+                if ui.button(format!("{} Música…", icon::MUSIC)).clicked() {
+                    events.push(PanelEvent::PickMusic);
+                }
+                if !st.music_path.is_empty() && ui.button(icon::RELEASE).on_hover_text("Quitar música").clicked() {
+                    st.music_path.clear();
+                }
+            });
+            ui.label(
+                egui::RichText::new(if st.music_path.is_empty() {
+                    "Sin música (vídeo mudo).".to_string()
+                } else {
+                    let name = std::path::Path::new(&st.music_path)
+                        .file_name()
+                        .map(|s| s.to_string_lossy().into_owned())
+                        .unwrap_or_else(|| st.music_path.clone());
+                    format!("{} {name}", icon::MUSIC)
+                })
+                .weak()
+                .small(),
+            );
         });
 
         // ===================== Lienzo y vista =====================
-        egui::CollapsingHeader::new("🖼 Lienzo y vista").show(ui, |ui| {
+        egui::CollapsingHeader::new(format!("{} Lienzo y vista", icon::H_CANVAS)).show(ui, |ui| {
             ui.add(
                 egui::Slider::new(&mut st.canvas_size, 200.0..=6000.0)
                     .logarithmic(true)
                     .text("Tamaño lienzo"),
             );
-            if ui.button("📐 Lienzo = pantalla (L)").clicked() {
+            if ui.button(format!("{} Lienzo = pantalla (L)", icon::DESKTOP)).clicked() {
                 events.push(PanelEvent::CanvasEqualsScreen);
             }
             ui.label("Menos = más reducido y denso · Más = más espacio");
