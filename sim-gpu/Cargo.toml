@@ -1,0 +1,17 @@
+[package]
+name = "sim-gpu"
+version.workspace = true
+edition.workspace = true
+
+[[bin]]
+name = "sim-gpu"
+path = "src/main.rs"
+
+[dependencies]
+shared = { path = "../shared" }
+# wgpu 24 = el pareado de egui-wgpu 0.31 (el panel egui llega en el hito 5).
+wgpu = "24"
+winit = "0.30"
+pollster = "0.4"
+bytemuck = { version = "1", features = ["derive"] }
+rand.workspace = true
