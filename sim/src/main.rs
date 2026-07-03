@@ -1,5 +1,6 @@
 mod audio;
 mod grid;
+mod music;
 mod render;
 mod simulation;
 
@@ -10,9 +11,9 @@ use ::rand::Rng;
 use render::Renderer;
 use shared::ipc::{decode, read_frame, socket_path, write_msg, IPC_VERSION};
 use shared::{
-    config_panel, example_store, hue_for_index, scenes_path, AudioTarget, Boundary, Brush,
-    ControlMsg, ControlState, InteractionMode, PanelEvent, PanelState, Playlist, SceneStore,
-    SeqPlayback, ShapeStore, SimParams, TelemetryMsg, Tool, FRAME_PRESETS,
+    config_panel, example_store, hue_for_index, scenes_path, AudioTarget, BeatAction, Boundary,
+    Brush, ControlMsg, ControlState, InteractionMode, PanelEvent, PanelState, Playlist,
+    SceneStore, SeqPlayback, ShapeStore, SimParams, TelemetryMsg, Tool, FRAME_PRESETS,
 };
 use simulation::Simulation;
 
@@ -727,6 +728,8 @@ fn apply_local_event(
         | PanelEvent::SeqNext
         | PanelEvent::SeqPrev
         | PanelEvent::SeqJump(_)
+        | PanelEvent::MusicAnalyze
+        | PanelEvent::MusicPreviewToggle
         | PanelEvent::HidePanel => {}
     }
 }
@@ -773,6 +776,20 @@ async fn main() {
         eprintln!("Audio: sin dispositivo de entrada; 'Reactivo al audio' no tendrá efecto.");
     }
     let mut audio_level = 0.0f32;
+    // Sincronía con la música: análisis (resultado + canal del hilo de fondo),
+    // preescucha, y estado de beats (cursor sobre los onsets, contador para el
+    // divisor y pulso con decaimiento).
+    let mut music: Option<music::MusicAnalysis> = None;
+    let mut music_rx: Option<std::sync::mpsc::Receiver<std::io::Result<music::MusicAnalysis>>> =
+        None;
+    // Ruta a la que corresponden `music`/`music_rx` (si el usuario cambia de
+    // pista, el análisis viejo deja de valer).
+    let mut music_path_analyzed = String::new();
+    let mut music_rx_path = String::new();
+    let mut preview: Option<music::Preview> = None;
+    let mut beat_cursor = 0usize;
+    let mut beat_count = 0u32;
+    let mut beat_pulse = 0.0f32;
     // Escenas guardadas (el `sim` es el dueño; ver sección "Escenas" del panel).
     // En el primer arranque (sin fichero) sembramos un set de ejemplos.
     let mut store = if scenes_path().exists() {
@@ -946,17 +963,145 @@ async fn main() {
             scene_autoplay_timer = 0.0;
         }
 
+        // Resultado del análisis de la música, si hay uno en marcha.
+        if let Some(rx) = &music_rx {
+            match rx.try_recv() {
+                Ok(Ok(a)) => {
+                    eprintln!(
+                        "Música analizada: {} beats{} · {:.0} s",
+                        a.onsets.len(),
+                        a.bpm.map(|b| format!(" · ~{b:.0} BPM")).unwrap_or_default(),
+                        a.duration
+                    );
+                    music = Some(a);
+                    music_path_analyzed = music_rx_path.clone();
+                    music_rx = None;
+                    beat_cursor = 0;
+                    beat_count = 0;
+                }
+                Ok(Err(e)) => {
+                    eprintln!("No se pudo analizar la música: {e}");
+                    music_rx = None;
+                }
+                Err(std::sync::mpsc::TryRecvError::Empty) => {}
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => music_rx = None,
+            }
+        }
+        // Preescucha que terminó por sí sola (fin de la pista).
+        if preview.as_mut().is_some_and(|p| p.finished()) {
+            preview = None;
+        }
+
+        // Reloj musical: grabando es el frame de vídeo (exacto por
+        // construcción, el audio del .mp4 empieza en 0 con el frame 0); en
+        // vivo, el tiempo de la preescucha menos la latencia configurada.
+        // `None` = la sincronía no actúa este frame.
+        let music_t: Option<f32> = if st.music_sync.enabled
+            && music.is_some()
+            && music_path_analyzed == st.music_path
+        {
+            if let Some(r) = &rec {
+                Some(r.frames as f32 / REC_FPS as f32)
+            } else {
+                preview
+                    .as_ref()
+                    .map(|p| (p.elapsed() - st.music_sync.latency_offset).max(0.0))
+            }
+        } else {
+            None
+        };
+
         // Nivel de audio suavizado (ataque rápido, caída lenta) para la
         // reactividad. Se calcula cada frame, aun en pausa (afecta al brillo).
         let audio_raw = audio_in.as_ref().map(|a| a.level()).unwrap_or(0.0);
         let audio_goal = (audio_raw * 6.0).clamp(0.0, 1.0);
         let k = if audio_goal > audio_level { 0.5 } else { 0.08 };
         audio_level += (audio_goal - audio_level) * k;
-        let audio_gain = if params.audio_reactive {
-            1.0 + audio_level * params.audio_intensity
-        } else {
-            1.0
-        };
+
+        // Con sincronía activa, la envolvente analizada de la pista sustituye
+        // al micrófono como nivel (mismo objetivo/intensidad de audio).
+        let env_drive = music_t.is_some() && st.music_sync.envelope_drive;
+        if let (Some(t), Some(m), true) = (music_t, &music, env_drive) {
+            audio_level = m.envelope_at(t);
+        }
+
+        // Beats: al cruzar cada onset, dispara la acción configurada cada
+        // `beat_divisor` golpes. El pulso decae en ~0.2 s (tiempo de show).
+        beat_pulse *= (-show_dt / 0.2).exp();
+        if let Some(t) = music_t {
+            let onsets_len = music.as_ref().map_or(0, |m| m.onsets.len());
+            while beat_cursor < onsets_len
+                && music.as_ref().unwrap().onsets[beat_cursor] <= t
+            {
+                beat_cursor += 1;
+                beat_count += 1;
+                if beat_count % st.music_sync.beat_divisor.max(1) != 0 {
+                    continue;
+                }
+                match st.music_sync.beat_action {
+                    BeatAction::None => {}
+                    BeatAction::Pulse => beat_pulse = st.music_sync.pulse_gain,
+                    BeatAction::RandomizeMatrix => {
+                        let snap = params.current_snapshot();
+                        params.randomize_matrix(&mut rng);
+                        params.start_transition(snap);
+                        if mode == AppMode::Detached {
+                            pending_apply = Some(params.clone());
+                        }
+                    }
+                    BeatAction::NextScene => {
+                        if sequencer.state == SeqPlayback::Playing {
+                            // El beat fuerza el paso a la siguiente entrada del
+                            // show (el cronómetro se reinicia en seq_launch).
+                            let n = sequencer.playlist.entries.len();
+                            if n > 0 {
+                                if let Some(v) =
+                                    sequencer.find_valid(&store, (sequencer.idx + 1) % n, 1)
+                                {
+                                    seq_launch(
+                                        &mut sequencer,
+                                        v,
+                                        &store,
+                                        &mut params,
+                                        &mut sim,
+                                        &st,
+                                        &mut current_scene_idx,
+                                        &mut scene_morph,
+                                        &mut pending_apply,
+                                        mode == AppMode::Detached,
+                                        &mut rng,
+                                    );
+                                }
+                            }
+                        } else {
+                            let (old_t, old_i) =
+                                (params.shape_text.clone(), params.shape_image.clone());
+                            scene_morph = cycle_scene(
+                                1,
+                                &store,
+                                &mut params,
+                                &mut current_scene_idx,
+                                st.scene_smooth,
+                                st.scene_transition_duration,
+                            );
+                            apply_scene_shape(&mut sim, &params, &old_t, &old_i, &mut rng);
+                            if scene_morph.is_none() && mode == AppMode::Detached {
+                                pending_apply = Some(params.clone());
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // La modulación de audio actúa con el micrófono activo, con la
+        // envolvente de la pista o mientras quede pulso de beat vivo.
+        let audio_mod_on = params.audio_reactive || env_drive || beat_pulse > 1e-3;
+        let mut audio_gain = 1.0;
+        if params.audio_reactive || env_drive {
+            audio_gain += audio_level * params.audio_intensity;
+        }
+        audio_gain += beat_pulse;
 
         // Física.
         if !st.paused || step_once {
@@ -976,7 +1121,7 @@ async fn main() {
             // la transición de velocidad (`advance_transition`).
             let saved_ts = params.time_scale;
             let saved_force = params.force;
-            if params.audio_reactive {
+            if audio_mod_on {
                 match params.audio_target {
                     AudioTarget::Speed => params.time_scale *= audio_gain,
                     AudioTarget::Force => params.force *= audio_gain,
@@ -1010,6 +1155,11 @@ async fn main() {
         st.seq_state = sequencer.state;
         st.seq_idx = sequencer.idx;
         st.seq_elapsed = sequencer.timer;
+        st.music_analyzed = music.is_some() && music_path_analyzed == st.music_path;
+        st.music_duration = music.as_ref().map_or(0.0, |m| m.duration);
+        st.music_onsets = music.as_ref().map_or(0, |m| m.onsets.len());
+        st.music_bpm = music.as_ref().and_then(|m| m.bpm);
+        st.music_previewing = preview.is_some();
 
         match mode {
             AppMode::Embedded => {
@@ -1267,6 +1417,10 @@ async fn main() {
                     None => match Recorder::start(preset_w, preset_h, &video_dir, &st.music_path) {
                         Ok(r) => {
                             rec = Some(r);
+                            // La música del .mp4 empieza en 0 con el frame 0:
+                            // rebobinar el cursor de beats.
+                            beat_cursor = 0;
+                            beat_count = 0;
                             // Show ligado a la grabación: arranca desde el
                             // principio junto con ella.
                             if sequencer.playlist.start_on_record {
@@ -1594,6 +1748,23 @@ async fn main() {
                         );
                     }
                 }
+                PanelEvent::MusicAnalyze => {
+                    if st.music_path.is_empty() {
+                        eprintln!("Elige primero una pista de música (sección Grabación).");
+                    } else if music_rx.is_none() {
+                        eprintln!("Analizando '{}'…", st.music_path);
+                        music_rx_path = st.music_path.clone();
+                        music_rx = Some(music::analyze_async(st.music_path.clone()));
+                    }
+                }
+                PanelEvent::MusicPreviewToggle => {
+                    if preview.take().is_none() && !st.music_path.is_empty() {
+                        preview = music::Preview::start(&st.music_path);
+                        // La preescucha arranca la pista en 0: rebobinar beats.
+                        beat_cursor = 0;
+                        beat_count = 0;
+                    }
+                }
                 PanelEvent::HidePanel => panel_visible = false,
                 other => apply_local_event(
                     other,
@@ -1678,6 +1849,18 @@ async fn main() {
                 };
                 if let Some(w) = ipc.writer.lock().unwrap().as_mut() {
                     let _ = write_msg(w, &seq_tele);
+                }
+                // Estado del análisis/preescucha de la música (continuo; son
+                // cinco campos, no compensa un flag de "sucio").
+                let music_tele = TelemetryMsg::MusicInfo {
+                    analyzed: st.music_analyzed,
+                    duration: st.music_duration,
+                    onsets: st.music_onsets,
+                    bpm: st.music_bpm,
+                    previewing: st.music_previewing,
+                };
+                if let Some(w) = ipc.writer.lock().unwrap().as_mut() {
+                    let _ = write_msg(w, &music_tele);
                 }
                 if let Some(p) = pending_apply.take() {
                     if let Some(w) = ipc.writer.lock().unwrap().as_mut() {
@@ -1788,7 +1971,7 @@ async fn main() {
         // Modulación de audio sobre el brillo (transitoria durante el render y la
         // grabación; se restaura tras volcar el frame).
         let saved_brightness = params.brightness;
-        if params.audio_reactive && params.audio_target == AudioTarget::Brightness {
+        if audio_mod_on && params.audio_target == AudioTarget::Brightness {
             params.brightness = (params.brightness * audio_gain).min(1.0);
         }
 
