@@ -136,6 +136,7 @@ impl PanelApp {
                     scene_transition_duration,
                     scene_autoplay,
                     scene_autoplay_interval,
+                    music_sync,
                 } = *state;
                 self.params = params;
                 self.st.paused = paused;
@@ -152,6 +153,7 @@ impl PanelApp {
                 self.st.scene_transition_duration = scene_transition_duration;
                 self.st.scene_autoplay = scene_autoplay;
                 self.st.scene_autoplay_interval = scene_autoplay_interval;
+                self.st.music_sync = music_sync;
                 self.initialized = true;
             }
             TelemetryMsg::Stats {
@@ -211,6 +213,19 @@ impl PanelApp {
                 self.st.seq_idx = idx;
                 self.st.seq_elapsed = elapsed;
             }
+            TelemetryMsg::MusicInfo {
+                analyzed,
+                duration,
+                onsets,
+                bpm,
+                previewing,
+            } => {
+                self.st.music_analyzed = analyzed;
+                self.st.music_duration = duration;
+                self.st.music_onsets = onsets;
+                self.st.music_bpm = bpm;
+                self.st.music_previewing = previewing;
+            }
             TelemetryMsg::Version(v) => {
                 if v != IPC_VERSION {
                     eprintln!(
@@ -256,6 +271,7 @@ impl eframe::App for PanelApp {
                 scene_transition_duration: self.st.scene_transition_duration,
                 scene_autoplay: self.st.scene_autoplay,
                 scene_autoplay_interval: self.st.scene_autoplay_interval,
+                music_sync: self.st.music_sync.clone(),
             };
             let mut closing = false;
             if write_msg(&mut self.write_stream, &ControlMsg::State(state)).is_err() {

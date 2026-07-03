@@ -14,3 +14,6 @@ egui-macroquad = "0.17"
 rand.workspace = true
 rayon = "1"
 rfd = "0.15"
+# FFT pura-Rust para el análisis de la música (flujo espectral / beats). Sin
+# enlaces nativos: no repite el conflicto ALSA que veta a cpal.
+realfft = "3"

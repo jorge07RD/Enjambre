@@ -108,6 +108,12 @@ impl Default for PanelState {
             paused: false,
             video_dir: String::new(),
             music_path: String::new(),
+            music_sync: MusicSync::default(),
+            music_analyzed: false,
+            music_duration: 0.0,
+            music_onsets: 0,
+            music_bpm: None,
+            music_previewing: false,
             shape_text: String::new(),
             saved_shapes: Vec::new(),
             shape_sel: None,
@@ -211,6 +217,10 @@ pub enum PanelEvent {
     SeqPrev,
     /// Saltar a la entrada `i` de la playlist.
     SeqJump(usize),
+    /// Analizar la pista de música elegida (envolvente + beats, en fondo).
+    MusicAnalyze,
+    /// Arrancar/parar la preescucha de la pista (ffplay en el `sim`).
+    MusicPreviewToggle,
 }
 
 /// Selecciona la forma `idx` de la biblioteca: la resalta, carga su texto en el
@@ -1119,6 +1129,109 @@ pub fn config_panel(
                 .weak()
                 .small(),
             );
+
+            // --- Sincronía con la música (envolvente + beats de la pista) ---
+            if !st.music_path.is_empty() {
+                ui.separator();
+                ui.horizontal(|ui| {
+                    if ui
+                        .button(format!("{} Analizar pista", icon::H_AUDIO))
+                        .on_hover_text("Extrae la envolvente y los beats (unos segundos)")
+                        .clicked()
+                    {
+                        events.push(PanelEvent::MusicAnalyze);
+                    }
+                    if ui
+                        .button(if st.music_previewing {
+                            format!("{} Preescucha", icon::STOP)
+                        } else {
+                            format!("{} Preescucha", icon::PLAY)
+                        })
+                        .on_hover_text("Reproducir la pista en vivo (sincronía aproximada)")
+                        .clicked()
+                    {
+                        events.push(PanelEvent::MusicPreviewToggle);
+                    }
+                });
+                ui.label(
+                    egui::RichText::new(if st.music_analyzed {
+                        let bpm = st
+                            .music_bpm
+                            .map(|b| format!(" · ~{b:.0} BPM"))
+                            .unwrap_or_default();
+                        let m = (st.music_duration / 60.0) as u32;
+                        let s = st.music_duration as u32 % 60;
+                        format!("{} beats{bpm} · {m}:{s:02}", st.music_onsets)
+                    } else {
+                        "Pista sin analizar.".to_string()
+                    })
+                    .weak()
+                    .small(),
+                );
+                ui.checkbox(&mut st.music_sync.enabled, "Sincronizar con la música");
+                if st.music_sync.enabled {
+                    if !st.music_analyzed {
+                        ui.label(
+                            egui::RichText::new("Analiza la pista para que la sincronía actúe.")
+                                .color(egui::Color32::from_rgb(230, 180, 60))
+                                .small(),
+                        );
+                    }
+                    ui.horizontal(|ui| {
+                        ui.label("En cada beat:");
+                        ui.selectable_value(&mut st.music_sync.beat_action, BeatAction::None, "Nada");
+                        ui.selectable_value(&mut st.music_sync.beat_action, BeatAction::Pulse, "Pulso");
+                    });
+                    ui.horizontal(|ui| {
+                        ui.selectable_value(
+                            &mut st.music_sync.beat_action,
+                            BeatAction::RandomizeMatrix,
+                            "Aleatorizar matriz",
+                        );
+                        ui.selectable_value(
+                            &mut st.music_sync.beat_action,
+                            BeatAction::NextScene,
+                            "Escena siguiente",
+                        );
+                    });
+                    if st.music_sync.beat_action != BeatAction::None {
+                        let mut div = st.music_sync.beat_divisor.max(1) as i32;
+                        if ui
+                            .add(egui::Slider::new(&mut div, 1..=16).text("Cada N beats"))
+                            .changed()
+                        {
+                            st.music_sync.beat_divisor = div as u32;
+                        }
+                    }
+                    if st.music_sync.beat_action == BeatAction::Pulse {
+                        ui.add(
+                            egui::Slider::new(&mut st.music_sync.pulse_gain, 0.0..=4.0)
+                                .text("Fuerza del pulso"),
+                        );
+                    }
+                    ui.checkbox(
+                        &mut st.music_sync.envelope_drive,
+                        "La envolvente modula (según 'Reactivo al audio')",
+                    )
+                    .on_hover_text(
+                        "Usa el objetivo e intensidad de la sección 'Reactivo al audio', \
+                         pero con la pista en lugar del micrófono.",
+                    );
+                    if st.music_previewing {
+                        ui.add(
+                            egui::Slider::new(&mut st.music_sync.latency_offset, -0.5..=0.5)
+                                .text("Latencia preescucha (s)"),
+                        );
+                    }
+                    ui.label(
+                        egui::RichText::new(
+                            "Grabando, la sincronía es exacta en el .mp4; la preescucha es aproximada.",
+                        )
+                        .weak()
+                        .small(),
+                    );
+                }
+            }
         });
 
         // ===================== Lienzo y vista =====================

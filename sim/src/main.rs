@@ -658,6 +658,7 @@ fn control_state(params: &SimParams, st: &PanelState) -> ControlState {
         scene_transition_duration: st.scene_transition_duration,
         scene_autoplay: st.scene_autoplay,
         scene_autoplay_interval: st.scene_autoplay_interval,
+        music_sync: st.music_sync.clone(),
     }
 }
 
@@ -1063,6 +1064,7 @@ async fn main() {
                         st.scene_transition_duration = state.scene_transition_duration;
                         st.scene_autoplay = state.scene_autoplay;
                         st.scene_autoplay_interval = state.scene_autoplay_interval;
+                        st.music_sync = state.music_sync.clone();
                         // La carpeta de guardado y la música las elige el panel.
                         video_dir = state.video_dir.clone();
                         st.music_path = state.music_path.clone();
