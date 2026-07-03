@@ -5,6 +5,7 @@
 pub mod config;
 pub mod ipc;
 pub mod panel_ui;
+pub mod playlist;
 pub mod scenes;
 pub mod shapes;
 pub mod ui_theme;
@@ -12,5 +13,6 @@ pub mod ui_theme;
 pub use config::*;
 pub use ipc::{ControlMsg, ControlState, TelemetryMsg};
 pub use panel_ui::{config_panel, PanelEvent, PanelState};
+pub use playlist::{playlist_path, Playlist, PlaylistEntry, SeqPlayback};
 pub use scenes::{example_store, scenes_path, Scene, SceneStore};
 pub use shapes::{shapes_path, SavedShape, ShapeStore};

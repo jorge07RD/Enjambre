@@ -109,6 +109,8 @@ pub mod icon {
     pub const ERASE: &str = "\u{f12d}"; // eraser
     pub const DESKTOP: &str = "\u{f108}";
     pub const FIT: &str = "\u{f065}"; // expand
+    pub const UP: &str = "\u{f062}"; // arrow-up
+    pub const DOWN: &str = "\u{f063}"; // arrow-down
 
     // Iconos de cabecera de secciones.
     pub const H_INTERACT: &str = "\u{f0d0}"; // magic
@@ -119,6 +121,7 @@ pub mod icon {
     pub const H_TOOL: &str = "\u{f245}"; // mouse-pointer
     pub const H_SHAPE: &str = "\u{f075}"; // comment
     pub const H_SCENES: &str = "\u{f008}"; // film
+    pub const H_SEQ: &str = "\u{f03a}"; // list
     pub const H_REC: &str = "\u{f111}"; // circle
     pub const H_CANVAS: &str = "\u{f125}"; // crop
 }
