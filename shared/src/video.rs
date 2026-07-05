@@ -232,14 +232,18 @@ pub fn overlay_audio(recorded: &str, src: &str, offset_secs: f32, mix_existing: 
     }
     let delay_ms = (offset_secs.max(0.0) * 1000.0).round() as i64;
     let tmp = format!("{recorded}.mux.mp4");
-    // Retrasa el audio del vídeo (input 1) y, si hay música (input 0 con audio),
-    // lo mezcla con ella.
+    // Retrasa el audio del vídeo (input 1) al offset en que apareció y lo
+    // RELLENA con silencio (`apad`) para que la pista más corta sea siempre el
+    // vídeo grabado: así `-shortest` conserva TODA la grabación (si no, el
+    // `.mp4` se cortaría justo al acabar el audio del vídeo). Con música (input
+    // 0 con audio) los mezcla; `amix` con `duration=first` ya dura lo que el
+    // audio grabado (= la grabación entera).
     let filter = if mix_existing {
         format!(
             "[1:a]adelay={delay_ms}:all=1[da];[0:a][da]amix=inputs=2:duration=first:normalize=0[a]"
         )
     } else {
-        format!("[1:a]adelay={delay_ms}:all=1[a]")
+        format!("[1:a]adelay={delay_ms}:all=1,apad[a]")
     };
     let status = Command::new("ffmpeg")
         .args([
