@@ -11,17 +11,19 @@
 //!
 //! Uso: `cargo run --release -p sim-gpu [n_partículas]` (por defecto 20000).
 //! Teclas: Espacio = pausa · H = panel · R = grabar · M = aleatorizar la
-//! matriz · N/P = escena siguiente/anterior · B = contorno · G = grid/naive ·
-//! 1..9/0 = velocidad 10..90/100 % · +/- = ±10 % · Esc = salir.
+//! matriz · U = anti-aglomeración · N/P = escena siguiente/anterior ·
+//! B = contorno · G = grid/naive · 1..9/0 = velocidad 10..90/100 % ·
+//! +/- = ±10 % · Esc = salir.
 
 mod gpu_sim;
 mod rec;
 mod shape;
 
 use gpu_sim::{GpuSim, ShapeDrive};
+use rand::Rng;
 use shared::{
     config_panel, example_store, hue_for_index, ui_theme, PanelEvent, PanelState, SceneStore,
-    ShapeStore, SimParams,
+    ShapeStore, SimParams, NUM_COLORS,
 };
 use std::sync::Arc;
 use std::time::Instant;
@@ -173,6 +175,7 @@ struct State {
     scene_idx: usize,
     morph: Option<SceneMorph>,
     autoplay_timer: f32,
+    auto_rand_timer: f32,
     // Formas (texto/imagen) y grabación de vídeo (hito 6).
     shape_store: ShapeStore,
     shape: ShapeState,
@@ -281,6 +284,7 @@ impl State {
             scene_idx,
             morph: None,
             autoplay_timer: 0.0,
+            auto_rand_timer: 0.0,
             shape_store,
             shape: ShapeState::default(),
             recorder: None,
@@ -405,6 +409,7 @@ impl State {
                 self.sim.reseed(&self.queue, n as u32, &mut rand::thread_rng())
             }
             PanelEvent::StartTransition(snap) => self.params.start_transition(snap),
+            PanelEvent::MatrixBlend(snap) => self.params.start_matrix_blend(snap),
             PanelEvent::SetSpeed(v) => self.params.set_speed(v),
             PanelEvent::SaveScene(name) => {
                 self.store.upsert(&name, self.params.settled());
@@ -528,10 +533,10 @@ impl State {
         match key {
             Key::Named(NamedKey::Space) => self.panel.paused = !self.panel.paused,
             Key::Character(c) if c.eq_ignore_ascii_case("m") => {
-                // Aleatorizar la matriz con transición fluida (si está activa).
+                // Aleatorizar la matriz: el cruce es suave SIEMPRE.
                 let snap = self.params.current_snapshot();
                 self.params.randomize_matrix(&mut rand::thread_rng());
-                self.params.start_transition(snap);
+                self.params.start_matrix_blend(snap);
             }
             Key::Character(c) if c.eq_ignore_ascii_case("g") => {
                 // Alternar grid ↔ naive (mismo comportamiento estadístico;
@@ -549,6 +554,11 @@ impl State {
                     shared::Boundary::Wrap => shared::Boundary::Bounce,
                     shared::Boundary::Bounce => shared::Boundary::Wrap,
                 };
+            }
+            Key::Character(c) if c.eq_ignore_ascii_case("u") => {
+                // Anti-aglomeración: disolver bolas hiperdensas (on/off), para
+                // comparar con/sin al vuelo.
+                self.params.anti_clump = !self.params.anti_clump;
             }
             // Velocidad: 1..9 = 10..90 %, 0 = 100 % (como en la app CPU),
             // y +/- para pasos de ±10 % (hasta 300 %). Va por el sistema de
@@ -635,11 +645,45 @@ impl State {
         for ev in events {
             self.handle_event(ev);
         }
+        let paused = self.panel.paused && !self.step_once;
+        self.step_once = false;
+
+        // Auto-aleatorizado de la matriz (modo Matriz), con cruce suave.
+        if !paused
+            && self.params.auto_randomize
+            && self.params.mode == shared::InteractionMode::Matrix
+        {
+            self.auto_rand_timer += dt;
+            if self.auto_rand_timer >= self.params.auto_randomize_interval.max(0.2) {
+                self.auto_rand_timer = 0.0;
+                let snap = self.params.current_snapshot();
+                self.params.randomize_matrix(&mut rand::thread_rng());
+                self.params.start_matrix_blend(snap);
+            }
+        }
+
+        // Deriva gradual de la MATRIZ: muta los parámetros en la CPU (la del
+        // color por partícula corre en la GPU, color.wgsl), igual que
+        // `apply_dynamics` en la app CPU.
+        if !paused && self.params.gradual {
+            let ms = self.params.gradual_matrix_speed * self.params.time_scale.max(0.0);
+            if ms > 0.0 {
+                let mut rng = rand::thread_rng();
+                for i in 0..NUM_COLORS {
+                    for j in 0..NUM_COLORS {
+                        self.params.matrix[i][j] = (self.params.matrix[i][j]
+                            + rng.gen_range(-1.0f32..=1.0) * ms)
+                            .clamp(-1.0, 1.0);
+                    }
+                }
+            }
+        }
 
         // Los parámetros (física + render) suben cada frame: los blends y lo
-        // que haya tocado el panel se reflejan al instante.
+        // que haya tocado el panel se reflejan al instante. `dt` escala el
+        // lerp del suavizado de color en el kernel.
         let drive = self.shape.drive(self.params.shape_strength);
-        self.sim.upload_params(&self.queue, &self.params, &drive);
+        self.sim.upload_params(&self.queue, &self.params, &drive, dt);
 
         let frame = match self.surface.get_current_texture() {
             Ok(f) => f,
@@ -653,8 +697,6 @@ impl State {
         let mut encoder = self
             .device
             .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
-        let paused = self.panel.paused && !self.step_once;
-        self.step_once = false;
         self.sim.frame(&mut encoder, &view, paused);
 
         // Grabación: volcar la escena (sin el panel) a la textura de captura
@@ -804,7 +846,8 @@ fn main() {
         .unwrap_or(20_000);
     eprintln!(
         "Enjambre GPU · {count} partículas · Espacio pausa · H panel · R graba · M aleatoriza · \
-         N/P escena · B contorno · G grid/naive · 1..9/0 velocidad · +/- ±10 % · Esc sale"
+         U anti-aglomeración · N/P escena · B contorno · G grid/naive · 1..9/0 velocidad · \
+         +/- ±10 % · Esc sale"
     );
     let event_loop = EventLoop::new().expect("bucle de eventos");
     event_loop

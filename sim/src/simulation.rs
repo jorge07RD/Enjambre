@@ -204,6 +204,19 @@ impl Simulation {
         let attract_strength = params.attract_active_strength;
         let focus = self.focus;
 
+        // Anti-aglomeración: umbral de vecinos por encima del cual la bola se
+        // considera hiperdensa. Relativo a la densidad media (vecinos esperados
+        // dentro de r_max con las partículas repartidas), así se adapta al nº
+        // de partículas y al radio. Infinito = desactivado.
+        let clump_thr = if params.anti_clump {
+            let expected =
+                n as f32 / (world.x * world.y).max(1.0) * std::f32::consts::PI * r_max2;
+            (params.anti_clump_factor.max(1.0) * expected).max(30.0)
+        } else {
+            f32::INFINITY
+        };
+        let clump_strength = params.anti_clump_strength;
+
         // Fuerza del cursor (herramienta Fuerza): atrae o repele alrededor del
         // puntero con caída suave dentro de `pointer_radius`.
         let pointer = self.pointer;
@@ -246,7 +259,9 @@ impl Simulation {
         // en Boids) mientras la bandada aparece, y viceversa.
         let boids_mix = {
             let to_boids = if params.mode == InteractionMode::Boids { 1.0 } else { 0.0 };
-            if params.smooth && params.blend < 1.0 {
+            // Solo el blend gobierna (como `interaction()`): así el cruce
+            // forzado de `start_matrix_blend` también queda cubierto.
+            if params.blend < 1.0 {
                 let from_boids =
                     if params.from_state.mode == InteractionMode::Boids { 1.0 } else { 0.0 };
                 let b = params.blend;
@@ -293,6 +308,9 @@ impl Simulation {
                 let i_text = shape_on && i < n_shape;
                 let mut acc = Vec2::ZERO;
                 let mut neighbors = 0u32;
+                // Suma de los vectores a los vecinos: apunta al centro de masa
+                // local (para la dispersión anti-aglomeración).
+                let mut crowd = Vec2::ZERO;
                 // Acumuladores de Boids (solo se usan si `need_boids`).
                 let mut sep_acc = Vec2::ZERO;
                 let mut ali_acc = Vec2::ZERO;
@@ -339,6 +357,7 @@ impl Simulation {
                                 continue;
                             }
                             neighbors += 1;
+                            crowd += d;
                             let dist = d2.sqrt();
                             // Interacción texto ↔ fondo: se ignoran mutuamente y el
                             // fondo esquiva al texto para no invadir las letras.
@@ -389,6 +408,20 @@ impl Simulation {
                                 acc += d * (f / dist);
                             }
                         }
+                    }
+                }
+
+                // Anti-aglomeración: con muchos más vecinos que la media, la
+                // bola es hiperdensa y las fuerzas de pareja se vuelven
+                // violentas. Se calman (damping) y se añade un empuje suave
+                // hacia fuera del centro local: la bola se disuelve desde el
+                // borde, de forma natural, sin teletransportes.
+                if (neighbors as f32) > clump_thr {
+                    let over = ((neighbors as f32 - clump_thr) / clump_thr).min(1.0);
+                    acc *= 1.0 - 0.7 * over;
+                    let len = crowd.length();
+                    if len > 1e-4 {
+                        acc -= (crowd / len) * (over * clump_strength);
                     }
                 }
 

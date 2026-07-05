@@ -22,10 +22,10 @@
 //! `blit_to` vuelca la escena (sin panel) a una textura rgba8 externa que el
 //! Recorder (rec.rs) copia a staging y manda a ffmpeg.
 //!
-//! Sin paridad (documentado): la dinámica de color por partícula
-//! (`random_color`/`gradual_color_speed`), que muta datos por partícula en la
-//! CPU; la deriva de la MATRIZ (`gradual_matrix_speed`) sí funciona porque
-//! vive en los parámetros.
+//! Dinámica del color: el kernel de color.wgsl aplica por partícula los
+//! saltos aleatorios, la deriva gradual y la transición suave del matiz (RNG
+//! por hash PCG de índice+frame); la deriva de la MATRIZ corre en la CPU
+//! (main.rs) porque muta los parámetros, igual que en la app CPU.
 
 use rand::Rng;
 use shared::{
@@ -85,7 +85,9 @@ fn pack_matrix(m: &[[f32; NUM_COLORS]; NUM_COLORS]) -> [[f32; 4]; 9] {
 /// Progreso ya suavizado (ease-in-out) del cruce de interacción, 1 = sin
 /// transición (el mismo cálculo que `SimParams::interaction()`).
 fn eased_blend(p: &SimParams) -> f32 {
-    if p.blend >= 1.0 || !p.smooth {
+    // Solo el blend gobierna (como `interaction()` en la CPU): así el cruce
+    // forzado de `start_matrix_blend` funciona con la fluida apagada.
+    if p.blend >= 1.0 {
         1.0
     } else {
         let b = p.blend;
@@ -97,7 +99,7 @@ fn eased_blend(p: &SimParams) -> f32 {
 /// local de `Simulation::step` en la CPU).
 fn boids_mix(p: &SimParams) -> f32 {
     let to = if p.mode == InteractionMode::Boids { 1.0 } else { 0.0 };
-    if p.smooth && p.blend < 1.0 {
+    if p.blend < 1.0 {
         let from = if p.from_state.mode == InteractionMode::Boids { 1.0 } else { 0.0 };
         let b = p.blend;
         let t = b * b * (3.0 - 2.0 * b);
@@ -167,6 +169,18 @@ struct GpuParams {
     shape_k: f32,
     shape_inter: f32,
     shape_avoid: f32,
+    random_color: u32,
+    p_switch: f32,
+    gradual: u32,
+    color_drift: f32,
+    color_smooth: u32,
+    color_lerp: f32,
+    color_seed: u32,
+    _pad2: u32,
+    clump_thr: f32,
+    clump_strength: f32,
+    _pad3: f32,
+    _pad4: f32,
     matrix: [[f32; 4]; 9],
     from_matrix: [[f32; 4]; 9],
 }
@@ -178,7 +192,23 @@ impl GpuParams {
         count: u32,
         grid: &GridDims,
         shape: &ShapeDrive,
+        frame_dt: f32,
+        color_seed: u32,
     ) -> Self {
+        // Las tasas de la dinámica de color se escalan por el paso, como en
+        // `apply_dynamics` de la CPU; el lerp del suavizado va en tiempo real.
+        let dt_step = params.time_scale.max(0.0);
+        // Umbral anti-aglomeración absoluto: múltiplo de los vecinos esperados
+        // por la densidad media dentro de r_max (0 = desactivado), como la CPU.
+        let clump_thr = if params.anti_clump {
+            let expected = count as f32 / (world[0] * world[1]).max(1.0)
+                * std::f32::consts::PI
+                * params.r_max
+                * params.r_max;
+            (params.anti_clump_factor.max(1.0) * expected).max(30.0)
+        } else {
+            0.0
+        };
         Self {
             world,
             dt: params.time_scale,
@@ -218,6 +248,18 @@ impl GpuParams {
             shape_k: shape.k,
             shape_inter: shape.inter,
             shape_avoid: shape.avoid,
+            random_color: params.random_color as u32,
+            p_switch: (params.random_color_rate * dt_step).clamp(0.0, 1.0),
+            gradual: params.gradual as u32,
+            color_drift: params.gradual_color_speed * dt_step,
+            color_smooth: params.color_smooth as u32,
+            color_lerp: (frame_dt / params.color_transition_duration.max(0.05)).clamp(0.0, 1.0),
+            color_seed,
+            _pad2: 0,
+            clump_thr,
+            clump_strength: params.anti_clump_strength,
+            _pad3: 0.0,
+            _pad4: 0.0,
             matrix: pack_matrix(&params.matrix),
             from_matrix: pack_matrix(&params.from_state.matrix),
         }
@@ -297,6 +339,10 @@ pub struct GpuSim {
     bloom_on: bool,
     disc_alpha: f32,
     arrow_alpha: f32,
+    /// Correr el kernel de dinámica del color este frame.
+    color_on: bool,
+    /// Semilla del RNG por hash del kernel de color (avanza cada subida).
+    color_seed: u32,
     /// Limpiar la textura persistente en el próximo frame (arranque/resize).
     clear_pending: bool,
     params_buf: wgpu::Buffer,
@@ -304,6 +350,7 @@ pub struct GpuSim {
     pos_bufs: [wgpu::Buffer; 2],
     vel_bufs: [wgpu::Buffer; 2],
     hue_buf: wgpu::Buffer,
+    target_hue_buf: wgpu::Buffer,
     shape_buf: wgpu::Buffer,
     counts_buf: wgpu::Buffer,
     starts_buf: wgpu::Buffer,
@@ -312,6 +359,7 @@ pub struct GpuSim {
     pipeline_count: wgpu::ComputePipeline,
     pipeline_prefix: wgpu::ComputePipeline,
     pipeline_scatter: wgpu::ComputePipeline,
+    pipeline_color: wgpu::ComputePipeline,
     pipeline_disc: wgpu::RenderPipeline,
     pipeline_arrow: wgpu::RenderPipeline,
     pipeline_bloom: wgpu::RenderPipeline,
@@ -322,6 +370,7 @@ pub struct GpuSim {
     compute_bind: [wgpu::BindGroup; 2],
     /// Grid CSR de solo lectura para las fuerzas (group 1 de sim.wgsl).
     grid_read_bind: wgpu::BindGroup,
+    color_bind: wgpu::BindGroup,
     /// Bind groups de la construcción del grid, uno por buffer de entrada.
     grid_build_bind: [wgpu::BindGroup; 2],
     /// Bind groups del render para leer el buffer recién escrito (B, A).
@@ -390,6 +439,12 @@ impl GpuSim {
             usage: storage,
             mapped_at_creation: false,
         });
+        // Matiz objetivo de la dinámica de color (arranca igual al matiz).
+        let target_hue_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("target hue"),
+            contents: bytemuck::cast_slice(&hue),
+            usage: storage,
+        });
 
         // --- Buffers del grid CSR ---
         let counts_buf = device.create_buffer(&wgpu::BufferDescriptor {
@@ -426,6 +481,8 @@ impl GpuSim {
                 count,
                 &grid,
                 &ShapeDrive::default(),
+                0.0,
+                0,
             )),
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
         });
@@ -563,6 +620,39 @@ impl GpuSim {
         let pipeline_count = mk_grid_pipeline("count");
         let pipeline_prefix = mk_grid_pipeline("prefix");
         let pipeline_scatter = mk_grid_pipeline("scatter");
+
+        // --- Dinámica del color por partícula (color.wgsl) ---
+        let color_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("color.wgsl"),
+            source: wgpu::ShaderSource::Wgsl(
+                format!("{prelude}\n{}", include_str!("shaders/color.wgsl")).into(),
+            ),
+        });
+        let color_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("color layout"),
+            entries: &[uniform_entry(0), rw(1), rw(2)],
+        });
+        let pipeline_color = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+            label: Some("color_step"),
+            layout: Some(&device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: None,
+                bind_group_layouts: &[&color_layout],
+                push_constant_ranges: &[],
+            })),
+            module: &color_shader,
+            entry_point: Some("color_step"),
+            compilation_options: Default::default(),
+            cache: None,
+        });
+        let color_bind = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("color bind"),
+            layout: &color_layout,
+            entries: &[
+                wgpu::BindGroupEntry { binding: 0, resource: params_buf.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 1, resource: hue_buf.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 2, resource: target_hue_buf.as_entire_binding() },
+            ],
+        });
 
         let mk_grid_build_bind = |pos: &wgpu::Buffer| {
             device.create_bind_group(&wgpu::BindGroupDescriptor {
@@ -751,12 +841,15 @@ impl GpuSim {
             bloom_on: params.bloom && params.bloom_intensity > 0.001,
             disc_alpha: params.brightness * (1.0 - params.orient),
             arrow_alpha: params.brightness * params.orient,
+            color_on: false,
+            color_seed: 0,
             clear_pending: true,
             params_buf,
             render_buf,
             pos_bufs: [pos_a, pos_b],
             vel_bufs: [vel_a, vel_b],
             hue_buf,
+            target_hue_buf,
             shape_buf,
             counts_buf,
             starts_buf,
@@ -765,6 +858,7 @@ impl GpuSim {
             pipeline_count,
             pipeline_prefix,
             pipeline_scatter,
+            pipeline_color,
             pipeline_disc,
             pipeline_arrow,
             pipeline_bloom,
@@ -773,6 +867,7 @@ impl GpuSim {
             pipeline_blit_rec,
             compute_bind,
             grid_read_bind,
+            color_bind,
             grid_build_bind,
             render_bind,
             blit_layout,
@@ -797,9 +892,18 @@ impl GpuSim {
     /// así los blends que conduce la CPU (transiciones de escena/interacción/
     /// velocidad, deriva de la matriz) se reflejan al instante, y el grid se
     /// redimensiona en caliente si cambió `r_max`.
-    pub fn upload_params(&mut self, queue: &wgpu::Queue, params: &SimParams, shape: &ShapeDrive) {
+    pub fn upload_params(
+        &mut self,
+        queue: &wgpu::Queue,
+        params: &SimParams,
+        shape: &ShapeDrive,
+        frame_dt: f32,
+    ) {
         self.grid = GridDims::new(self.world, params.r_max);
-        let gp = GpuParams::from(params, self.world, self.count, &self.grid, shape);
+        self.color_seed = self.color_seed.wrapping_add(1);
+        let gp = GpuParams::from(
+            params, self.world, self.count, &self.grid, shape, frame_dt, self.color_seed,
+        );
         queue.write_buffer(&self.params_buf, 0, bytemuck::bytes_of(&gp));
         let rp = RenderParams::from(params, self.world);
         queue.write_buffer(&self.render_buf, 0, bytemuck::bytes_of(&rp));
@@ -808,6 +912,9 @@ impl GpuSim {
         self.bloom_on = params.bloom && params.bloom_intensity > 0.001;
         self.disc_alpha = rp.brightness * (1.0 - rp.orient);
         self.arrow_alpha = rp.brightness * rp.orient;
+        // El suavizado también corre solo, para terminar de converger tras
+        // apagar los saltos/deriva.
+        self.color_on = params.random_color || params.gradual || params.color_smooth;
     }
 
     /// Vuelve a sembrar `n` partículas (≤ capacidad) con posición aleatoria y
@@ -821,6 +928,7 @@ impl GpuSim {
             queue.write_buffer(&self.pos_bufs[self.flip], 0, bytemuck::cast_slice(&pos));
             queue.write_buffer(&self.vel_bufs[self.flip], 0, bytemuck::cast_slice(&vel));
             queue.write_buffer(&self.hue_buf, 0, bytemuck::cast_slice(&hue));
+            queue.write_buffer(&self.target_hue_buf, 0, bytemuck::cast_slice(&hue));
         }
         self.count = n;
         // Los datos frescos viven en el buffer fuente del sentido `flip`:
@@ -838,11 +946,14 @@ impl GpuSim {
         n as u32
     }
 
-    /// Tiñe del matiz indicado las primeras `n` partículas (las de la forma).
+    /// Tiñe del matiz indicado las primeras `n` partículas (las de la forma);
+    /// también fija su matiz objetivo (como `tint_shape` en la CPU).
     pub fn tint(&self, queue: &wgpu::Queue, n: u32, hue: f32) {
         let n = n.min(self.capacity) as usize;
         if n > 0 {
-            queue.write_buffer(&self.hue_buf, 0, bytemuck::cast_slice(&vec![hue; n]));
+            let hues = vec![hue; n];
+            queue.write_buffer(&self.hue_buf, 0, bytemuck::cast_slice(&hues));
+            queue.write_buffer(&self.target_hue_buf, 0, bytemuck::cast_slice(&hues));
         }
     }
 
@@ -895,6 +1006,17 @@ impl GpuSim {
         paused: bool,
     ) {
         if !paused && self.count > 0 {
+            // Dinámica del color por partícula, antes de las fuerzas (como
+            // `apply_dynamics` en la CPU).
+            if self.color_on {
+                let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                    label: Some("color"),
+                    timestamp_writes: None,
+                });
+                pass.set_pipeline(&self.pipeline_color);
+                pass.set_bind_group(0, &self.color_bind, &[]);
+                pass.dispatch_workgroups(self.count.div_ceil(256), 1, 1);
+            }
             if self.use_grid {
                 self.build_grid(encoder);
             }

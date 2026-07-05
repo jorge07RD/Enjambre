@@ -682,6 +682,7 @@ fn apply_local_event(
         PanelEvent::Clear => sim.clear(),
         PanelEvent::Fill(n) => sim.spawn_random(n, rng),
         PanelEvent::StartTransition(snap) => params.start_transition(snap),
+        PanelEvent::MatrixBlend(snap) => params.start_matrix_blend(snap),
         PanelEvent::SetSpeed(v) => params.set_speed(v),
         PanelEvent::FitCanvas => {
             st.zoom_level = (canvas.x / world.x)
@@ -1044,7 +1045,7 @@ async fn main() {
                     BeatAction::RandomizeMatrix => {
                         let snap = params.current_snapshot();
                         params.randomize_matrix(&mut rng);
-                        params.start_transition(snap);
+                        params.start_matrix_blend(snap);
                         if mode == AppMode::Detached {
                             pending_apply = Some(params.clone());
                         }
@@ -1111,7 +1112,7 @@ async fn main() {
                 if auto_rng_timer >= params.auto_randomize_interval.max(0.2) {
                     let snap = params.current_snapshot();
                     params.randomize_matrix(&mut rng);
-                    params.start_transition(snap);
+                    params.start_matrix_blend(snap);
                     auto_rng_timer = 0.0;
                 }
             }
@@ -1291,7 +1292,7 @@ async fn main() {
                 // transicionamos igual que el botón del panel.
                 let snap = params.current_snapshot();
                 params.randomize_matrix(&mut rng);
-                params.start_transition(snap);
+                params.start_matrix_blend(snap);
                 pending_apply = Some(params.clone());
             }
             if is_key_pressed(KeyCode::L) {
@@ -1362,6 +1363,12 @@ async fn main() {
             if is_key_pressed(KeyCode::Y) {
                 // Resplandor cinematográfico (on/off).
                 params.bloom = !params.bloom;
+                pending_apply = Some(params.clone());
+            }
+            if is_key_pressed(KeyCode::U) {
+                // Anti-aglomeración: disolver bolas hiperdensas (on/off), para
+                // comparar con/sin al vuelo.
+                params.anti_clump = !params.anti_clump;
                 pending_apply = Some(params.clone());
             }
             // Velocidad: teclas 1..9 = 10..90 %, tecla 0 = 100 %.

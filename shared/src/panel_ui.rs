@@ -150,8 +150,12 @@ pub enum PanelEvent {
     Clear,
     /// Llenar aleatoriamente con N partículas.
     Fill(usize),
-    /// Iniciar transición de interacción desde `snap` (cambio de modo, etc.).
+    /// Iniciar transición de interacción desde `snap` (cambio de modo, etc.);
+    /// respeta el interruptor de "Transición fluida".
     StartTransition(InteractionSnapshot),
+    /// Cruce SIEMPRE suave de las reglas (aleatorizar/restablecer la matriz),
+    /// aunque la transición fluida global esté apagada.
+    MatrixBlend(InteractionSnapshot),
     /// Fijar una nueva velocidad objetivo (transición suave si está activa).
     SetSpeed(f32),
     /// Empezar/detener la grabación de vídeo.
@@ -427,13 +431,24 @@ pub fn config_panel(
                     ui.add(egui::Slider::new(&mut params.sim_range, 0.02..=0.5).text("Tolerancia de color"));
                 }
                 if params.mode == InteractionMode::Matrix {
-                    if ui.button(format!("{} Aleatorizar reglas (M)", icon::RANDOM)).clicked() {
-                        // La matriz es propiedad del panel: la aleatorizamos aquí
-                        // mismo para que el nuevo estado fluya al `sim` por `State`
-                        // y no lo pise el eco de la matriz anterior.
-                        params.randomize_matrix(&mut ::rand::thread_rng());
-                        trigger = true;
-                    }
+                    ui.horizontal(|ui| {
+                        if ui.button(format!("{} Aleatorizar reglas (M)", icon::RANDOM)).clicked() {
+                            // La matriz es propiedad del panel: la aleatorizamos aquí
+                            // mismo para que el nuevo estado fluya al `sim` por `State`
+                            // y no lo pise el eco de la matriz anterior. El cruce
+                            // (`MatrixBlend`) es suave siempre.
+                            params.randomize_matrix(&mut ::rand::thread_rng());
+                            events.push(PanelEvent::MatrixBlend(snap_before));
+                        }
+                        if ui
+                            .button(format!("{} Restablecer", icon::RESET))
+                            .on_hover_text("Matriz por defecto: cada color se atrae a sí mismo")
+                            .clicked()
+                        {
+                            params.reset_matrix();
+                            events.push(PanelEvent::MatrixBlend(snap_before));
+                        }
+                    });
                     ui.checkbox(&mut params.auto_randomize, "Auto-aleatorizar sola")
                         .on_hover_text("X");
                     if params.auto_randomize {
@@ -518,6 +533,25 @@ pub fn config_panel(
                 ui.selectable_value(&mut params.boundary, Boundary::Wrap, "Toroidal");
                 ui.selectable_value(&mut params.boundary, Boundary::Bounce, "Rebote");
             });
+            ui.checkbox(&mut params.anti_clump, "Disolver aglomeraciones densas")
+                .on_hover_text("U · compara con/sin al vuelo");
+            if params.anti_clump {
+                ui.add(
+                    egui::Slider::new(&mut params.anti_clump_factor, 1.5..=10.0)
+                        .text("Umbral (× densidad media)"),
+                );
+                ui.add(
+                    egui::Slider::new(&mut params.anti_clump_strength, 0.0..=3.0)
+                        .text("Fuerza de dispersión"),
+                );
+                ui.label(
+                    egui::RichText::new(
+                        "Las bolas hiperpobladas se dispersan con suavidad en vez de vibrar.",
+                    )
+                    .weak()
+                    .small(),
+                );
+            }
             ui.checkbox(
                 &mut params.attract_active,
                 "Atraer zonas activas al centro (A)",

@@ -376,6 +376,17 @@ pub struct SimParams {
     /// Intervalo (s) entre aleatorizados automáticos de la matriz.
     pub auto_randomize_interval: f32,
 
+    // --- Anti-aglomeración ---
+    /// Si está activo, las bolas hiperdensas (partículas con muchos más
+    /// vecinos que la densidad media) se disuelven con suavidad en vez de
+    /// apilarse y vibrar violentamente.
+    pub anti_clump: bool,
+    /// Umbral de detección, como múltiplo de los vecinos esperados por la
+    /// densidad media dentro de `r_max`.
+    pub anti_clump_factor: f32,
+    /// Fuerza de la dispersión hacia fuera del centro local (0..~3).
+    pub anti_clump_strength: f32,
+
     // --- Recentrado de zonas activas ---
     /// Si está activo, las partículas en zonas densas (mucha actividad) sienten
     /// una atracción leve hacia el centro de la vista, para traer la acción de
@@ -500,6 +511,9 @@ impl Default for SimParams {
             speed_blend: 1.0,
             auto_randomize: false,
             auto_randomize_interval: 8.0,
+            anti_clump: true,
+            anti_clump_factor: 3.0,
+            anti_clump_strength: 1.0,
             attract_active: false,
             attract_active_strength: 0.4,
             boids_scope: BoidsScope::Hybrid,
@@ -553,7 +567,9 @@ impl SimParams {
     #[inline]
     pub fn interaction(&self, hue_a: f32, hue_b: f32) -> f32 {
         let target = self.target_coef(hue_a, hue_b);
-        if self.blend >= 1.0 || !self.smooth {
+        // Solo el blend gobierna: `start_transition` respeta el interruptor de
+        // transición fluida, pero `start_matrix_blend` cruza siempre.
+        if self.blend >= 1.0 {
             return target;
         }
         let from = self.from_state.coef(hue_a, hue_b);
@@ -581,6 +597,23 @@ impl SimParams {
             self.blend = 0.0;
         } else {
             self.blend = 1.0;
+        }
+    }
+
+    /// Arranca el cruce SIEMPRE, aunque la transición fluida global esté
+    /// apagada: para aleatorizar/restablecer la matriz, que debe fundirse
+    /// suave y no dar un salto brusco.
+    pub fn start_matrix_blend(&mut self, from: InteractionSnapshot) {
+        self.from_state = from;
+        self.blend = 0.0;
+    }
+
+    /// Restablece la matriz a su valor por defecto (identidad: cada color se
+    /// atrae a sí mismo y es neutral con el resto).
+    pub fn reset_matrix(&mut self) {
+        self.matrix = [[0.0; NUM_COLORS]; NUM_COLORS];
+        for i in 0..NUM_COLORS {
+            self.matrix[i][i] = 1.0;
         }
     }
 
@@ -649,6 +682,8 @@ impl SimParams {
         self.gradual_matrix_speed = l(from.gradual_matrix_speed, target.gradual_matrix_speed);
         self.attract_active_strength = l(from.attract_active_strength, target.attract_active_strength);
         self.auto_randomize_interval = l(from.auto_randomize_interval, target.auto_randomize_interval);
+        self.anti_clump_factor = l(from.anti_clump_factor, target.anti_clump_factor);
+        self.anti_clump_strength = l(from.anti_clump_strength, target.anti_clump_strength);
         self.boids_separation = l(from.boids_separation, target.boids_separation);
         self.boids_alignment = l(from.boids_alignment, target.boids_alignment);
         self.boids_cohesion = l(from.boids_cohesion, target.boids_cohesion);

@@ -130,6 +130,9 @@ struct Acc {
     ali: vec2f,
     coh: vec2f,
     grp: vec2f,
+    // Suma de vectores a los vecinos: apunta al centro de masa local (para
+    // la dispersión anti-aglomeración).
+    crowd: vec2f,
     flock_n: u32,
     neighbors: u32,
 }
@@ -150,6 +153,7 @@ fn accumulate(i: u32, pi: vec2f, hi: f32, bi: u32, j: u32, A: ptr<function, Acc>
         return;
     }
     (*A).neighbors += 1u;
+    (*A).crowd += d;
     let dist = sqrt(d2);
     // Interacción texto ↔ fondo (= la CPU): se ignoran mutuamente y el fondo
     // esquiva al texto para no invadir las letras.
@@ -239,6 +243,17 @@ fn integrate(i: u32, pi: vec2f, acc: vec2f) {
 // fuerzas de la CPU).
 fn finish(i: u32, pi: vec2f, A: Acc) {
     var acc = A.acc;
+    // Anti-aglomeración (= la CPU): con muchos más vecinos que la media, se
+    // calman las fuerzas de pareja y se empuja suavemente hacia fuera del
+    // centro local para que la bola se disuelva desde el borde.
+    if P.clump_thr > 0.0 && f32(A.neighbors) > P.clump_thr {
+        let over = min((f32(A.neighbors) - P.clump_thr) / P.clump_thr, 1.0);
+        acc *= 1.0 - 0.7 * over;
+        let len = length(A.crowd);
+        if len > 1e-4 {
+            acc -= (A.crowd / len) * (over * P.clump_strength);
+        }
+    }
     if P.boids_mix > 0.0 {
         var b = A.sep * P.w_sep + A.grp * P.w_grp;
         if A.flock_n > 0u {

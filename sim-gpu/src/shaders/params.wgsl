@@ -54,6 +54,22 @@ struct Params {
     shape_k: f32,
     shape_inter: f32,
     shape_avoid: f32,
+    // Dinámica del color por partícula (ver color.wgsl); las tasas llegan ya
+    // escaladas por el paso (`time_scale`) desde la CPU.
+    random_color: u32,
+    p_switch: f32,
+    gradual: u32,
+    color_drift: f32,
+    color_smooth: u32,
+    color_lerp: f32,
+    color_seed: u32,
+    _pad2: u32,
+    // Anti-aglomeración: umbral ABSOLUTO de vecinos (precalculado de la
+    // densidad media en la CPU; 0 = desactivado) y fuerza de dispersión.
+    clump_thr: f32,
+    clump_strength: f32,
+    _pad3: f32,
+    _pad4: f32,
     // Matrices 6×6 empaquetadas en 9 vec4 (alineación de uniform): la del
     // modo objetivo y la congelada de la transición.
     matrix: array<vec4f, 9>,
