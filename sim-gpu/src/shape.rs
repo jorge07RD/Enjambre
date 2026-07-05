@@ -7,6 +7,39 @@
 use ab_glyph::{Font, FontVec, PxScale, ScaleFont};
 use rand::Rng;
 
+/// Fisher–Yates parcial: deja `on` con como mucho `count` elementos.
+fn partial_shuffle(on: &mut Vec<(usize, usize)>, count: usize, rng: &mut impl Rng) {
+    if on.len() > count {
+        for k in 0..count {
+            let j = rng.gen_range(k..on.len());
+            on.swap(k, j);
+        }
+        on.truncate(count);
+    }
+}
+
+/// Mapea píxeles (px,py) a puntos de mundo, preservando aspecto, centrado al
+/// 90% de la caja. `flip_y` compensa que el origen de fila 0 de una imagen de
+/// disco es la parte de ARRIBA de la foto tal como se ve normalmente, pero
+/// necesita invertirse para que no aparezca boca abajo en el mundo (el texto,
+/// que ya rasteriza con el origen correcto, no lo necesita).
+fn map_points(on: &[(usize, usize)], w: usize, h: usize, world: [f32; 2], flip_y: bool) -> Vec<[f32; 2]> {
+    let iw = w as f32;
+    let ih = h as f32;
+    let scale = (world[0] * 0.9 / iw).min(world[1] * 0.9 / ih);
+    let (cx, cy) = (world[0] * 0.5, world[1] * 0.5);
+    on.iter()
+        .map(|&(px, py)| {
+            let sx = (px as f32 + 0.5) / iw;
+            let mut sy = (py as f32 + 0.5) / ih;
+            if flip_y {
+                sy = 1.0 - sy;
+            }
+            [cx + (sx - 0.5) * iw * scale, cy + (sy - 0.5) * ih * scale]
+        })
+        .collect()
+}
+
 /// Máscara de píxeles "encendidos" → puntos de mundo: submuestrea a `count`
 /// (Fisher–Yates parcial) y ajusta la caja al lienzo con margen, preservando
 /// el aspecto (= final de `image_to_points` de la CPU).
@@ -17,29 +50,67 @@ fn points_from_mask(
     world: [f32; 2],
     count: usize,
     rng: &mut impl Rng,
+    flip_y: bool,
 ) -> Vec<[f32; 2]> {
     if on.is_empty() || w == 0 || h == 0 {
         return Vec::new();
     }
+    partial_shuffle(&mut on, count.max(1), rng);
+    map_points(&on, w, h, world, flip_y)
+}
+
+/// Puntos meta (mundo) de una rejilla `~count` sobre la caja de la foto
+/// (centro `c`, extensión `e`), pero SOLO en las celdas con píxel opaco: en un
+/// PNG sin fondo, las partículas se reclutan únicamente donde hay imagen (las
+/// zonas transparentes se quedan sin partículas). `rgba`/`w`/`h` es la imagen.
+/// Las coordenadas coinciden con las de la textura superpuesta (fila 0 =
+/// arriba), así el mosaico y la imagen quedan alineados.
+pub fn mosaic_points(
+    rgba: &[u8],
+    w: usize,
+    h: usize,
+    c: [f32; 2],
+    e: [f32; 2],
+    count: usize,
+) -> Vec<[f32; 2]> {
     let count = count.max(1);
-    if on.len() > count {
-        for k in 0..count {
-            let j = rng.gen_range(k..on.len());
-            on.swap(k, j);
-        }
-        on.truncate(count);
+    if w == 0 || h == 0 {
+        return Vec::new();
     }
-    let iw = w as f32;
-    let ih = h as f32;
-    let scale = (world[0] * 0.9 / iw).min(world[1] * 0.9 / ih);
-    let (cx, cy) = (world[0] * 0.5, world[1] * 0.5);
-    on.iter()
-        .map(|&(px, py)| {
-            let sx = (px as f32 + 0.5) / iw;
-            let sy = (py as f32 + 0.5) / ih;
-            [cx + (sx - 0.5) * iw * scale, cy + (sy - 0.5) * ih * scale]
-        })
-        .collect()
+    let aspect = (e[0] / e[1].max(1e-3)).max(1e-3);
+    let cols = ((count as f32 * aspect).sqrt().round().max(1.0)) as usize;
+    let rows = ((count as f32 / aspect).sqrt().round().max(1.0)) as usize;
+    let (x0, y0) = (c[0] - e[0] * 0.5, c[1] - e[1] * 0.5);
+    let mut pts = Vec::with_capacity(cols * rows);
+    for gy in 0..rows {
+        let py = (((gy as f32 + 0.5) / rows as f32 * h as f32) as usize).min(h - 1);
+        let wy = y0 + (gy as f32 + 0.5) / rows as f32 * e[1];
+        for gx in 0..cols {
+            let px = (((gx as f32 + 0.5) / cols as f32 * w as f32) as usize).min(w - 1);
+            if rgba[(py * w + px) * 4 + 3] > 128 {
+                let wx = x0 + (gx as f32 + 0.5) / cols as f32 * e[0];
+                pts.push([wx, wy]);
+            }
+        }
+    }
+    pts
+}
+
+/// Decodifica una imagen de disco a RGBA8 crudo + dimensiones, para subirla
+/// como textura y muestrearla bajo el enjambre (modo "recrear los colores de
+/// la foto"). `None` si no se pudo abrir/decodificar.
+pub fn decode_image_rgba(path: &str) -> Option<(Vec<u8>, u32, u32)> {
+    match image::open(path) {
+        Ok(img) => {
+            let rgba = img.to_rgba8();
+            let (w, h) = (rgba.width(), rgba.height());
+            Some((rgba.into_raw(), w, h))
+        }
+        Err(e) => {
+            eprintln!("No pude abrir/decodificar la imagen '{path}': {e}");
+            None
+        }
+    }
 }
 
 /// Umbraliza una imagen RGBA: por alfa si la imagen usa transparencia de
@@ -100,6 +171,7 @@ pub fn image_points_from_path(
         world,
         count,
         rng,
+        true,
     ))
 }
 
@@ -192,7 +264,7 @@ pub fn text_to_points(
             }
         }
     }
-    points_from_mask(on, w, h, world, count, rng)
+    points_from_mask(on, w, h, world, count, rng, false)
 }
 
 #[cfg(test)]

@@ -266,6 +266,22 @@ impl GpuParams {
     }
 }
 
+/// Datos del "revelado" de una foto encima del enjambre (los calcula
+/// `main.rs`): cada partícula muestrea la textura de la foto en su posición
+/// actual y funde su color hacia el de la foto según `reveal`. `center`/
+/// `extent` son la caja de la foto en coordenadas de mundo (fuera de ella no
+/// Color del mosaico (fase A): las primeras `n` partículas (reclutadas)
+/// funden su color hacia el de la foto en su posición mientras se acomodan.
+/// Lo calcula `main.rs`.
+#[derive(Clone, Copy, Default)]
+pub struct Mosaic {
+    pub on: bool,
+    pub reveal: f32,
+    pub n: u32,
+    pub center: [f32; 2],
+    pub extent: [f32; 2],
+}
+
 /// Uniform del render (ver particles.wgsl / post.wgsl).
 #[repr(C)]
 #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
@@ -280,10 +296,16 @@ struct RenderParams {
     bloom_radius: f32,
     trail_fade: f32,
     _pad: f32,
+    mosaic_on: u32,
+    mosaic_reveal: f32,
+    mosaic_n: u32,
+    _pad2: u32,
+    photo_center: [f32; 2],
+    photo_extent: [f32; 2],
 }
 
 impl RenderParams {
-    fn from(params: &SimParams, world: [f32; 2]) -> Self {
+    fn from(params: &SimParams, world: [f32; 2], mosaic: &Mosaic) -> Self {
         Self {
             // Mundo completo a NDC; la Y del mundo crece hacia abajo.
             scale: [2.0 / world[0], -2.0 / world[1]],
@@ -296,8 +318,24 @@ impl RenderParams {
             bloom_radius: params.bloom_radius,
             trail_fade: params.trail_fade.clamp(0.0, 1.0),
             _pad: 0.0,
+            mosaic_on: (mosaic.on && mosaic.reveal > 0.001) as u32,
+            mosaic_reveal: mosaic.reveal,
+            mosaic_n: mosaic.n,
+            _pad2: 0,
+            photo_center: mosaic.center,
+            photo_extent: mosaic.extent,
         }
     }
+}
+
+/// Uniform del pase de superposición de la foto (ver photo.wgsl): la mitad de
+/// la caja de la foto en NDC (para el quad) y la opacidad del fundido.
+#[repr(C)]
+#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+struct PhotoOverlay {
+    half: [f32; 2],
+    reveal: f32,
+    _pad: f32,
 }
 
 /// Dimensiones del grid (celda = r_max). Se recalculan al subir parámetros;
@@ -375,6 +413,17 @@ pub struct GpuSim {
     grid_build_bind: [wgpu::BindGroup; 2],
     /// Bind groups del render para leer el buffer recién escrito (B, A).
     render_bind: [wgpu::BindGroup; 2],
+    /// Layout del render, para recrear `render_bind` al cambiar la foto.
+    render_layout: wgpu::BindGroupLayout,
+    // Superposición de la foto (fundido encima de la escena).
+    pipeline_photo: wgpu::RenderPipeline,
+    pipeline_photo_rec: wgpu::RenderPipeline,
+    /// Layout del overlay, para recrear `overlay_bind` al cambiar la foto.
+    photo_layout: wgpu::BindGroupLayout,
+    overlay_buf: wgpu::Buffer,
+    overlay_bind: wgpu::BindGroup,
+    /// Vista de la textura de la foto activa; 1×1 vacía si no hay foto.
+    photo_view: wgpu::TextureView,
     blit_layout: wgpu::BindGroupLayout,
     blit_bind: wgpu::BindGroup,
     sampler: wgpu::Sampler,
@@ -488,7 +537,7 @@ impl GpuSim {
         });
         let render_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("render params"),
-            contents: bytemuck::bytes_of(&RenderParams::from(params, world)),
+            contents: bytemuck::bytes_of(&RenderParams::from(params, world, &Mosaic::default())),
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
         });
 
@@ -697,6 +746,50 @@ impl GpuSim {
                 vs_ro(1),
                 vs_ro(2),
                 vs_ro(3),
+                // Textura de la foto + sampler para el color del mosaico
+                // (se muestrean en el vértice → visibilidad VERTEX).
+                wgpu::BindGroupLayoutEntry {
+                    binding: 4,
+                    visibility: wgpu::ShaderStages::VERTEX,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 5,
+                    visibility: wgpu::ShaderStages::VERTEX,
+                    ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                    count: None,
+                },
+            ],
+        });
+        // Superposición de la foto (photo.wgsl): uniform + textura + sampler.
+        let photo_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("photo overlay layout"),
+            entries: &[
+                wgpu::BindGroupLayoutEntry {
+                    visibility: wgpu::ShaderStages::VERTEX_FRAGMENT,
+                    ..uniform_entry(0)
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 1,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 2,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                    count: None,
+                },
             ],
         });
         let blit_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
@@ -808,26 +901,54 @@ impl GpuSim {
             None, TriangleList, wgpu::TextureFormat::Rgba8Unorm,
         );
 
-        let mk_render_bind = |pos: &wgpu::Buffer, vel: &wgpu::Buffer| {
-            device.create_bind_group(&wgpu::BindGroupDescriptor {
-                label: Some("render bind"),
-                layout: &render_layout,
-                entries: &[
-                    wgpu::BindGroupEntry { binding: 0, resource: render_buf.as_entire_binding() },
-                    wgpu::BindGroupEntry { binding: 1, resource: pos.as_entire_binding() },
-                    wgpu::BindGroupEntry { binding: 2, resource: hue_buf.as_entire_binding() },
-                    wgpu::BindGroupEntry { binding: 3, resource: vel.as_entire_binding() },
-                ],
-            })
-        };
-        // Tras el paso A→B se pinta B; tras B→A se pinta A.
-        let render_bind = [mk_render_bind(&pos_b, &vel_b), mk_render_bind(&pos_a, &vel_a)];
+        // Superposición de la foto (photo.wgsl): un quad con mezcla alfa que se
+        // funde encima de la escena. Dos pipelines: superficie y grabación.
+        let photo_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("photo.wgsl"),
+            source: wgpu::ShaderSource::Wgsl(include_str!("shaders/photo.wgsl").into()),
+        });
+        let photo_pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: None,
+            bind_group_layouts: &[&photo_layout],
+            push_constant_ranges: &[],
+        });
+        let pipeline_photo = mk_render_pipeline(
+            "foto overlay", &photo_shader, &photo_pipeline_layout, "vs_photo", "fs_photo",
+            Some(wgpu::BlendState::ALPHA_BLENDING), TriangleStrip, surface_format,
+        );
+        let pipeline_photo_rec = mk_render_pipeline(
+            "foto overlay rec", &photo_shader, &photo_pipeline_layout, "vs_photo", "fs_photo",
+            Some(wgpu::BlendState::ALPHA_BLENDING), TriangleStrip, wgpu::TextureFormat::Rgba8Unorm,
+        );
+        let overlay_buf = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("photo overlay uniform"),
+            size: std::mem::size_of::<PhotoOverlay>() as u64,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
 
         let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
             mag_filter: wgpu::FilterMode::Linear,
             min_filter: wgpu::FilterMode::Linear,
             ..Default::default()
         });
+        // Textura de la foto: arranca 1×1 vacía; `upload_photo` la sustituye y
+        // recrea `overlay_bind`.
+        let photo_view = make_empty_photo(device);
+        let overlay_bind =
+            make_overlay_bind(device, &photo_layout, &overlay_buf, &photo_view, &sampler);
+        // Tras el paso A→B se pinta B; tras B→A se pinta A.
+        let render_bind = make_render_binds(
+            device,
+            &render_layout,
+            &render_buf,
+            [&pos_b, &pos_a],
+            [&vel_b, &vel_a],
+            &hue_buf,
+            &photo_view,
+            &sampler,
+        );
+
         let offscreen_view = make_offscreen(device, size.0, size.1);
         let blit_bind = mk_blit_bind(device, &blit_layout, &offscreen_view, &sampler);
 
@@ -870,6 +991,13 @@ impl GpuSim {
             color_bind,
             grid_build_bind,
             render_bind,
+            render_layout,
+            pipeline_photo,
+            pipeline_photo_rec,
+            photo_layout,
+            overlay_buf,
+            overlay_bind,
+            photo_view,
             blit_layout,
             blit_bind,
             sampler,
@@ -897,6 +1025,7 @@ impl GpuSim {
         queue: &wgpu::Queue,
         params: &SimParams,
         shape: &ShapeDrive,
+        mosaic: &Mosaic,
         frame_dt: f32,
     ) {
         self.grid = GridDims::new(self.world, params.r_max);
@@ -905,7 +1034,7 @@ impl GpuSim {
             params, self.world, self.count, &self.grid, shape, frame_dt, self.color_seed,
         );
         queue.write_buffer(&self.params_buf, 0, bytemuck::bytes_of(&gp));
-        let rp = RenderParams::from(params, self.world);
+        let rp = RenderParams::from(params, self.world, mosaic);
         queue.write_buffer(&self.render_buf, 0, bytemuck::bytes_of(&rp));
         // Si las estelas se acaban de apagar, el Clear por frame ya limpia.
         self.trails = params.trails;
@@ -944,6 +1073,66 @@ impl GpuSim {
             queue.write_buffer(&self.shape_buf, 0, bytemuck::cast_slice(&pts[..n]));
         }
         n as u32
+    }
+
+    /// Sube la foto (RGBA8) como textura para la superposición y recrea el
+    /// bind group del overlay. Se llama al elegir/cambiar la imagen en modo
+    /// "recrear colores de la foto".
+    pub fn upload_photo(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, rgba: &[u8], w: u32, h: u32) {
+        self.photo_view = make_photo_texture(device, queue, rgba, w, h);
+        // La textura la leen tanto el mosaico (render de partículas) como la
+        // superposición: recreamos ambos bind groups.
+        self.render_bind = make_render_binds(
+            device,
+            &self.render_layout,
+            &self.render_buf,
+            [&self.pos_bufs[1], &self.pos_bufs[0]],
+            [&self.vel_bufs[1], &self.vel_bufs[0]],
+            &self.hue_buf,
+            &self.photo_view,
+            &self.sampler,
+        );
+        self.overlay_bind = make_overlay_bind(
+            device,
+            &self.photo_layout,
+            &self.overlay_buf,
+            &self.photo_view,
+            &self.sampler,
+        );
+    }
+
+    /// Dibuja la foto como una capa que se funde encima de `view` (superficie
+    /// o textura de grabación). `half` es la mitad de la caja de la foto en
+    /// NDC y `reveal` la opacidad (0 = nada, 1 = foto completa). No hace nada
+    /// si `reveal` es ~0.
+    pub fn draw_photo(
+        &self,
+        encoder: &mut wgpu::CommandEncoder,
+        queue: &wgpu::Queue,
+        view: &wgpu::TextureView,
+        rec: bool,
+        half: [f32; 2],
+        reveal: f32,
+    ) {
+        if reveal <= 0.001 {
+            return;
+        }
+        let ov = PhotoOverlay { half, reveal, _pad: 0.0 };
+        queue.write_buffer(&self.overlay_buf, 0, bytemuck::bytes_of(&ov));
+        let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+            label: Some("foto overlay"),
+            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                view,
+                resolve_target: None,
+                ops: wgpu::Operations { load: wgpu::LoadOp::Load, store: wgpu::StoreOp::Store },
+            })],
+            depth_stencil_attachment: None,
+            timestamp_writes: None,
+            occlusion_query_set: None,
+        });
+        pass.set_pipeline(if rec { &self.pipeline_photo_rec } else { &self.pipeline_photo });
+        pass.set_bind_group(0, &self.overlay_bind, &[]);
+        pass.draw(0..4, 0..1);
     }
 
     /// Tiñe del matiz indicado las primeras `n` partículas (las de la forma);
@@ -1181,6 +1370,119 @@ fn mk_blit_bind(
         layout,
         entries: &[
             wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::TextureView(view) },
+            wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::Sampler(sampler) },
+        ],
+    })
+}
+
+/// Textura 1×1 vacía para la foto (placeholder mientras no hay imagen; nunca
+/// se muestrea de verdad porque `photo_on = 0`).
+fn make_empty_photo(device: &wgpu::Device) -> wgpu::TextureView {
+    let tex = device.create_texture(&wgpu::TextureDescriptor {
+        label: Some("foto vacía"),
+        size: wgpu::Extent3d { width: 1, height: 1, depth_or_array_layers: 1 },
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format: wgpu::TextureFormat::Rgba8Unorm,
+        usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+        view_formats: &[],
+    });
+    tex.create_view(&wgpu::TextureViewDescriptor::default())
+}
+
+/// Sube una imagen RGBA8 (`w`×`h`) a una textura nueva y devuelve su vista,
+/// para el revelado de la foto.
+fn make_photo_texture(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    rgba: &[u8],
+    w: u32,
+    h: u32,
+) -> wgpu::TextureView {
+    let (w, h) = (w.max(1), h.max(1));
+    let tex = device.create_texture(&wgpu::TextureDescriptor {
+        label: Some("foto"),
+        size: wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 },
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format: wgpu::TextureFormat::Rgba8Unorm,
+        usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+        view_formats: &[],
+    });
+    queue.write_texture(
+        wgpu::TexelCopyTextureInfo {
+            texture: &tex,
+            mip_level: 0,
+            origin: wgpu::Origin3d::ZERO,
+            aspect: wgpu::TextureAspect::All,
+        },
+        rgba,
+        wgpu::TexelCopyBufferLayout {
+            offset: 0,
+            bytes_per_row: Some(4 * w),
+            rows_per_image: Some(h),
+        },
+        wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 },
+    );
+    tex.create_view(&wgpu::TextureViewDescriptor::default())
+}
+
+/// (Re)crea los dos bind groups del render (uno por sentido del ping-pong),
+/// incluida la textura de la foto para el color del mosaico.
+#[allow(clippy::too_many_arguments)]
+fn make_render_binds(
+    device: &wgpu::Device,
+    layout: &wgpu::BindGroupLayout,
+    render_buf: &wgpu::Buffer,
+    pos: [&wgpu::Buffer; 2],
+    vel: [&wgpu::Buffer; 2],
+    hue_buf: &wgpu::Buffer,
+    photo_view: &wgpu::TextureView,
+    sampler: &wgpu::Sampler,
+) -> [wgpu::BindGroup; 2] {
+    let mk = |pos: &wgpu::Buffer, vel: &wgpu::Buffer| {
+        device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("render bind"),
+            layout,
+            entries: &[
+                wgpu::BindGroupEntry { binding: 0, resource: render_buf.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 1, resource: pos.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 2, resource: hue_buf.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 3, resource: vel.as_entire_binding() },
+                wgpu::BindGroupEntry {
+                    binding: 4,
+                    resource: wgpu::BindingResource::TextureView(photo_view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 5,
+                    resource: wgpu::BindingResource::Sampler(sampler),
+                },
+            ],
+        })
+    };
+    [mk(pos[0], vel[0]), mk(pos[1], vel[1])]
+}
+
+/// (Re)crea el bind group de la superposición de la foto (uniform + textura +
+/// sampler); se rehace al cambiar la textura de la foto.
+fn make_overlay_bind(
+    device: &wgpu::Device,
+    layout: &wgpu::BindGroupLayout,
+    overlay_buf: &wgpu::Buffer,
+    photo_view: &wgpu::TextureView,
+    sampler: &wgpu::Sampler,
+) -> wgpu::BindGroup {
+    device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: Some("photo overlay bind"),
+        layout,
+        entries: &[
+            wgpu::BindGroupEntry { binding: 0, resource: overlay_buf.as_entire_binding() },
+            wgpu::BindGroupEntry {
+                binding: 1,
+                resource: wgpu::BindingResource::TextureView(photo_view),
+            },
             wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::Sampler(sampler) },
         ],
     })

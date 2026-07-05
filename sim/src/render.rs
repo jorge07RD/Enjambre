@@ -7,6 +7,28 @@ use shared::{color_for_hue, RenderStyle, SimParams};
 /// internos del batcher de macroquad para `draw_mesh`.
 const CHUNK: usize = 800;
 
+/// Color de la partícula `i` en fase A del efecto foto: su matiz normal,
+/// fundido hacia el color de la foto en su posición según se acomoda
+/// (`shape_ease`). Solo las reclutadas (las primeras `shape.len()`); el resto
+/// conserva su color. Sin foto o fuera de su caja, color normal.
+fn particle_rgb(sim: &Simulation, i: usize, pos: Vec2, hue: f32) -> [f32; 3] {
+    let base = color_for_hue(hue);
+    let recruited = sim.shape.as_ref().map_or(0, |s| s.len());
+    if i < recruited {
+        if let Some(photo) = sim.photo.as_ref() {
+            if let Some(target) = photo.color_at(pos) {
+                let t = sim.shape_ease();
+                return [
+                    base[0] + (target[0] - base[0]) * t,
+                    base[1] + (target[1] - base[1]) * t,
+                    base[2] + (target[2] - base[2]) * t,
+                ];
+            }
+        }
+    }
+    base
+}
+
 pub struct Renderer {
     glow: Texture2D,
     solid: Texture2D,
@@ -57,6 +79,23 @@ impl Renderer {
         if arrow_amt > 0.003 {
             self.draw_arrows(sim, params, alpha * arrow_amt);
         }
+        // Fase B: la foto real se funde ENCIMA del mosaico de partículas.
+        let reveal = sim.overlay_ease();
+        if reveal > 0.001 {
+            if let Some(photo) = sim.photo.as_ref() {
+                let origin = photo.origin();
+                draw_texture_ex(
+                    &photo.tex,
+                    origin.x,
+                    origin.y,
+                    Color::new(1.0, 1.0, 1.0, reveal),
+                    DrawTextureParams {
+                        dest_size: Some(photo.extent),
+                        ..Default::default()
+                    },
+                );
+            }
+        }
     }
 
     /// Dibuja un halo suave y grande por partícula con mezcla ADITIVA (los
@@ -72,14 +111,15 @@ impl Renderer {
         let ga = (a * params.bloom_intensity * 0.5).clamp(0.0, 1.0);
         self.mesh.texture = Some(self.glow.clone());
         gl_use_material(mat);
-        for chunk in sim.particles.chunks(CHUNK) {
+        for (ci, chunk) in sim.particles.chunks(CHUNK).enumerate() {
             let verts = &mut self.mesh.vertices;
             let inds = &mut self.mesh.indices;
             verts.clear();
             inds.clear();
-            for p in chunk {
+            for (j, p) in chunk.iter().enumerate() {
                 let base = verts.len() as u16;
-                let [r, g, b] = color_for_hue(p.hue);
+                let idx = ci * CHUNK + j;
+                let [r, g, b] = particle_rgb(sim, idx, p.pos, p.hue);
                 let c = Color::new(r, g, b, ga);
                 let (x, y) = (p.pos.x, p.pos.y);
                 verts.push(Vertex::new(x - s, y - s, 0.0, 0.0, 0.0, c));
@@ -109,15 +149,16 @@ impl Renderer {
         };
         self.mesh.texture = Some(tex.clone());
 
-        for chunk in sim.particles.chunks(CHUNK) {
+        for (ci, chunk) in sim.particles.chunks(CHUNK).enumerate() {
             let verts = &mut self.mesh.vertices;
             let inds = &mut self.mesh.indices;
             verts.clear();
             inds.clear();
 
-            for p in chunk {
+            for (j, p) in chunk.iter().enumerate() {
                 let base = verts.len() as u16;
-                let [r, g, b] = color_for_hue(p.hue);
+                let idx = ci * CHUNK + j;
+                let [r, g, b] = particle_rgb(sim, idx, p.pos, p.hue);
                 let c = Color::new(r, g, b, a);
                 let (x, y) = (p.pos.x, p.pos.y);
                 verts.push(Vertex::new(x - s, y - s, 0.0, 0.0, 0.0, c));
@@ -135,15 +176,16 @@ impl Renderer {
     fn draw_arrows(&mut self, sim: &Simulation, params: &SimParams, a: f32) {
         self.mesh.texture = None;
         let s = params.point_size * 1.3;
-        for chunk in sim.particles.chunks(CHUNK) {
+        for (ci, chunk) in sim.particles.chunks(CHUNK).enumerate() {
             let verts = &mut self.mesh.vertices;
             let inds = &mut self.mesh.indices;
             verts.clear();
             inds.clear();
 
-            for p in chunk {
+            for (j, p) in chunk.iter().enumerate() {
                 let base = verts.len() as u16;
-                let [r, g, b] = color_for_hue(p.hue);
+                let idx = ci * CHUNK + j;
+                let [r, g, b] = particle_rgb(sim, idx, p.pos, p.hue);
                 let c = Color::new(r, g, b, a);
                 let dir = p.vel.normalize_or(Vec2::X);
                 let perp = Vec2::new(-dir.y, dir.x);

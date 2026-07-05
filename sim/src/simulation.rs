@@ -1,6 +1,6 @@
 use crate::grid::Grid;
 use shared::{hue_bucket, hue_for_index, BoidsScope, Boundary, InteractionMode, SimParams, NUM_COLORS};
-use macroquad::prelude::Vec2;
+use macroquad::prelude::{Texture2D, Vec2};
 use rand::Rng;
 use rayon::prelude::*;
 
@@ -12,6 +12,46 @@ pub struct Particle {
     pub hue: f32,
     /// Matiz objetivo hacia el que transita `hue` (para cambios suaves).
     pub target_hue: f32,
+}
+
+/// Foto activa del efecto en dos fases: (A) las partículas se acomodan a una
+/// rejilla que cubre la imagen y toman su color (`color_at` muestrea los
+/// píxeles); (B) la textura se superpone encima con un fundido (`tex`).
+pub struct Photo {
+    pub tex: Texture2D,
+    bytes: Vec<u8>,
+    w: usize,
+    h: usize,
+    /// Centro de la caja de la foto (mundo).
+    pub center: Vec2,
+    /// Tamaño de la caja de la foto (mundo).
+    pub extent: Vec2,
+}
+
+impl Photo {
+    /// Esquina superior izquierda de la caja (mundo), para dibujar la textura.
+    pub fn origin(&self) -> Vec2 {
+        self.center - self.extent * 0.5
+    }
+
+    /// Color RGB [0,1] de la foto en la posición de mundo `p`, o `None` si `p`
+    /// cae fuera de la caja. La `u`/`v` coinciden con las de la textura
+    /// superpuesta (mismo encuadre), para que el mosaico quede alineado.
+    pub fn color_at(&self, p: Vec2) -> Option<[f32; 3]> {
+        let u = (p.x - self.center.x) / self.extent.x + 0.5;
+        let v = (p.y - self.center.y) / self.extent.y + 0.5;
+        if !(0.0..=1.0).contains(&u) || !(0.0..=1.0).contains(&v) {
+            return None;
+        }
+        let px = ((u * self.w as f32) as usize).min(self.w - 1);
+        let py = ((v * self.h as f32) as usize).min(self.h - 1);
+        let idx = (py * self.w + px) * 4;
+        Some([
+            self.bytes[idx] as f32 / 255.0,
+            self.bytes[idx + 1] as f32 / 255.0,
+            self.bytes[idx + 2] as f32 / 255.0,
+        ])
+    }
 }
 
 pub struct Simulation {
@@ -29,6 +69,13 @@ pub struct Simulation {
     pub shape_blend: f32,
     /// Objetivo de `shape_blend` (1 mientras hay forma, 0 al soltarla).
     shape_target: f32,
+    /// Foto activa del efecto en dos fases (modo recrear colores). Fase A usa
+    /// el sistema de forma (`shape`) para acomodar + colorear las partículas;
+    /// fase B funde la textura encima con `overlay_reveal`. `None` = sin foto.
+    pub photo: Option<Photo>,
+    /// Mezcla 0..1 de la superposición (fase B) y su objetivo.
+    pub overlay_reveal: f32,
+    overlay_target: f32,
     grid: Grid,
     /// Aceleraciones acumuladas por partícula (scratch reutilizado).
     forces: Vec<Vec2>,
@@ -44,6 +91,9 @@ impl Simulation {
             shape: None,
             shape_blend: 0.0,
             shape_target: 0.0,
+            photo: None,
+            overlay_reveal: 0.0,
+            overlay_target: 0.0,
             grid: Grid::new(),
             forces: Vec::new(),
         }
@@ -64,6 +114,75 @@ impl Simulation {
             self.shape_blend = 0.0;
             self.shape_target = 1.0;
         }
+    }
+
+    /// Fija la foto (textura + píxeles `bytes` de `w`×`h`) del efecto: encuadra
+    /// al 90% del lienzo, centrada y con el aspecto preservado. La fase A
+    /// (acomodar + colorear) la arranca `set_shape` con la rejilla; la fase B
+    /// (superposición) empieza en 0.
+    pub fn set_photo(&mut self, tex: Texture2D, bytes: Vec<u8>, w: usize, h: usize) {
+        if w == 0 || h == 0 {
+            return;
+        }
+        let (iw, ih) = (w as f32, h as f32);
+        let scale = (self.world.x * 0.9 / iw).min(self.world.y * 0.9 / ih);
+        self.photo = Some(Photo {
+            tex,
+            bytes,
+            w,
+            h,
+            center: self.world * 0.5,
+            extent: Vec2::new(iw * scale, ih * scale),
+        });
+        self.overlay_reveal = 0.0;
+        self.overlay_target = 0.0;
+    }
+
+    /// Suelta la foto: la superposición baja a 0 (disolución suave). La foto se
+    /// descarta cuando la mezcla de forma y el overlay llegan a 0.
+    pub fn clear_photo(&mut self) {
+        self.overlay_target = 0.0;
+    }
+
+    /// Descarta la foto de golpe (cuando una forma nueva la reemplaza).
+    pub fn drop_photo(&mut self) {
+        self.photo = None;
+        self.overlay_reveal = 0.0;
+        self.overlay_target = 0.0;
+    }
+
+    /// Fija el objetivo de la superposición (fase B): la enciende cuando las
+    /// partículas ya se acomodaron (`shape_blend` alto) y no se está soltando.
+    pub fn set_overlay_target(&mut self, on: bool) {
+        self.overlay_target = if on { 1.0 } else { 0.0 };
+    }
+
+    /// Avanza la superposición hacia su objetivo durante `duration` s. Al
+    /// terminar de ocultarse tras soltar, descarta la foto.
+    pub fn advance_overlay(&mut self, dt: f32, duration: f32) {
+        let step = if duration > 1e-3 { dt / duration } else { 1.0 };
+        if self.overlay_reveal < self.overlay_target {
+            self.overlay_reveal = (self.overlay_reveal + step).min(self.overlay_target);
+        } else if self.overlay_reveal > self.overlay_target {
+            self.overlay_reveal = (self.overlay_reveal - step).max(self.overlay_target);
+        }
+        // Foto descartada cuando ya no queda ni mosaico (forma) ni overlay.
+        if self.overlay_target <= 0.0 && self.overlay_reveal <= 1e-4 && self.shape.is_none() {
+            self.photo = None;
+        }
+    }
+
+    /// Superposición (fase B) ya suavizada (ease-in-out) para el render.
+    pub fn overlay_ease(&self) -> f32 {
+        let r = self.overlay_reveal.clamp(0.0, 1.0);
+        r * r * (3.0 - 2.0 * r)
+    }
+
+    /// Mezcla de aparición de la forma ya suavizada (ease-in-out): el color del
+    /// mosaico (fase A) sigue esta curva a la vez que la posición.
+    pub fn shape_ease(&self) -> f32 {
+        let b = self.shape_blend.clamp(0.0, 1.0);
+        b * b * (3.0 - 2.0 * b)
     }
 
     /// Suelta la forma de forma fluida: la mezcla baja a 0 y, al llegar, se
@@ -245,8 +364,10 @@ impl Simulation {
         // Interacción residual: plena al inicio (blend 0) y baja según la fijación
         // cuando la forma ya está aplicada, para un texto legible pero orgánico.
         let shape_inter = 1.0 - shape_blend * (1.0 - 0.35 * (1.0 - shape_fix));
-        // El texto y el fondo se ignoran entre sí; además el fondo REPELE al texto
-        // (para no invadir las letras). Ganancia de esa evasión (crece con la mezcla).
+        // El texto/figura y el fondo se ignoran entre sí; además el fondo REPELE
+        // a la figura (para no invadirla). Ganancia de esa evasión (crece con la
+        // mezcla). También aplica en modo foto: el enjambre choca/rodea la
+        // imagen, no la atraviesa.
         let shape_avoid = 2.5 * shape_blend;
 
         // Bandada (Boids): física vectorial que sustituye a la fuerza radial.

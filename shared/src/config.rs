@@ -442,6 +442,11 @@ pub struct SimParams {
     pub shape_tint: bool,
     /// Índice de color de la paleta para el tinte de la forma.
     pub shape_color: usize,
+    /// Recrear los colores reales de la foto: cada partícula de la forma
+    /// migra su matiz hacia el de su píxel de origen (mosaico completo), en
+    /// vez de un tinte único. Solo aplica a imágenes (el texto no tiene
+    /// color propio); mutuamente excluyente con `shape_tint` en la UI.
+    pub shape_photo_color: bool,
     /// Descriptor de la forma activa (para poder guardarla en una escena y
     /// reconstruirla al cargarla). Los posee el `sim`. Vacíos = sin forma.
     /// Mensaje de texto activo (prioritario sobre la imagen).
@@ -536,6 +541,7 @@ impl Default for SimParams {
             shape_transition_duration: 1.5,
             shape_tint: false,
             shape_color: 0,
+            shape_photo_color: false,
             shape_text: String::new(),
             shape_image: String::new(),
             bloom: false,

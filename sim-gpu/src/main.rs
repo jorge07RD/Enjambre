@@ -19,7 +19,7 @@ mod gpu_sim;
 mod rec;
 mod shape;
 
-use gpu_sim::{GpuSim, ShapeDrive};
+use gpu_sim::{GpuSim, Mosaic, ShapeDrive};
 use rand::Rng;
 use shared::{
     config_panel, example_store, hue_for_index, ui_theme, PanelEvent, PanelState, SceneStore,
@@ -178,7 +178,15 @@ struct State {
     auto_rand_timer: f32,
     // Formas (texto/imagen) y grabación de vídeo (hito 6).
     shape_store: ShapeStore,
+    // Fase A del efecto foto: las partículas se acomodan a una rejilla que
+    // cubre la imagen (`shape`) y toman su color (mosaico). Fase B: la foto
+    // real se funde encima (`overlay_*`) tras acomodarse. `photo_loaded` = hay
+    // una textura subida; `photo_extent` = caja de la foto en mundo.
     shape: ShapeState,
+    overlay_reveal: f32,
+    overlay_target: f32,
+    photo_extent: [f32; 2],
+    photo_loaded: bool,
     recorder: Option<rec::Recorder>,
     // Panel egui embebido (mismo `config_panel` que `sim` y `panel`).
     panel: PanelState,
@@ -287,6 +295,10 @@ impl State {
             auto_rand_timer: 0.0,
             shape_store,
             shape: ShapeState::default(),
+            overlay_reveal: 0.0,
+            overlay_target: 0.0,
+            photo_extent: [WORLD[0], WORLD[1]],
+            photo_loaded: false,
             recorder: None,
             panel,
             panel_visible: true,
@@ -315,10 +327,21 @@ impl State {
     }
 
     /// (Re)construye la forma desde el descriptor de `params` (= `build_shape`
-    /// de la CPU): rasteriza los puntos meta, los sube y arranca la aparición.
+    /// de la CPU). En modo "recrear colores de la foto" NO se mueve nada: se
+    /// sube la imagen como textura y se revela su color encima del enjambre
+    /// (`start_photo`). En modo texto/silueta las partículas migran a los
+    /// puntos meta con el resorte de siempre.
     fn build_shape(&mut self) {
-        // Solo una parte de las partículas forma la figura; el resto sigue
-        // con la animación del modo.
+        // Modo foto: efecto en dos fases (mosaico + superposición).
+        if self.params.shape_photo_color && !self.params.shape_image.is_empty() {
+            self.start_photo();
+            return;
+        }
+        // Salir del modo foto: la superposición se desvanece.
+        self.overlay_target = 0.0;
+
+        // Texto/silueta: solo una parte de las partículas forma la figura y el
+        // resto queda de ambiente.
         let count = ((self.sim.count as usize) * 7 / 10).max(1);
         let mut rng = rand::thread_rng();
         let pts = if !self.params.shape_text.trim().is_empty() {
@@ -330,12 +353,18 @@ impl State {
             Vec::new()
         };
         if pts.is_empty() {
+            // Sin nueva forma: la figura de la foto (o el texto) se DISUELVE
+            // suave y las partículas reclutadas vuelven al enjambre; el color
+            // del mosaico se retira con la mezcla (photo_loaded lo limpia el
+            // bucle al terminar de disolverse).
             self.shape.target = 0.0;
-            if self.shape.blend <= 1e-4 {
+            if !self.photo_loaded && self.shape.blend <= 1e-4 {
                 self.shape.n = 0;
             }
             return;
         }
+        // Una nueva forma (texto/silueta) reemplaza al efecto foto.
+        self.photo_loaded = false;
         self.shape.n = self.sim.upload_shape_targets(&self.queue, &pts);
         self.shape.blend = 0.0;
         self.shape.target = 1.0;
@@ -343,6 +372,34 @@ impl State {
             self.sim
                 .tint(&self.queue, self.shape.n, hue_for_index(self.params.shape_color));
         }
+    }
+
+    /// Arranca el efecto foto en dos fases: (A) las partículas se reparten en
+    /// una rejilla que cubre la imagen y toman su color (mosaico); (B) la foto
+    /// real se funde encima al terminar de acomodarse (ver el bucle).
+    fn start_photo(&mut self) {
+        let Some((rgba, w, h)) = shape::decode_image_rgba(&self.params.shape_image) else {
+            self.overlay_target = 0.0;
+            return;
+        };
+        self.sim.upload_photo(&self.device, &self.queue, &rgba, w, h);
+        // Caja de la foto en mundo: 90% del lienzo, centrada, aspecto preservado.
+        let (iw, ih) = (w as f32, h as f32);
+        let scale = (WORLD[0] * 0.9 / iw).min(WORLD[1] * 0.9 / ih);
+        self.photo_extent = [iw * scale, ih * scale];
+        self.photo_loaded = true;
+        // Fase B (overlay) arranca en 0 y espera a que se acomoden.
+        self.overlay_reveal = 0.0;
+        self.overlay_target = 0.0;
+        // Fase A: se reclutan partículas SOLO en la zona opaca de la imagen
+        // (en un PNG sin fondo, nada de partículas en lo transparente); toman
+        // su color. Las no reclutadas se desvanecen (ver particles.wgsl).
+        let recruit = ((self.sim.count as usize) * 9 / 10).max(1);
+        let center = [WORLD[0] * 0.5, WORLD[1] * 0.5];
+        let pts = shape::mosaic_points(&rgba, w as usize, h as usize, center, self.photo_extent, recruit);
+        self.shape.n = self.sim.upload_shape_targets(&self.queue, &pts);
+        self.shape.blend = 0.0;
+        self.shape.target = 1.0;
     }
 
     /// Al cambiar de escena: reconstruye la forma SOLO si el descriptor
@@ -488,6 +545,7 @@ impl State {
                 self.params.shape_text.clear();
                 self.params.shape_image.clear();
                 self.shape.target = 0.0;
+                self.overlay_target = 0.0;
             }
             PanelEvent::SaveShape => {
                 // Guarda el descriptor activo con un nombre derivado (el texto,
@@ -616,6 +674,26 @@ impl State {
         self.params.advance_speed(dt);
         self.shape
             .advance(dt, self.params.shape_transition_duration);
+        // Fase B: la foto real se funde encima SOLO cuando las partículas ya
+        // se acomodaron (fase A casi completa). Al soltar, ambas bajan.
+        let releasing = self.shape.target <= 0.0;
+        if self.photo_loaded && !releasing && self.shape.blend >= 0.95 {
+            self.overlay_target = 1.0;
+        }
+        let step = if self.params.shape_transition_duration > 1e-3 {
+            dt / self.params.shape_transition_duration
+        } else {
+            1.0
+        };
+        if self.overlay_reveal < self.overlay_target {
+            self.overlay_reveal = (self.overlay_reveal + step).min(self.overlay_target);
+        } else if self.overlay_reveal > self.overlay_target {
+            self.overlay_reveal = (self.overlay_reveal - step).max(self.overlay_target);
+        }
+        // Cuando se soltó y ya no queda ni mosaico ni overlay, olvida la foto.
+        if self.photo_loaded && releasing && self.shape.n == 0 && self.overlay_reveal <= 1e-4 {
+            self.photo_loaded = false;
+        }
 
         // Auto-avance de escenas (slideshow), como en la app CPU.
         if self.panel.scene_autoplay && self.morph.is_none() && self.store.scenes.len() > 1 {
@@ -682,8 +760,32 @@ impl State {
         // Los parámetros (física + render) suben cada frame: los blends y lo
         // que haya tocado el panel se reflejan al instante. `dt` escala el
         // lerp del suavizado de color en el kernel.
-        let drive = self.shape.drive(self.params.shape_strength);
-        self.sim.upload_params(&self.queue, &self.params, &drive, dt);
+        // Fase A: en modo foto forzamos fijación alta para que las reclutadas
+        // se asienten en la rejilla. El fondo REPELE a la figura como con el
+        // texto (el resto del enjambre choca/rodea la imagen, no la atraviesa).
+        let fix = if self.photo_loaded { 0.9 } else { self.params.shape_strength };
+        let drive = self.shape.drive(fix);
+        // Color del mosaico: sigue la mezcla de aparición de la forma (las
+        // reclutadas toman el color de la foto según se acomodan).
+        let mb = self.shape.blend.clamp(0.0, 1.0);
+        let mosaic = Mosaic {
+            on: self.photo_loaded,
+            reveal: mb * mb * (3.0 - 2.0 * mb),
+            n: self.shape.n,
+            center: [WORLD[0] * 0.5, WORLD[1] * 0.5],
+            extent: self.photo_extent,
+        };
+        self.sim
+            .upload_params(&self.queue, &self.params, &drive, &mosaic, dt);
+
+        // Fase B (superposición): mitad de la caja en NDC y opacidad (ease).
+        let r = self.overlay_reveal.clamp(0.0, 1.0);
+        let reveal = r * r * (3.0 - 2.0 * r);
+        let half = [
+            self.photo_extent[0] / WORLD[0],
+            self.photo_extent[1] / WORLD[1],
+        ];
+        let draw_photo = self.photo_loaded && reveal > 0.001;
 
         let frame = match self.surface.get_current_texture() {
             Ok(f) => f,
@@ -698,11 +800,18 @@ impl State {
             .device
             .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
         self.sim.frame(&mut encoder, &view, paused);
+        // La foto se funde encima de la escena (después de las partículas).
+        if draw_photo {
+            self.sim.draw_photo(&mut encoder, &self.queue, &view, false, half, reveal);
+        }
 
         // Grabación: volcar la escena (sin el panel) a la textura de captura
         // y encolar la copia a staging del frame.
         if let Some(r) = self.recorder.as_ref() {
             self.sim.blit_to(&mut encoder, &r.view);
+            if draw_photo {
+                self.sim.draw_photo(&mut encoder, &self.queue, &r.view, true, half, reveal);
+            }
             r.copy_frame(&mut encoder);
         }
 

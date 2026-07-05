@@ -53,6 +53,10 @@ pub struct PanelState {
     pub saved_shapes: Vec<SavedShape>,
     /// Índice seleccionado en la biblioteca (para recorrerla y resaltarlo).
     pub shape_sel: Option<usize>,
+    /// Miniatura de la imagen de forma activa, cacheada junto a la ruta que la
+    /// generó (para no releerla/decodificarla en cada frame). `None` si no hay
+    /// imagen activa o falló la carga.
+    pub shape_image_preview: Option<(String, egui::TextureHandle)>,
 
     // --- Escenas ---
     /// Nombre en edición para guardar una escena nueva.
@@ -117,6 +121,7 @@ impl Default for PanelState {
             shape_text: String::new(),
             saved_shapes: Vec::new(),
             shape_sel: None,
+            shape_image_preview: None,
             scene_name_input: String::new(),
             scene_smooth: true,
             scene_transition_duration: 3.0,
@@ -240,6 +245,16 @@ fn select_shape(
         st.shape_text = s.text.clone();
         events.push(PanelEvent::ApplyShape(s.name.clone()));
     }
+}
+
+/// Carga y reduce a miniatura la imagen de `path` como textura egui, para
+/// mostrarla de referencia junto a los controles de forma. `None` si el
+/// fichero no existe o no se pudo decodificar.
+fn load_image_preview(ctx: &egui::Context, path: &str) -> Option<egui::TextureHandle> {
+    let thumb = image::open(path).ok()?.thumbnail(220, 220).to_rgba8();
+    let (w, h) = (thumb.width() as usize, thumb.height() as usize);
+    let color_image = egui::ColorImage::from_rgba_unmultiplied([w, h], thumb.as_raw());
+    Some(ctx.load_texture("shape_image_preview", color_image, egui::TextureOptions::LINEAR))
 }
 
 fn egui_color(c: [f32; 3]) -> egui::Color32 {
@@ -728,12 +743,32 @@ pub fn config_panel(
                     events.push(PanelEvent::ReleaseShape);
                 }
             });
+            // Miniatura de la foto activa, para comparar contra lo que forman
+            // las partículas. Se recarga solo si cambió la ruta.
+            if !params.shape_image.is_empty() {
+                let stale = st
+                    .shape_image_preview
+                    .as_ref()
+                    .is_none_or(|(p, _)| p != &params.shape_image);
+                if stale {
+                    st.shape_image_preview = load_image_preview(ui.ctx(), &params.shape_image)
+                        .map(|tex| (params.shape_image.clone(), tex));
+                }
+                if let Some((_, tex)) = &st.shape_image_preview {
+                    let max = egui::vec2(220.0, 160.0);
+                    ui.add(egui::Image::new(tex).max_size(max).shrink_to_fit());
+                }
+            }
             ui.add(
                 egui::Slider::new(&mut params.shape_transition_duration, 0.0..=8.0)
                     .text("Fluidez (s)"),
             );
             ui.add(egui::Slider::new(&mut params.shape_strength, 0.0..=1.0).text("Fijación"));
-            ui.checkbox(&mut params.shape_tint, "Teñir de un color");
+            if ui.checkbox(&mut params.shape_tint, "Teñir de un color").changed()
+                && params.shape_tint
+            {
+                params.shape_photo_color = false; // mutuamente excluyentes
+            }
             if params.shape_tint {
                 ui.horizontal_wrapped(|ui| {
                     for i in 0..NUM_COLORS {
@@ -748,6 +783,18 @@ pub fn config_panel(
                         }
                     }
                 });
+            }
+            if !params.shape_image.is_empty() {
+                if ui
+                    .checkbox(&mut params.shape_photo_color, "Recrear colores de la foto")
+                    .on_hover_text(
+                        "Cada partícula de la imagen migra hacia su color real (solo imágenes, no texto).",
+                    )
+                    .changed()
+                    && params.shape_photo_color
+                {
+                    params.shape_tint = false; // mutuamente excluyentes
+                }
             }
             ui.label(
                 egui::RichText::new(

@@ -19,12 +19,26 @@ struct RenderParams {
     bloom_radius: f32,
     trail_fade: f32,
     _pad: f32,
+    // Mosaico (fase A): las primeras `mosaic_n` partículas (las reclutadas)
+    // funden su color hacia el de la foto muestreada en su posición.
+    // `mosaic_reveal` es la mezcla 0..1; center/extent = caja de la foto en
+    // mundo; `mosaic_on` = modo foto activo. El resto de partículas no se tocan.
+    mosaic_on: u32,
+    mosaic_reveal: f32,
+    mosaic_n: u32,
+    _pad2: u32,
+    photo_center: vec2f,
+    photo_extent: vec2f,
 };
 
 @group(0) @binding(0) var<uniform> R: RenderParams;
 @group(0) @binding(1) var<storage, read> pos: array<vec2f>;
 @group(0) @binding(2) var<storage, read> hue: array<f32>;
 @group(0) @binding(3) var<storage, read> vel: array<vec2f>;
+// Textura de la foto + sampler para el color del mosaico (se muestrean en el
+// vértice, de ahí `textureSampleLevel`).
+@group(0) @binding(4) var photo_tex: texture_2d<f32>;
+@group(0) @binding(5) var photo_samp: sampler;
 
 // Matiz [0,1) a RGB vivo (= `color_for_hue` de la CPU: HSV con s=v=1).
 fn color_for_hue(h: f32) -> vec3f {
@@ -39,6 +53,24 @@ fn color_for_hue(h: f32) -> vec3f {
         case 4: { return vec3f(f, 0.0, 1.0); }
         default: { return vec3f(1.0, 0.0, 1.0 - f); }
     }
+}
+
+// Color de la partícula `ii`: su matiz normal, fundido hacia el color de la
+// foto en su posición (fase A). Solo las reclutadas (`ii < mosaic_n`); el
+// resto conserva su color. La `u`/`v` coinciden con las de la superposición
+// (mundo→NDC→uv), así el mosaico queda alineado con la imagen.
+fn particle_color(ii: u32) -> vec3f {
+    let base = color_for_hue(hue[ii]);
+    if R.mosaic_on == 1u && ii < R.mosaic_n {
+        let p = pos[ii];
+        let u = (p.x - R.photo_center.x) / R.photo_extent.x + 0.5;
+        let v = (p.y - R.photo_center.y) / R.photo_extent.y + 0.5;
+        if u >= 0.0 && u <= 1.0 && v >= 0.0 && v <= 1.0 {
+            let photo = textureSampleLevel(photo_tex, photo_samp, vec2f(u, v), 0.0).rgb;
+            return mix(base, photo, R.mosaic_reveal);
+        }
+    }
+    return base;
 }
 
 struct VsOut {
@@ -69,7 +101,7 @@ fn vs_disc(@builtin(vertex_index) vi: u32, @builtin(instance_index) ii: u32) -> 
     var mult = 1.6; // Brillo
     if R.style == 1u { mult = 1.0; } else if R.style == 2u { mult = 1.8; }
     let a = R.brightness * (1.0 - R.orient);
-    return quad_vertex(vi, pos[ii], R.point_size * mult, color_for_hue(hue[ii]), a);
+    return quad_vertex(vi, pos[ii], R.point_size * mult, particle_color(ii), a);
 }
 
 @fragment
@@ -101,7 +133,7 @@ fn vs_bloom(@builtin(vertex_index) vi: u32, @builtin(instance_index) ii: u32) ->
     // atenuada ×0.5 para que se acumule con gracia (= `draw_bloom`).
     let ga = clamp(R.brightness * R.bloom_intensity * 0.5, 0.0, 1.0);
     let s = R.point_size * max(R.bloom_radius, 0.1);
-    return quad_vertex(vi, pos[ii], s, color_for_hue(hue[ii]), ga);
+    return quad_vertex(vi, pos[ii], s, particle_color(ii), ga);
 }
 
 @fragment
@@ -134,7 +166,7 @@ fn vs_arrow(@builtin(vertex_index) vi: u32, @builtin(instance_index) ii: u32) ->
     var out: VsOut;
     out.clip = vec4f(w * R.scale + R.offset, 0.0, 1.0);
     out.uv = vec2f(0.0);
-    out.color = color_for_hue(hue[ii]);
+    out.color = particle_color(ii);
     out.alpha = R.brightness * R.orient;
     return out;
 }

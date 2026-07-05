@@ -249,6 +249,40 @@ fn record_camera(rt: &RenderTarget, center: Vec2, w: f32, h: f32) -> Camera2D {
     cam
 }
 
+/// Fisher–Yates parcial: deja `on` con como mucho `count` elementos.
+fn partial_shuffle(on: &mut Vec<(usize, usize)>, count: usize, rng: &mut impl Rng) {
+    if on.len() > count {
+        for k in 0..count {
+            let j = rng.gen_range(k..on.len());
+            on.swap(k, j);
+        }
+        on.truncate(count);
+    }
+}
+
+/// Mapea píxeles (px,py) a puntos de mundo, preservando aspecto, centrado al
+/// 90% de la caja. `flip_y` compensa la orientación (los RT se leen de abajo
+/// a arriba).
+fn map_points(on: &[(usize, usize)], w: usize, h: usize, world: Vec2, flip_y: bool) -> Vec<Vec2> {
+    let iw = w as f32;
+    let ih = h as f32;
+    let scale = (world.x * 0.9 / iw).min(world.y * 0.9 / ih);
+    let center = world * 0.5;
+    on.iter()
+        .map(|&(px, py)| {
+            let sx = (px as f32 + 0.5) / iw;
+            let mut sy = (py as f32 + 0.5) / ih;
+            if flip_y {
+                sy = 1.0 - sy;
+            }
+            Vec2::new(
+                center.x + (sx - 0.5) * iw * scale,
+                center.y + (sy - 0.5) * ih * scale,
+            )
+        })
+        .collect()
+}
+
 /// Convierte una imagen RGBA en una nube de puntos meta (mundo) para que las
 /// partículas la formen. Marca "encendido" por alfa (siluetas/emoji con
 /// transparencia) o, si la imagen es opaca, por luminancia. Submuestrea a
@@ -304,32 +338,32 @@ fn image_to_points(
     }
 
     // Submuestreo aleatorio (Fisher–Yates parcial) hasta `count`.
-    let count = count.max(1);
-    if on.len() > count {
-        for k in 0..count {
-            let j = rng.gen_range(k..on.len());
-            on.swap(k, j);
-        }
-        on.truncate(count);
-    }
+    partial_shuffle(&mut on, count.max(1), rng);
+    map_points(&on, w, h, world, flip_y)
+}
 
-    let iw = w as f32;
-    let ih = h as f32;
-    let scale = (world.x * 0.9 / iw).min(world.y * 0.9 / ih);
-    let center = world * 0.5;
-    on.iter()
-        .map(|&(px, py)| {
-            let sx = (px as f32 + 0.5) / iw;
-            let mut sy = (py as f32 + 0.5) / ih;
-            if flip_y {
-                sy = 1.0 - sy;
-            }
-            Vec2::new(
-                center.x + (sx - 0.5) * iw * scale,
-                center.y + (sy - 0.5) * ih * scale,
-            )
-        })
-        .collect()
+/// Carga una imagen de disco como (textura, píxeles RGBA, ancho, alto) para el
+/// efecto foto: la textura para superponerla (fase B) y los píxeles para
+/// colorear las partículas (fase A). `None` si no se pudo abrir/decodificar.
+fn load_photo(path: &str) -> Option<(Texture2D, Vec<u8>, usize, usize)> {
+    let bytes = match std::fs::read(path) {
+        Ok(b) => b,
+        Err(e) => {
+            eprintln!("No pude abrir la imagen '{path}': {e}");
+            return None;
+        }
+    };
+    match Image::from_file_with_format(&bytes, None) {
+        Ok(img) => {
+            let tex = Texture2D::from_image(&img);
+            tex.set_filter(FilterMode::Linear);
+            Some((tex, img.bytes.clone(), img.width as usize, img.height as usize))
+        }
+        Err(e) => {
+            eprintln!("No pude decodificar la imagen '{path}': {e}");
+            None
+        }
+    }
 }
 
 /// Rasteriza `text` a un `render_target` y devuelve sus puntos meta (mundo).
@@ -366,7 +400,7 @@ fn image_points_from_path(
         }
     };
     match Image::from_file_with_format(&bytes, None) {
-        Ok(img) => Some(image_to_points(&img, false, world, count, rng)),
+        Ok(img) => Some(image_to_points(&img, true, world, count, rng)),
         Err(e) => {
             eprintln!("No pude decodificar la imagen '{path}': {e}");
             None
@@ -374,21 +408,77 @@ fn image_points_from_path(
     }
 }
 
+
+/// Puntos meta (mundo) de una rejilla `~count` sobre la caja de la foto, SOLO
+/// en las celdas con píxel opaco: en un PNG sin fondo, las partículas se
+/// reclutan únicamente donde hay imagen. `rgba`/`w`/`h` es la imagen.
+fn mosaic_points(rgba: &[u8], w: usize, h: usize, c: Vec2, e: Vec2, count: usize) -> Vec<Vec2> {
+    let count = count.max(1);
+    if w == 0 || h == 0 {
+        return Vec::new();
+    }
+    let aspect = (e.x / e.y.max(1e-3)).max(1e-3);
+    let cols = ((count as f32 * aspect).sqrt().round().max(1.0)) as usize;
+    let rows = ((count as f32 / aspect).sqrt().round().max(1.0)) as usize;
+    let (x0, y0) = (c.x - e.x * 0.5, c.y - e.y * 0.5);
+    let mut pts = Vec::with_capacity(cols * rows);
+    for gy in 0..rows {
+        let py = (((gy as f32 + 0.5) / rows as f32 * h as f32) as usize).min(h - 1);
+        let wy = y0 + (gy as f32 + 0.5) / rows as f32 * e.y;
+        for gx in 0..cols {
+            let px = (((gx as f32 + 0.5) / cols as f32 * w as f32) as usize).min(w - 1);
+            if rgba[(py * w + px) * 4 + 3] > 128 {
+                let wx = x0 + (gx as f32 + 0.5) / cols as f32 * e.x;
+                pts.push(Vec2::new(wx, wy));
+            }
+        }
+    }
+    pts
+}
+
 /// Construye la forma a partir del descriptor de `params` (mensaje o ruta de
 /// imagen). Vacío = suelta la forma. Incondicional (siempre reconstruye).
+/// En modo "recrear colores de la foto" es un efecto en dos fases: las
+/// partículas se acomodan a una rejilla que cubre la imagen y toman su color
+/// (mosaico), y luego la foto real se funde encima; en texto/silueta migran a
+/// la silueta.
 fn build_shape(sim: &mut Simulation, params: &SimParams, rng: &mut impl Rng) {
-    // Solo una parte de las partículas forma la figura (en el centro); el resto
-    // sigue con la animación del modo.
+    // Modo foto: acomodar en rejilla + colorear (fase A) y preparar la foto.
+    if params.shape_photo_color && !params.shape_image.is_empty() {
+        match load_photo(&params.shape_image) {
+            Some((tex, bytes, w, h)) => {
+                let mask = bytes.clone();
+                sim.set_photo(tex, bytes, w, h);
+                if let Some(photo) = sim.photo.as_ref() {
+                    let (c, e) = (photo.center, photo.extent);
+                    // Reclutar SOLO en la zona opaca (PNG sin fondo → nada en lo
+                    // transparente); el resto se desvanece (ver render).
+                    let recruit = (sim.particles.len() * 9 / 10).max(1);
+                    let pts = mosaic_points(&mask, w, h, c, e, recruit);
+                    sim.set_shape(pts);
+                }
+            }
+            None => sim.clear_photo(),
+        }
+        return;
+    }
+    // Texto/silueta: solo una parte de las partículas forma la figura y el
+    // resto queda de ambiente. Una forma nueva reemplaza a la foto (drop); si
+    // no hay forma, la foto se disuelve suave y las partículas reclutadas
+    // vuelven al enjambre (clear_photo + clear_shape).
     let count = (sim.particles.len() * 7 / 10).max(1);
     if !params.shape_text.trim().is_empty() {
+        sim.drop_photo();
         let pts = text_to_points(&params.shape_text, sim.world, count, rng);
         sim.set_shape(pts);
     } else if !params.shape_image.is_empty() {
+        sim.drop_photo();
         match image_points_from_path(&params.shape_image, sim.world, count, rng) {
             Some(pts) => sim.set_shape(pts),
             None => sim.clear_shape(),
         }
     } else {
+        sim.clear_photo();
         sim.clear_shape();
         return;
     }
@@ -1122,6 +1212,7 @@ async fn main() {
             // la transición de velocidad (`advance_transition`).
             let saved_ts = params.time_scale;
             let saved_force = params.force;
+            let saved_fix = params.shape_strength;
             if audio_mod_on {
                 match params.audio_target {
                     AudioTarget::Speed => params.time_scale *= audio_gain,
@@ -1129,11 +1220,24 @@ async fn main() {
                     AudioTarget::Brightness => {}
                 }
             }
-            // Aparición/disolución fluida de la forma (crece o mengua la mezcla).
+            // Fase A: con foto activa, fijación alta para que las partículas se
+            // asienten en la rejilla y cubran la imagen.
+            if sim.photo.is_some() {
+                params.shape_strength = params.shape_strength.max(0.9);
+            }
+            // Aparición/disolución fluida de la forma (fase A, posición + color).
             sim.advance_shape(get_frame_time(), params.shape_transition_duration);
+            // Fase B: la foto real se funde encima SOLO cuando las partículas
+            // ya se acomodaron (mezcla de forma alta) y no se está soltando.
+            let arranged = sim.photo.is_some()
+                && sim.shape.is_some()
+                && sim.shape_blend >= 0.95;
+            sim.set_overlay_target(arranged);
+            sim.advance_overlay(get_frame_time(), params.shape_transition_duration);
             sim.step(&params);
             params.time_scale = saved_ts;
             params.force = saved_force;
+            params.shape_strength = saved_fix;
             params.advance_transition(get_frame_time());
             step_once = false;
         }
@@ -1603,6 +1707,7 @@ async fn main() {
                     params.shape_text = String::new();
                     params.shape_image = String::new();
                     sim.clear_shape();
+                    sim.clear_photo();
                 }
                 PanelEvent::SaveShape => {
                     // Guarda el descriptor activo con un nombre derivado (el texto,
