@@ -423,7 +423,9 @@ fn mosaic_points(rgba: &[u8], w: usize, h: usize, c: Vec2, e: Vec2, count: usize
     let (x0, y0) = (c.x - e.x * 0.5, c.y - e.y * 0.5);
     let mut pts = Vec::with_capacity(cols * rows);
     for gy in 0..rows {
-        let py = (((gy as f32 + 0.5) / rows as f32 * h as f32) as usize).min(h - 1);
+        // `py` invertida (Y de la cámara del CPU al revés), para que la máscara
+        // coincida con el color (`Photo::color_at`) y la textura superpuesta.
+        let py = ((((rows - 1 - gy) as f32 + 0.5) / rows as f32 * h as f32) as usize).min(h - 1);
         let wy = y0 + (gy as f32 + 0.5) / rows as f32 * e.y;
         for gx in 0..cols {
             let px = (((gx as f32 + 0.5) / cols as f32 * w as f32) as usize).min(w - 1);
@@ -478,8 +480,12 @@ fn build_shape(sim: &mut Simulation, params: &SimParams, rng: &mut impl Rng) {
             None => sim.clear_shape(),
         }
     } else {
-        sim.clear_photo();
-        sim.clear_shape();
+        // Sin nueva forma: con foto, salida en reverso; sin foto, disolución.
+        if sim.photo.is_some() {
+            sim.clear_photo();
+        } else {
+            sim.clear_shape();
+        }
         return;
     }
     if params.shape_tint {
@@ -1227,13 +1233,9 @@ async fn main() {
             }
             // Aparición/disolución fluida de la forma (fase A, posición + color).
             sim.advance_shape(get_frame_time(), params.shape_transition_duration);
-            // Fase B: la foto real se funde encima SOLO cuando las partículas
-            // ya se acomodaron (mezcla de forma alta) y no se está soltando.
-            let arranged = sim.photo.is_some()
-                && sim.shape.is_some()
-                && sim.shape_blend >= 0.95;
-            sim.set_overlay_target(arranged);
-            sim.advance_overlay(get_frame_time(), params.shape_transition_duration);
+            // Efecto foto (fase B + salida en reverso): la imagen se funde tras
+            // acomodarse; al soltar, se va primero la imagen y luego la forma.
+            sim.advance_photo_effect(get_frame_time(), params.shape_transition_duration);
             sim.step(&params);
             params.time_scale = saved_ts;
             params.force = saved_force;
@@ -1706,8 +1708,14 @@ async fn main() {
                 PanelEvent::ReleaseShape => {
                     params.shape_text = String::new();
                     params.shape_image = String::new();
-                    sim.clear_shape();
-                    sim.clear_photo();
+                    // Con foto: salida en reverso (imagen primero, luego soltar
+                    // — lo gestiona clear_photo + advance_photo_effect). Sin
+                    // foto: disolución normal de la forma.
+                    if sim.photo.is_some() {
+                        sim.clear_photo();
+                    } else {
+                        sim.clear_shape();
+                    }
                 }
                 PanelEvent::SaveShape => {
                     // Guarda el descriptor activo con un nombre derivado (el texto,

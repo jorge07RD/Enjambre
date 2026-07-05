@@ -91,6 +91,9 @@ impl Renderer {
                     Color::new(1.0, 1.0, 1.0, reveal),
                     DrawTextureParams {
                         dest_size: Some(photo.extent),
+                        // La cámara del CPU (from_display_rect) tiene la Y
+                        // invertida: sin esto la imagen sale boca abajo.
+                        flip_y: true,
                         ..Default::default()
                     },
                 );

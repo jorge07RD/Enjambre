@@ -187,6 +187,9 @@ struct State {
     overlay_target: f32,
     photo_extent: [f32; 2],
     photo_loaded: bool,
+    /// En salida: la imagen se desvanece primero y luego se sueltan las
+    /// partículas (transición de entrada en reverso).
+    photo_releasing: bool,
     recorder: Option<rec::Recorder>,
     // Panel egui embebido (mismo `config_panel` que `sim` y `panel`).
     panel: PanelState,
@@ -299,6 +302,7 @@ impl State {
             overlay_target: 0.0,
             photo_extent: [WORLD[0], WORLD[1]],
             photo_loaded: false,
+            photo_releasing: false,
             recorder: None,
             panel,
             panel_visible: true,
@@ -353,18 +357,22 @@ impl State {
             Vec::new()
         };
         if pts.is_empty() {
-            // Sin nueva forma: la figura de la foto (o el texto) se DISUELVE
-            // suave y las partículas reclutadas vuelven al enjambre; el color
-            // del mosaico se retira con la mezcla (photo_loaded lo limpia el
-            // bucle al terminar de disolverse).
-            self.shape.target = 0.0;
-            if !self.photo_loaded && self.shape.blend <= 1e-4 {
-                self.shape.n = 0;
+            // Sin nueva forma. Con foto activa, salida en reverso (la imagen ya
+            // se desvanece; el bucle suelta las partículas cuando la imagen se
+            // fue). Sin foto, disolución normal de la forma.
+            if self.photo_loaded {
+                self.photo_releasing = true;
+            } else {
+                self.shape.target = 0.0;
+                if self.shape.blend <= 1e-4 {
+                    self.shape.n = 0;
+                }
             }
             return;
         }
         // Una nueva forma (texto/silueta) reemplaza al efecto foto.
         self.photo_loaded = false;
+        self.photo_releasing = false;
         self.shape.n = self.sim.upload_shape_targets(&self.queue, &pts);
         self.shape.blend = 0.0;
         self.shape.target = 1.0;
@@ -388,6 +396,7 @@ impl State {
         let scale = (WORLD[0] * 0.9 / iw).min(WORLD[1] * 0.9 / ih);
         self.photo_extent = [iw * scale, ih * scale];
         self.photo_loaded = true;
+        self.photo_releasing = false;
         // Fase B (overlay) arranca en 0 y espera a que se acomoden.
         self.overlay_reveal = 0.0;
         self.overlay_target = 0.0;
@@ -544,8 +553,13 @@ impl State {
             PanelEvent::ReleaseShape => {
                 self.params.shape_text.clear();
                 self.params.shape_image.clear();
-                self.shape.target = 0.0;
-                self.overlay_target = 0.0;
+                if self.photo_loaded {
+                    // Salida en reverso: primero fuera la imagen, luego soltar.
+                    self.photo_releasing = true;
+                    self.overlay_target = 0.0;
+                } else {
+                    self.shape.target = 0.0;
+                }
             }
             PanelEvent::SaveShape => {
                 // Guarda el descriptor activo con un nombre derivado (el texto,
@@ -674,10 +688,9 @@ impl State {
         self.params.advance_speed(dt);
         self.shape
             .advance(dt, self.params.shape_transition_duration);
-        // Fase B: la foto real se funde encima SOLO cuando las partículas ya
-        // se acomodaron (fase A casi completa). Al soltar, ambas bajan.
-        let releasing = self.shape.target <= 0.0;
-        if self.photo_loaded && !releasing && self.shape.blend >= 0.95 {
+        // Entrada: la foto se funde encima SOLO cuando las partículas ya se
+        // acomodaron (fase A casi completa).
+        if self.photo_loaded && !self.photo_releasing && self.shape.blend >= 0.95 {
             self.overlay_target = 1.0;
         }
         let step = if self.params.shape_transition_duration > 1e-3 {
@@ -690,9 +703,15 @@ impl State {
         } else if self.overlay_reveal > self.overlay_target {
             self.overlay_reveal = (self.overlay_reveal - step).max(self.overlay_target);
         }
-        // Cuando se soltó y ya no queda ni mosaico ni overlay, olvida la foto.
-        if self.photo_loaded && releasing && self.shape.n == 0 && self.overlay_reveal <= 1e-4 {
+        // Salida (reverso): primero se va la imagen (overlay→0, con la silueta
+        // de partículas aún detrás); cuando ya no se ve, SE LIBERAN (shape→0).
+        if self.photo_releasing && self.overlay_reveal <= 1e-3 {
+            self.shape.target = 0.0;
+        }
+        // Cuando ya no queda ni mosaico ni overlay, olvida la foto.
+        if self.photo_loaded && self.photo_releasing && self.shape.n == 0 && self.overlay_reveal <= 1e-4 {
             self.photo_loaded = false;
+            self.photo_releasing = false;
         }
 
         // Auto-avance de escenas (slideshow), como en la app CPU.

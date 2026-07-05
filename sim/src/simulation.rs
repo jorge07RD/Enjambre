@@ -35,11 +35,12 @@ impl Photo {
     }
 
     /// Color RGB [0,1] de la foto en la posición de mundo `p`, o `None` si `p`
-    /// cae fuera de la caja. La `u`/`v` coinciden con las de la textura
-    /// superpuesta (mismo encuadre), para que el mosaico quede alineado.
+    /// cae fuera de la caja. La `v` va invertida porque la cámara del CPU
+    /// (from_display_rect) tiene la Y al revés (igual criterio que la silueta
+    /// con `flip_y=true` y la textura superpuesta).
     pub fn color_at(&self, p: Vec2) -> Option<[f32; 3]> {
         let u = (p.x - self.center.x) / self.extent.x + 0.5;
-        let v = (p.y - self.center.y) / self.extent.y + 0.5;
+        let v = 0.5 - (p.y - self.center.y) / self.extent.y;
         if !(0.0..=1.0).contains(&u) || !(0.0..=1.0).contains(&v) {
             return None;
         }
@@ -76,6 +77,9 @@ pub struct Simulation {
     /// Mezcla 0..1 de la superposición (fase B) y su objetivo.
     pub overlay_reveal: f32,
     overlay_target: f32,
+    /// En salida: la imagen se desvanece primero y luego se sueltan las
+    /// partículas (transición de entrada en reverso).
+    photo_releasing: bool,
     grid: Grid,
     /// Aceleraciones acumuladas por partícula (scratch reutilizado).
     forces: Vec<Vec2>,
@@ -94,6 +98,7 @@ impl Simulation {
             photo: None,
             overlay_reveal: 0.0,
             overlay_target: 0.0,
+            photo_releasing: false,
             grid: Grid::new(),
             forces: Vec::new(),
         }
@@ -136,12 +141,16 @@ impl Simulation {
         });
         self.overlay_reveal = 0.0;
         self.overlay_target = 0.0;
+        self.photo_releasing = false;
     }
 
-    /// Suelta la foto: la superposición baja a 0 (disolución suave). La foto se
-    /// descarta cuando la mezcla de forma y el overlay llegan a 0.
+    /// Suelta la foto en REVERSO: primero se desvanece la imagen (dejando ver
+    /// el mosaico de partículas detrás) y luego se sueltan las partículas (lo
+    /// gestiona `advance_photo_effect`).
     pub fn clear_photo(&mut self) {
-        self.overlay_target = 0.0;
+        if self.photo.is_some() {
+            self.photo_releasing = true;
+        }
     }
 
     /// Descarta la foto de golpe (cuando una forma nueva la reemplaza).
@@ -149,26 +158,34 @@ impl Simulation {
         self.photo = None;
         self.overlay_reveal = 0.0;
         self.overlay_target = 0.0;
+        self.photo_releasing = false;
     }
 
-    /// Fija el objetivo de la superposición (fase B): la enciende cuando las
-    /// partículas ya se acomodaron (`shape_blend` alto) y no se está soltando.
-    pub fn set_overlay_target(&mut self, on: bool) {
-        self.overlay_target = if on { 1.0 } else { 0.0 };
-    }
-
-    /// Avanza la superposición hacia su objetivo durante `duration` s. Al
-    /// terminar de ocultarse tras soltar, descarta la foto.
-    pub fn advance_overlay(&mut self, dt: f32, duration: f32) {
+    /// Secuencia el efecto foto y avanza la superposición `duration` s.
+    /// Entrada: la imagen se funde tras acomodarse las partículas. Salida
+    /// (reverso): la imagen se va primero y, cuando ya no se ve, se sueltan las
+    /// partículas; al terminar, descarta la foto.
+    pub fn advance_photo_effect(&mut self, dt: f32, duration: f32) {
+        if self.photo.is_none() {
+            return;
+        }
+        if self.photo_releasing {
+            self.overlay_target = 0.0;
+            if self.overlay_reveal <= 1e-3 {
+                self.shape_target = 0.0; // ahora sí, soltar las partículas
+            }
+        } else if self.shape.is_some() && self.shape_blend >= 0.95 {
+            self.overlay_target = 1.0;
+        }
         let step = if duration > 1e-3 { dt / duration } else { 1.0 };
         if self.overlay_reveal < self.overlay_target {
             self.overlay_reveal = (self.overlay_reveal + step).min(self.overlay_target);
         } else if self.overlay_reveal > self.overlay_target {
             self.overlay_reveal = (self.overlay_reveal - step).max(self.overlay_target);
         }
-        // Foto descartada cuando ya no queda ni mosaico (forma) ni overlay.
-        if self.overlay_target <= 0.0 && self.overlay_reveal <= 1e-4 && self.shape.is_none() {
+        if self.photo_releasing && self.overlay_reveal <= 1e-4 && self.shape.is_none() {
             self.photo = None;
+            self.photo_releasing = false;
         }
     }
 
