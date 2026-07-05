@@ -1384,7 +1384,10 @@ fn make_empty_photo(device: &wgpu::Device) -> wgpu::TextureView {
         mip_level_count: 1,
         sample_count: 1,
         dimension: wgpu::TextureDimension::D2,
-        format: wgpu::TextureFormat::Rgba8Unorm,
+        // sRGB: los píxeles de la foto son sRGB; al muestrear se convierten a
+        // lineal y, al escribir a la superficie sRGB, vuelven a sRGB (ciclo
+        // correcto). Con Unorm los colores salían lavados/claros.
+        format: wgpu::TextureFormat::Rgba8UnormSrgb,
         usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
         view_formats: &[],
     });
@@ -1407,7 +1410,8 @@ fn make_photo_texture(
         mip_level_count: 1,
         sample_count: 1,
         dimension: wgpu::TextureDimension::D2,
-        format: wgpu::TextureFormat::Rgba8Unorm,
+        // sRGB (ver `make_empty_photo`): evita el lavado de color.
+        format: wgpu::TextureFormat::Rgba8UnormSrgb,
         usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
         view_formats: &[],
     });
