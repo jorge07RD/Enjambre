@@ -108,6 +108,13 @@ programe explícitamente.
   partículas se agrupan para formarlo. Slider de **fijación** (de "texto vivo" que respira a
   "nítido" para leerse claro), opción de **teñir** de un color o mantener el arcoíris, y botón
   **Soltar** para liberar el enjambre. Cuantas más partículas, más legible.
+- 🖼️ **Recrear una foto o un vídeo con las partículas:** importa una imagen (o un **vídeo**) y marca
+  **«Recrear colores de la foto»**: las partículas se acomodan en un **mosaico puntillista** que toma
+  los colores reales de la imagen y, ya formadas, la foto nítida se **funde encima**. Con **vídeo**,
+  una vez formada la imagen **se reproduce sobre el enjambre** y, al acabar, **sale sola** en reverso
+  (la imagen se desvanece, quedan las partículas con la silueta y se liberan). Las partículas que no
+  forman la imagen siguen su comportamiento y **chocan** con ella. Al **grabar**, el **audio del vídeo**
+  se incluye en el `.mp4`. (Requiere `ffmpeg`.)
 
 ![Modo "matriz": clústeres orgánicos mezclando colores según la tabla 6×6](docs/img/02-matriz.png)
 
@@ -122,7 +129,7 @@ programe explícitamente.
 | Paralelismo | [`rayon`](https://crates.io/crates/rayon) |
 | Aleatoriedad | [`rand`](https://crates.io/crates/rand) |
 | Diálogo de carpeta | [`rfd`](https://crates.io/crates/rfd) (portal XDG) |
-| Codificación de vídeo | [`ffmpeg`](https://ffmpeg.org/) (externo) |
+| Vídeo (grabar + decodificar fotogramas), audio | [`ffmpeg`](https://ffmpeg.org/) / `ffprobe` (externo) |
 
 ## 🚀 Compilar y ejecutar
 
@@ -192,6 +199,25 @@ cargo test -p sim --release throughput -- --nocapture
 > o `-hyprland`). Sin portal, se guarda en el directorio actual.
 
 ![Recuadro de encuadre 9:16 con rejilla de tercios sobre el lienzo, y el panel de control](docs/img/06-encuadre.png)
+
+## 🖼️ Formar una foto o un vídeo con las partículas
+
+En la sección **Mensaje / Forma** del panel:
+
+1. Pulsa **«🖼️ Imagen…»** y elige una **imagen** (PNG/JPG/WEBP…) o un **vídeo**
+   (MP4/MOV/MKV/WEBM/AVI/M4V).
+2. Marca **«Recrear colores de la foto»** (se activa **sola** al elegir un vídeo). Las partículas
+   se acomodan formando un **mosaico** con los colores reales de la imagen y, al terminar de
+   formarse, la imagen nítida se **funde encima**.
+3. Con un **vídeo**, la reproducción arranca **cuando la imagen ya está formada** y se reproduce
+   **una vez** sobre el enjambre; al acabar **sale sola** (la misma transición en reverso). Pulsa
+   **Soltar** para liberarla antes de tiempo.
+4. **Grabando** (tecla `R`): el **audio del vídeo** se muxea en el `.mp4` en el momento en que
+   aparece; si además hay **música** cargada, se **mezclan**.
+
+> Una imagen con **transparencia** (PNG sin fondo) recluta partículas **solo** donde hay dibujo; el
+> resto del enjambre sigue su comportamiento y **choca** con la figura. Requiere **`ffmpeg`**/`ffprobe`
+> (decodifica los fotogramas del vídeo por streaming, sin cargarlo entero en memoria).
 
 ## 🎞️ Escenas (instantáneas de configuración)
 

@@ -198,8 +198,9 @@ impl Recorder {
     }
 
     /// Vuelca lo pendiente, cierra la tubería (EOF → ffmpeg finaliza el .mp4)
-    /// y espera a que termine de escribir.
-    pub fn finish(mut self, device: &wgpu::Device) {
+    /// y espera a que termine de escribir. Devuelve la ruta del `.mp4` (para un
+    /// posible post-muxeo del audio del vídeo del efecto foto).
+    pub fn finish(mut self, device: &wgpu::Device) -> String {
         while !self.pending.is_empty() {
             if let Err(e) = self.drain_one(device) {
                 eprintln!("Grabación: error volcando los últimos frames: {e}");
@@ -214,5 +215,6 @@ impl Recorder {
             self.frames,
             self.frames as f32 / REC_FPS as f32
         );
+        self.path.clone()
     }
 }

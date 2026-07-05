@@ -197,8 +197,11 @@ struct State {
     /// Fuente de fotogramas en streaming (solo tras arrancar). `video_frozen` se
     /// activa al soltar para congelar el frame visible durante el reverso.
     video: Option<VideoSource>,
-    video_seq: u64,
     video_frozen: bool,
+    /// Para muxear el audio del vídeo en la grabación: (ruta, frame de grabación
+    /// en que arrancó la reproducción) y si la grabación lleva música.
+    rec_video: Option<(String, u32)>,
+    rec_music: bool,
     recorder: Option<rec::Recorder>,
     // Panel egui embebido (mismo `config_panel` que `sim` y `panel`).
     panel: PanelState,
@@ -314,8 +317,9 @@ impl State {
             photo_releasing: false,
             video_pending: None,
             video: None,
-            video_seq: 0,
             video_frozen: false,
+            rec_video: None,
+            rec_music: false,
             recorder: None,
             panel,
             panel_visible: true,
@@ -337,8 +341,7 @@ impl State {
             // La captura tiene resolución fija: cambiar la ventana la corta.
             if let Some(r) = self.recorder.take() {
                 eprintln!("Grabación detenida por el cambio de tamaño de la ventana.");
-                r.finish(&self.device);
-                self.panel.recording = false;
+                self.finish_recording(r);
             }
         }
     }
@@ -387,6 +390,7 @@ impl State {
         self.photo_loaded = false;
         self.photo_releasing = false;
         self.video = None;
+        self.video_pending = None;
         self.shape.n = self.sim.upload_shape_targets(&self.queue, &pts);
         self.shape.blend = 0.0;
         self.shape.target = 1.0;
@@ -404,25 +408,19 @@ impl State {
         // fotograma RGBA. El vídeo, además, refresca la textura en el bucle
         // (`advance_video`) hasta que se suelta (se congela en el frame visible).
         let (rgba, w, h) = if is_video_path(&self.params.shape_image) {
-            match VideoSource::open(&self.params.shape_image, 720) {
-                Some(v) => {
-                    let (w, h) = v.dims();
-                    let Some(first) = v.first_frame(std::time::Duration::from_secs(5)) else {
-                        self.overlay_target = 0.0;
-                        return;
-                    };
-                    self.video = Some(v);
-                    self.video_seq = 0;
-                    self.video_frozen = false;
-                    (first, w, h)
-                }
-                None => {
-                    self.overlay_target = 0.0;
-                    return;
-                }
-            }
+            // Solo el primer fotograma para el mosaico/overlay; el streaming se
+            // abre diferido (cuando la imagen se forma del todo).
+            let Some(frame) = VideoSource::decode_first_frame(&self.params.shape_image, 720) else {
+                self.overlay_target = 0.0;
+                return;
+            };
+            self.video = None;
+            self.video_frozen = false;
+            self.video_pending = Some(self.params.shape_image.clone());
+            frame
         } else {
             self.video = None;
+            self.video_pending = None;
             let Some(frame) = shape::decode_image_rgba(&self.params.shape_image) else {
                 self.overlay_target = 0.0;
                 return;
@@ -458,11 +456,21 @@ impl State {
         }
     }
 
+    /// Cierra la grabación y, si durante ella se reprodujo un vídeo del efecto
+    /// foto, muxea su audio en el `.mp4` al offset en que apareció.
+    fn finish_recording(&mut self, r: rec::Recorder) {
+        let path = r.finish(&self.device);
+        if let Some((src, start_frame)) = self.rec_video.take() {
+            let offset = start_frame as f32 / rec::REC_FPS as f32;
+            shared::video::overlay_audio(&path, &src, offset, self.rec_music);
+        }
+        self.panel.recording = false;
+    }
+
     /// Arranca o detiene la grabación de vídeo (tecla R o botón del panel).
     fn toggle_record(&mut self) {
         if let Some(r) = self.recorder.take() {
-            r.finish(&self.device);
-            self.panel.recording = false;
+            self.finish_recording(r);
             return;
         }
         match rec::Recorder::start(
@@ -474,6 +482,8 @@ impl State {
         ) {
             Ok(r) => {
                 self.recorder = Some(r);
+                self.rec_music = !self.panel.music_path.is_empty();
+                self.rec_video = None;
                 self.panel.recording = true;
             }
             Err(e) => eprintln!("No se pudo iniciar la grabación (¿está ffmpeg?): {e}"),
@@ -740,18 +750,40 @@ impl State {
         self.params.advance_speed(dt);
         self.shape
             .advance(dt, self.params.shape_transition_duration);
-        // Vídeo: sube el fotograma más reciente a la textura de la foto (la leen
-        // el mosaico y el overlay). Al soltar se congela en el frame visible,
-        // que es el que se ve al desvanecerse el overlay en el reverso.
+        // Vídeo: arranque DIFERIDO — la reproducción empieza solo cuando la
+        // imagen ya se formó del todo (overlay revelado), para que arranque
+        // desde el primer fotograma justo al aparecer nítida.
+        if self.photo_loaded
+            && !self.photo_releasing
+            && self.video.is_none()
+            && self.overlay_reveal >= 0.99
+        {
+            if let Some(path) = self.video_pending.take() {
+                // Grabando: anota el offset (frame actual) para muxear su audio.
+                if let Some(r) = self.recorder.as_ref() {
+                    self.rec_video = Some((path.clone(), r.frames));
+                }
+                self.video = VideoSource::open(&path, 720);
+                self.video_frozen = false;
+            }
+        }
+        // Avanza el vídeo con el `dt` del show (1/60 grabando) y sube el
+        // fotograma actual a la textura de la foto (la leen el mosaico y el
+        // overlay). Al soltar se congela en el frame visible, que es el que se
+        // ve al desvanecerse el overlay en el reverso.
         if self.photo_releasing {
             self.video_frozen = true;
         }
         if !self.video_frozen && self.video.is_some() {
-            let mut seq = self.video_seq;
-            let new = self.video.as_ref().and_then(|v| v.poll(&mut seq));
-            self.video_seq = seq;
+            let new = self.video.as_mut().and_then(|v| v.advance(dt));
             if let Some(bytes) = new {
                 self.sim.update_photo_frame(&self.queue, &bytes);
+            }
+            // Reproducido una vez → salida en reverso automática.
+            let ended = self.video.as_ref().map(|v| v.ended()).unwrap_or(false);
+            if ended && !self.photo_releasing {
+                self.photo_releasing = true;
+                self.overlay_target = 0.0;
             }
         }
         // Entrada: la foto se funde encima SOLO cuando las partículas ya se
@@ -779,6 +811,7 @@ impl State {
             self.photo_loaded = false;
             self.photo_releasing = false;
             self.video = None;
+            self.video_pending = None;
         }
 
         // Auto-avance de escenas (slideshow), como en la app CPU.
@@ -946,8 +979,7 @@ impl State {
                 Ok(()) => self.recorder = Some(r),
                 Err(e) => {
                     eprintln!("Grabación detenida (error escribiendo a ffmpeg): {e}");
-                    r.finish(&self.device);
-                    self.panel.recording = false;
+                    self.finish_recording(r);
                 }
             }
         }

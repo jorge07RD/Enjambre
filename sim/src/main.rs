@@ -633,16 +633,29 @@ impl Recorder {
 
     /// Cierra la tubería para que `ffmpeg` finalice el `.mp4` y espera a que
     /// termine de escribir.
-    fn finish(self) {
+    /// Cierra la grabación y devuelve la ruta del `.mp4` guardado (para un
+    /// posible post-muxeo del audio del vídeo del efecto foto).
+    fn finish(self) -> String {
         drop(self.stdin); // EOF -> ffmpeg cierra el fichero limpiamente
+        let path = self.path.clone();
+        let frames = self.frames;
         let mut child = self.child;
         let _ = child.wait();
         eprintln!(
-            "■ Vídeo guardado: {} ({} frames · {:.1}s a {REC_FPS} fps)",
-            self.path,
-            self.frames,
-            self.frames as f32 / REC_FPS as f32
+            "■ Vídeo guardado: {path} ({frames} frames · {:.1}s a {REC_FPS} fps)",
+            frames as f32 / REC_FPS as f32
         );
+        path
+    }
+}
+
+/// Cierra la grabación y, si durante ella se reprodujo un vídeo del efecto
+/// foto, muxea su audio en el `.mp4` al offset en que apareció.
+fn finish_recording(r: Recorder, rec_video: &mut Option<(String, u32)>, has_music: bool) {
+    let path = r.finish();
+    if let Some((src, start_frame)) = rec_video.take() {
+        let offset = start_frame as f32 / REC_FPS as f32;
+        shared::video::overlay_audio(&path, &src, offset, has_music);
     }
 }
 
@@ -884,6 +897,11 @@ async fn main() {
     // El tema egui (visuales + fuente de iconos) se instala una vez.
     let mut theme_applied = false;
     let mut rec: Option<Recorder> = None;
+    // Marcador para muxear el audio del vídeo del efecto foto en la grabación:
+    // (ruta del vídeo, frame de grabación en que arrancó su reproducción) y si
+    // la grabación lleva música (para mezclar en vez de sustituir).
+    let mut rec_video: Option<(String, u32)> = None;
+    let mut rec_music = false;
     // Recuadro de encuadre de grabación (estado local, lo mueve el ratón).
     let mut show_frame = false;
     let mut frame_preset = 0usize;
@@ -1036,7 +1054,7 @@ async fn main() {
                     sequencer.timer = 0.0;
                     if sequencer.playlist.start_on_record {
                         if let Some(r) = rec.take() {
-                            r.finish();
+                            finish_recording(r, &mut rec_video, rec_music);
                         }
                     }
                 } else if let Some(v) = sequencer.find_valid(&store, next % n, 1) {
@@ -1260,9 +1278,15 @@ async fn main() {
             }
             // Aparición/disolución fluida de la forma (fase A, posición + color).
             sim.advance_shape(get_frame_time(), params.shape_transition_duration);
-            // Vídeo: sube el fotograma actual (si la foto es un vídeo); al
-            // soltar se congela en el frame visible para el reverso.
-            sim.advance_video();
+            // Vídeo: avanza con el `dt` del show (1/60 grabando) — si la foto
+            // es un vídeo, sube el fotograma actual; al soltar se congela en el
+            // frame visible para el reverso. Al arrancar la reproducción durante
+            // una grabación, anota el offset para muxear su audio al terminar.
+            if sim.advance_video(show_dt) {
+                if let (Some(r), Some(path)) = (rec.as_ref(), sim.video_path()) {
+                    rec_video = Some((path.to_string(), r.frames));
+                }
+            }
             // Efecto foto (fase B + salida en reverso): la imagen se funde tras
             // acomodarse; al soltar, se va primero la imagen y luego la forma.
             sim.advance_photo_effect(get_frame_time(), params.shape_transition_duration);
@@ -1556,10 +1580,12 @@ async fn main() {
                     init_sent = false;
                 }
                 PanelEvent::ToggleRecord => match rec.take() {
-                    Some(r) => r.finish(),
+                    Some(r) => finish_recording(r, &mut rec_video, rec_music),
                     None => match Recorder::start(preset_w, preset_h, &video_dir, &st.music_path) {
                         Ok(r) => {
                             rec = Some(r);
+                            rec_music = !st.music_path.is_empty();
+                            rec_video = None;
                             // La música del .mp4 empieza en 0 con el frame 0:
                             // rebobinar el cursor de beats.
                             beat_cursor = 0;
@@ -2252,7 +2278,7 @@ async fn main() {
             set_default_camera();
             if let Err(e) = r.capture() {
                 eprintln!("Grabación detenida (error escribiendo a ffmpeg): {e}");
-                rec.take().unwrap().finish();
+                finish_recording(rec.take().unwrap(), &mut rec_video, rec_music);
             }
         }
         // Restaurar el brillo base tras el render/grabación.

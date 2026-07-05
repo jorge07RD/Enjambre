@@ -34,10 +34,9 @@ pub struct Photo {
     /// la imagen se ha formado del todo (overlay revelado).
     video_path: Option<String>,
     /// Fuente de fotogramas activa (solo tras arrancar la reproducción). Al
-    /// avanzar (`advance_video`) se sube el fotograma más reciente a
-    /// `tex`/`bytes`; al soltar se congela (`frozen`) en el frame visible.
+    /// avanzar (`advance_video`) se sube el fotograma actual a `tex`/`bytes`; al
+    /// soltar se congela (`frozen`) en el frame visible.
     video: Option<VideoSource>,
-    video_seq: u64,
     frozen: bool,
 }
 
@@ -164,7 +163,6 @@ impl Simulation {
             extent: Vec2::new(iw * scale, ih * scale),
             video_path: None,
             video: None,
-            video_seq: 0,
             frozen: false,
         });
         self.overlay_reveal = 0.0;
@@ -178,43 +176,43 @@ impl Simulation {
         if let Some(p) = self.photo.as_mut() {
             p.video_path = Some(path);
             p.video = None;
-            p.video_seq = 0;
             p.frozen = false;
         }
     }
 
-    /// Avanza el vídeo de la foto (si lo es). Arranca la reproducción SOLO
-    /// cuando la imagen ya está formada del todo (overlay revelado), para que
-    /// empiece desde el primer fotograma justo al aparecer nítida. Sube el
-    /// fotograma más reciente; cuando el vídeo termina (se reprodujo una vez)
-    /// dispara la salida en reverso. Al soltar se congela en el frame visible.
-    pub fn advance_video(&mut self) {
+    /// Avanza el vídeo de la foto (si lo es) `dt` segundos. Arranca la
+    /// reproducción SOLO cuando la imagen ya está formada del todo (overlay
+    /// revelado), para que empiece desde el primer fotograma justo al aparecer
+    /// nítida. Sube el fotograma actual; cuando el vídeo termina (se reprodujo
+    /// una vez) dispara la salida en reverso. Al soltar se congela en el frame
+    /// visible. Devuelve `true` justo en el frame en que arranca la
+    /// reproducción (para marcar el offset de audio al grabar).
+    pub fn advance_video(&mut self, dt: f32) -> bool {
         let releasing = self.photo_releasing;
         let formed = self.overlay_reveal >= 0.99;
         let mut ended = false;
+        let mut just_started = false;
         {
-            let Some(p) = self.photo.as_mut() else { return };
+            let Some(p) = self.photo.as_mut() else { return false };
             if p.video_path.is_none() {
-                return; // imagen fija
+                return false; // imagen fija
             }
             if releasing {
                 p.frozen = true;
             }
             if p.frozen {
-                return;
+                return false;
             }
             // Arranque diferido: abre el streaming al terminar de formarse.
             if p.video.is_none() && formed {
                 if let Some(path) = p.video_path.as_deref() {
                     p.video = VideoSource::open(path, 720);
-                    p.video_seq = 0;
+                    just_started = p.video.is_some();
                 }
             }
             if p.video.is_some() {
-                let mut seq = p.video_seq;
-                let new = p.video.as_ref().and_then(|v| v.poll(&mut seq));
+                let new = p.video.as_mut().and_then(|v| v.advance(dt));
                 ended = p.video.as_ref().map(|v| v.ended()).unwrap_or(false);
-                p.video_seq = seq;
                 if let Some(bytes) = new {
                     p.update_frame(bytes);
                 }
@@ -225,6 +223,13 @@ impl Simulation {
         if ended && !self.photo_releasing {
             self.photo_releasing = true;
         }
+        just_started
+    }
+
+    /// Ruta del vídeo activo (para muxear su audio en la grabación), si la foto
+    /// es un vídeo y ya está reproduciéndose.
+    pub fn video_path(&self) -> Option<&str> {
+        self.photo.as_ref().and_then(|p| p.video_path.as_deref())
     }
 
     /// Suelta la foto en REVERSO: primero se desvanece la imagen (dejando ver

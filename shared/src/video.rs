@@ -3,22 +3,30 @@
 //! Para el efecto foto con vídeo: en vez de una textura fija, alimentamos
 //! fotogramas RGBA en el tiempo. Se lanza `ffmpeg` (debe estar en el `PATH`),
 //! que escupe vídeo crudo `rgba` por su `stdout`; un hilo lee fotograma a
-//! fotograma y guarda siempre el más reciente. El render coge el último con
-//! `poll` al ritmo que quiera (pacing por `-re` en tiempo real). Sin
-//! dependencias nativas de Rust y aguanta clips de cualquier duración porque
-//! nunca carga el vídeo entero en memoria (solo un fotograma).
+//! fotograma y los mete en una cola acotada (con contrapresión: si nadie
+//! consume, `ffmpeg` se pausa). El consumidor avanza la reproducción con
+//! `advance(dt)`, sacando fotogramas al ritmo de los FPS del vídeo pero
+//! gobernado por el `dt` de la simulación. Así funciona igual en vivo (dt real)
+//! que grabando (dt fijo 1/60): el vídeo avanza en tiempo de simulación, no de
+//! reloj de pared, y el audio muxeado a posteriori cuadra con la imagen.
+//!
+//! Sin dependencias nativas de Rust y aguanta clips de cualquier duración
+//! porque nunca carga el vídeo entero en memoria.
 
 use std::io::Read;
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::mpsc::{sync_channel, Receiver, TryRecvError};
+use std::sync::Arc;
 use std::thread::JoinHandle;
-use std::time::{Duration, Instant};
 
 /// Extensiones que tratamos como vídeo (el resto se decodifican como imagen
 /// fija con el crate `image`/macroquad). El `gif` se deja como imagen (primer
 /// fotograma) por simplicidad.
 const VIDEO_EXTS: &[&str] = &["mp4", "mov", "mkv", "webm", "avi", "m4v"];
+
+/// FPS por defecto si `ffprobe` no reporta uno válido.
+const DEFAULT_FPS: f32 = 30.0;
 
 /// `true` si la ruta apunta a un contenedor de vídeo (por extensión).
 pub fn is_video_path(path: &str) -> bool {
@@ -29,45 +37,41 @@ pub fn is_video_path(path: &str) -> bool {
         .unwrap_or(false)
 }
 
-/// El fotograma más reciente decodificado, con un contador que se incrementa
-/// en cada nuevo fotograma (para que el consumidor sepa si hay algo nuevo).
-struct FrameSlot {
-    seq: u64,
-    bytes: Vec<u8>,
-}
-
 /// Fuente de vídeo en streaming: mantiene vivo un `ffmpeg` que produce
-/// fotogramas RGBA `w`×`h` en tiempo real, UNA sola vez (sin bucle). Al
-/// terminar de leer marca `ended`.
+/// fotogramas RGBA `w`×`h` UNA vez (sin bucle). El consumidor los saca con
+/// `advance(dt)`; al agotarse la entrada, `ended()` pasa a `true`.
 pub struct VideoSource {
     w: u32,
     h: u32,
-    latest: Arc<Mutex<FrameSlot>>,
+    fps: f32,
+    rx: Receiver<Vec<u8>>,
     stop: Arc<AtomicBool>,
-    ended: Arc<AtomicBool>,
     child: Child,
     _reader: JoinHandle<()>,
+    /// Acumulador de tiempo para decidir cuántos fotogramas sacar por `dt`.
+    acc: f32,
+    /// El emisor se desconectó y la cola se vació: el vídeo terminó.
+    finished: bool,
 }
 
 impl VideoSource {
     /// Abre `path` con `ffmpeg`, escalando para que el lado mayor no supere
-    /// `max_dim` (preservando aspecto, dimensiones pares). Reproduce UNA vez en
-    /// tiempo real; al acabar, `ended()` pasa a `true`. `None` si
-    /// `ffprobe`/`ffmpeg` fallan.
+    /// `max_dim` (aspecto preservado, dimensiones pares). Se reproduce UNA vez.
+    /// `None` si `ffprobe`/`ffmpeg` fallan.
     pub fn open(path: &str, max_dim: u32) -> Option<VideoSource> {
         let (nw, nh) = probe_dims(path)?;
         let (w, h) = scaled_even(nw, nh, max_dim.max(2));
+        let fps = probe_fps(path).unwrap_or(DEFAULT_FPS);
         let frame_bytes = (w as usize) * (h as usize) * 4;
 
-        // `-re`: leer a la velocidad nativa (pacing en tiempo real por el pipe).
-        // `-an`: sin audio. Salida cruda RGBA por stdout. Sin `-stream_loop`:
-        // se reproduce una sola vez.
+        // Sin `-re`: el pacing lo lleva el consumidor (`advance`). `ffmpeg`
+        // decodifica tan rápido como se vacíe la cola (contrapresión del pipe).
+        // `-an`: sin audio. Salida cruda RGBA por stdout.
         let mut child = Command::new("ffmpeg")
             .args([
                 "-hide_banner",
                 "-loglevel",
                 "error",
-                "-re",
                 "-i",
                 path,
                 "-an",
@@ -87,31 +91,34 @@ impl VideoSource {
             .ok()?;
 
         let mut stdout = child.stdout.take()?;
-        let latest = Arc::new(Mutex::new(FrameSlot { seq: 0, bytes: Vec::new() }));
+        // Cola acotada: unos pocos fotogramas de holgura; el `send` bloquea
+        // cuando está llena → `ffmpeg` se pausa (no decodifica de más).
+        let (tx, rx) = sync_channel::<Vec<u8>>(8);
         let stop = Arc::new(AtomicBool::new(false));
-        let ended = Arc::new(AtomicBool::new(false));
 
         let reader = {
-            let latest = Arc::clone(&latest);
             let stop = Arc::clone(&stop);
-            let ended = Arc::clone(&ended);
             std::thread::spawn(move || {
-                let mut buf = vec![0u8; frame_bytes];
-                while !stop.load(Ordering::Relaxed) {
+                loop {
+                    if stop.load(Ordering::Relaxed) {
+                        break;
+                    }
+                    let mut buf = vec![0u8; frame_bytes];
                     // Un fotograma completo o se acabó (EOF / proceso muerto).
                     if stdout.read_exact(&mut buf).is_err() {
                         break;
                     }
-                    let mut slot = latest.lock().unwrap();
-                    slot.seq += 1;
-                    slot.bytes.clear();
-                    slot.bytes.extend_from_slice(&buf);
+                    // Bloquea si la cola está llena (contrapresión). Si el
+                    // receptor se soltó, termina.
+                    if tx.send(buf).is_err() {
+                        break;
+                    }
                 }
-                ended.store(true, Ordering::Relaxed);
+                // Al salir se suelta `tx`: el receptor verá `Disconnected`.
             })
         };
 
-        Some(VideoSource { w, h, latest, stop, ended, child, _reader: reader })
+        Some(VideoSource { w, h, fps, rx, stop, child, _reader: reader, acc: 0.0, finished: false })
     }
 
     /// Decodifica SOLO el primer fotograma (RGBA) con las mismas dimensiones
@@ -155,40 +162,42 @@ impl VideoSource {
         (self.w, self.h)
     }
 
-    /// `true` cuando el vídeo terminó de reproducirse (EOF) una vez.
+    /// `true` cuando el vídeo terminó de reproducirse (EOF) y la cola se vació.
     pub fn ended(&self) -> bool {
-        self.ended.load(Ordering::Relaxed)
+        self.finished
     }
 
-    /// Bloquea hasta que llegue el primer fotograma (o expire `timeout`).
-    /// Devuelve una copia de sus bytes RGBA.
-    pub fn first_frame(&self, timeout: Duration) -> Option<Vec<u8>> {
-        let start = Instant::now();
-        loop {
-            {
-                let slot = self.latest.lock().unwrap();
-                if slot.seq > 0 {
-                    return Some(slot.bytes.clone());
+    /// Avanza la reproducción `dt` segundos de tiempo de simulación y devuelve
+    /// el fotograma que debe mostrarse ahora (el más nuevo de los que tocaba
+    /// sacar), o `None` si no hay fotograma nuevo este paso. Si la entrada se
+    /// agotó, marca `ended`.
+    pub fn advance(&mut self, dt: f32) -> Option<Vec<u8>> {
+        if self.finished {
+            return None;
+        }
+        let spf = 1.0 / self.fps.max(1.0);
+        self.acc += dt.max(0.0);
+        // Acota el "catch-up" tras un parón (p.ej. el arranque del decodificador)
+        // a unos pocos fotogramas: evita saltarse el principio del vídeo de golpe.
+        self.acc = self.acc.min(spf * 4.0);
+        let mut latest = None;
+        while self.acc >= spf {
+            match self.rx.try_recv() {
+                Ok(frame) => {
+                    latest = Some(frame);
+                    self.acc -= spf;
+                }
+                // Aún no hay fotograma listo (decodificando): esperamos al
+                // próximo paso sin gastar el acumulador.
+                Err(TryRecvError::Empty) => break,
+                // El hilo lector terminó y la cola está vacía: fin del vídeo.
+                Err(TryRecvError::Disconnected) => {
+                    self.finished = true;
+                    break;
                 }
             }
-            if start.elapsed() >= timeout {
-                eprintln!("El primer fotograma de vídeo no llegó a tiempo.");
-                return None;
-            }
-            std::thread::sleep(Duration::from_millis(8));
         }
-    }
-
-    /// Si hay un fotograma más nuevo que `*last_seq`, actualiza `*last_seq` y
-    /// devuelve una copia de sus bytes RGBA; si no, `None`.
-    pub fn poll(&self, last_seq: &mut u64) -> Option<Vec<u8>> {
-        let slot = self.latest.lock().unwrap();
-        if slot.seq != *last_seq && slot.seq > 0 {
-            *last_seq = slot.seq;
-            Some(slot.bytes.clone())
-        } else {
-            None
-        }
+        latest
     }
 }
 
@@ -197,6 +206,64 @@ impl Drop for VideoSource {
         self.stop.store(true, Ordering::Relaxed);
         let _ = self.child.kill();
         let _ = self.child.wait();
+    }
+}
+
+/// `true` si `path` tiene al menos una pista de audio (para no intentar muxear
+/// el audio de un vídeo mudo).
+pub fn has_audio(path: &str) -> bool {
+    let out = Command::new("ffprobe")
+        .args([
+            "-v", "error", "-select_streams", "a", "-show_entries", "stream=index", "-of",
+            "csv=p=0", path,
+        ])
+        .output();
+    matches!(out, Ok(o) if o.status.success() && !o.stdout.is_empty())
+}
+
+/// Mezcla en el `.mp4` grabado (`recorded`) el audio del vídeo `src` empezando
+/// en `offset_secs` (cuando el vídeo apareció en el show). Si el grabado ya
+/// tiene audio (música), se mezclan (`amix`); si no, se añade el audio del
+/// vídeo con silencio antes del offset. Reencoda solo el audio (`-c:v copy`).
+/// No hace nada si `src` no tiene audio. Sobrescribe `recorded` al terminar.
+pub fn overlay_audio(recorded: &str, src: &str, offset_secs: f32, mix_existing: bool) {
+    if !has_audio(src) {
+        return;
+    }
+    let delay_ms = (offset_secs.max(0.0) * 1000.0).round() as i64;
+    let tmp = format!("{recorded}.mux.mp4");
+    // Retrasa el audio del vídeo (input 1) y, si hay música (input 0 con audio),
+    // lo mezcla con ella.
+    let filter = if mix_existing {
+        format!(
+            "[1:a]adelay={delay_ms}:all=1[da];[0:a][da]amix=inputs=2:duration=first:normalize=0[a]"
+        )
+    } else {
+        format!("[1:a]adelay={delay_ms}:all=1[a]")
+    };
+    let status = Command::new("ffmpeg")
+        .args([
+            "-y", "-i", recorded, "-i", src, "-filter_complex", &filter, "-map", "0:v:0", "-map",
+            "[a]", "-c:v", "copy", "-c:a", "aac", "-b:a", "192k", "-shortest", "-movflags",
+            "+faststart", &tmp,
+        ])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status();
+    match status {
+        Ok(s) if s.success() => {
+            if let Err(e) = std::fs::rename(&tmp, recorded) {
+                eprintln!("No pude reemplazar el vídeo con el audio muxeado: {e}");
+                let _ = std::fs::remove_file(&tmp);
+            } else {
+                eprintln!("♪ Audio del vídeo añadido a la grabación.");
+            }
+        }
+        _ => {
+            eprintln!("No pude muxear el audio del vídeo en la grabación.");
+            let _ = std::fs::remove_file(&tmp);
+        }
     }
 }
 
@@ -225,6 +292,28 @@ fn probe_dims(path: &str) -> Option<(u32, u32)> {
     let line = s.lines().next()?.trim();
     let (w, h) = line.split_once('x')?;
     Some((w.trim().parse().ok()?, h.trim().parse().ok()?))
+}
+
+/// FPS del stream de vídeo (`r_frame_rate`, p.ej. "30000/1001").
+fn probe_fps(path: &str) -> Option<f32> {
+    let out = Command::new("ffprobe")
+        .args([
+            "-v", "error", "-select_streams", "v:0", "-show_entries", "stream=r_frame_rate", "-of",
+            "csv=p=0", path,
+        ])
+        .output()
+        .ok()?;
+    let s = String::from_utf8_lossy(&out.stdout);
+    let r = s.lines().next()?.trim();
+    let fps = match r.split_once('/') {
+        Some((n, d)) => n.trim().parse::<f32>().ok()? / d.trim().parse::<f32>().ok()?.max(1.0),
+        None => r.parse::<f32>().ok()?,
+    };
+    if fps.is_finite() && fps > 1.0 {
+        Some(fps)
+    } else {
+        None
+    }
 }
 
 /// Escala `(w,h)` para que el lado mayor no exceda `max_dim`, preservando el
@@ -271,23 +360,23 @@ mod tests {
             eprintln!("(saltado: define ENJAMBRE_VIDEO_TEST=/ruta/clip.mp4)");
             return;
         };
-        let src = VideoSource::open(&path, 720).expect("abrir vídeo");
-        let (w, h) = src.dims();
-        assert!(w > 0 && h > 0 && w % 2 == 0 && h % 2 == 0);
-        let first = src.first_frame(Duration::from_secs(5)).expect("primer fotograma");
+        // Primer fotograma one-shot.
+        let (first, w, h) = VideoSource::decode_first_frame(&path, 720).expect("primer fotograma");
+        assert!(w % 2 == 0 && h % 2 == 0);
         assert_eq!(first.len(), (w * h * 4) as usize);
-        // Debe llegar al menos un fotograma más distinto (el vídeo avanza).
-        let mut seq = 1;
-        let start = Instant::now();
-        let mut got_new = false;
-        while start.elapsed() < Duration::from_secs(3) {
-            if let Some(f) = src.poll(&mut seq) {
+
+        // Streaming: avanzando ~1 s de simulación deben salir fotogramas.
+        let mut src = VideoSource::open(&path, 720).expect("abrir vídeo");
+        assert_eq!(src.dims(), (w, h));
+        let mut got = 0;
+        let start = std::time::Instant::now();
+        while got == 0 && start.elapsed() < std::time::Duration::from_secs(3) {
+            if let Some(f) = src.advance(1.0 / 60.0) {
                 assert_eq!(f.len(), (w * h * 4) as usize);
-                got_new = true;
-                break;
+                got += 1;
             }
-            std::thread::sleep(Duration::from_millis(16));
+            std::thread::sleep(std::time::Duration::from_millis(8));
         }
-        assert!(got_new, "no llegó ningún fotograma nuevo tras el primero");
+        assert!(got > 0, "no salió ningún fotograma del streaming");
     }
 }
