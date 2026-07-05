@@ -10,10 +10,14 @@
 //! vídeo con música (rec.rs, R o el botón del panel).
 //!
 //! Uso: `cargo run --release -p sim-gpu [n_partículas]` (por defecto 20000).
-//! Teclas: Espacio = pausa · H = panel · R = grabar · M = aleatorizar la
-//! matriz · U = anti-aglomeración · N/P = escena siguiente/anterior ·
-//! B = contorno · G = grid/naive · 1..9/0 = velocidad 10..90/100 % ·
-//! +/- = ±10 % · Esc = salir.
+//! Teclas: Espacio = pausa · . = paso · C = vaciar · F = llenar · S = soltar
+//! forma · Enter = formar el texto del panel · N/P = escena sig./ant. ·
+//! M = aleatorizar matriz · X = auto-aleatorizar · V = deriva gradual ·
+//! E = estelas · Y = bloom · A = atraer al centro · U = anti-aglomeración ·
+//! B = contorno · R = grabar · H = panel · G = grid/naive (debug) ·
+//! 1..9/0 = velocidad 10..90/100 % · +/- = ±10 % · Esc = salir.
+//! No aplican en el visor GPU (mundo fijo, panel embebido): L/Z (zoom/lienzo),
+//! D (separar panel), y G no alterna recuadro (aquí es el debug grid/naive).
 
 mod gpu_sim;
 mod rec;
@@ -23,7 +27,7 @@ use gpu_sim::{GpuSim, Mosaic, ShapeDrive};
 use rand::Rng;
 use shared::{
     config_panel, example_store, hue_for_index, is_video_path, ui_theme, PanelEvent, PanelState,
-    SceneStore, ShapeStore, SimParams, VideoSource, NUM_COLORS,
+    Playlist, SceneStore, SeqPlayback, ShapeStore, SimParams, VideoSource, NUM_COLORS,
 };
 use std::sync::Arc;
 use std::time::Instant;
@@ -115,6 +119,12 @@ fn cycle_scene(
     start_scene(params, &target, smooth, dur)
 }
 
+/// Fecha de última modificación de un fichero (para la recarga en caliente).
+/// `None` si no existe o no se puede leer.
+fn file_mtime(path: &std::path::Path) -> Option<std::time::SystemTime> {
+    std::fs::metadata(path).and_then(|m| m.modified()).ok()
+}
+
 /// Estado runtime de la forma activa (port de la parte de forma de
 /// `Simulation` en la CPU): los puntos meta viven en la GPU; aquí solo la
 /// mezcla de aparición/disolución y cuántos puntos hay subidos.
@@ -176,6 +186,18 @@ struct State {
     morph: Option<SceneMorph>,
     autoplay_timer: f32,
     auto_rand_timer: f32,
+    // Secuenciador (show): reproduce la playlist (`playlist.json`) con duración
+    // propia por entrada. La playlist vive en `panel.seq_playlist` (la edita el
+    // panel embebido); aquí guardamos solo el estado de reproducción.
+    seq_state: SeqPlayback,
+    seq_idx: usize,
+    seq_timer: f32,
+    // Recarga en caliente: mtime de los ficheros de datos para detectar
+    // ediciones externas (p.ej. autoradas) y recargar sin reiniciar.
+    reload_timer: f32,
+    scenes_mtime: Option<std::time::SystemTime>,
+    playlist_mtime: Option<std::time::SystemTime>,
+    shapes_mtime: Option<std::time::SystemTime>,
     // Formas (texto/imagen) y grabación de vídeo (hito 6).
     shape_store: ShapeStore,
     // Fase A del efecto foto: las partículas se acomodan a una rejilla que
@@ -294,6 +316,11 @@ impl State {
         panel.default_scene = store.default.clone().unwrap_or_default();
         panel.particle_count = count as usize;
         panel.saved_shapes = shape_store.shapes.clone();
+        // Secuenciador: la playlist del show (misma `playlist.json` que el CPU).
+        panel.seq_playlist = Playlist::load();
+        let scenes_mtime = file_mtime(&shared::scenes_path());
+        let playlist_mtime = file_mtime(&shared::playlist_path());
+        let shapes_mtime = file_mtime(&shared::shapes_path());
 
         State {
             window,
@@ -308,6 +335,13 @@ impl State {
             morph: None,
             autoplay_timer: 0.0,
             auto_rand_timer: 0.0,
+            seq_state: SeqPlayback::Stopped,
+            seq_idx: 0,
+            seq_timer: 0.0,
+            reload_timer: 0.0,
+            scenes_mtime,
+            playlist_mtime,
+            shapes_mtime,
             shape_store,
             shape: ShapeState::default(),
             overlay_reveal: 0.0,
@@ -485,6 +519,14 @@ impl State {
                 self.rec_music = !self.panel.music_path.is_empty();
                 self.rec_video = None;
                 self.panel.recording = true;
+                // Show ligado a la grabación: arranca la secuencia desde el
+                // principio junto con ella (y, sin bucle, la para al terminar).
+                if self.panel.seq_playlist.start_on_record {
+                    if let Some(v) = self.seq_find_valid(0, 1) {
+                        self.seq_state = SeqPlayback::Playing;
+                        self.seq_launch(v);
+                    }
+                }
             }
             Err(e) => eprintln!("No se pudo iniciar la grabación (¿está ffmpeg?): {e}"),
         }
@@ -494,6 +536,25 @@ impl State {
     fn refresh_scenes(&mut self) {
         self.panel.scenes = self.store.names();
         self.panel.default_scene = self.store.default.clone().unwrap_or_default();
+    }
+
+    /// Guarda `scenes.json`, actualiza el mtime propio (para no auto-recargar) y
+    /// refresca el panel.
+    fn persist_scenes(&mut self) {
+        if let Err(e) = self.store.save() {
+            eprintln!("No se pudo guardar scenes.json: {e}");
+        }
+        self.scenes_mtime = file_mtime(&shared::scenes_path());
+        self.refresh_scenes();
+    }
+
+    /// Guarda `shapes.json`, actualiza el mtime propio y refresca el panel.
+    fn persist_shapes(&mut self) {
+        if let Err(e) = self.shape_store.save() {
+            eprintln!("No se pudo guardar shapes.json: {e}");
+        }
+        self.shapes_mtime = file_mtime(&shared::shapes_path());
+        self.panel.saved_shapes = self.shape_store.shapes.clone();
     }
 
     /// Cambia a la escena siguiente (+1) o anterior (-1).
@@ -508,6 +569,120 @@ impl State {
             self.panel.scene_transition_duration,
         );
         self.apply_scene_shape(&old_t, &old_i);
+    }
+
+    /// Índice de la primera entrada de la playlist cuya escena existe, desde
+    /// `start` en la dirección `dir` (±1) con envoltura. `None` = ninguna válida.
+    fn seq_find_valid(&self, start: usize, dir: i32) -> Option<usize> {
+        let entries = &self.panel.seq_playlist.entries;
+        let n = entries.len();
+        if n == 0 {
+            return None;
+        }
+        let mut i = start.min(n - 1) as i32;
+        for _ in 0..n {
+            let idx = i.rem_euclid(n as i32) as usize;
+            if self.store.get(&entries[idx].scene).is_some() {
+                return Some(idx);
+            }
+            i += dir;
+        }
+        None
+    }
+
+    /// Lanza la entrada `idx` de la playlist: carga su escena con la transición
+    /// propia de la entrada (o la global) y reinicia el cronómetro. Igual que
+    /// `LoadScene` pero desde el secuenciador.
+    fn seq_launch(&mut self, idx: usize) {
+        self.seq_idx = idx;
+        self.seq_timer = 0.0;
+        let Some(entry) = self.panel.seq_playlist.entries.get(idx).cloned() else {
+            return;
+        };
+        let dur = entry.transition.unwrap_or(self.panel.scene_transition_duration);
+        if let Some(pos) = self.store.scenes.iter().position(|s| s.name == entry.scene) {
+            self.scene_idx = pos;
+            let target = self.store.scenes[pos].params.clone();
+            let (old_t, old_i) =
+                (self.params.shape_text.clone(), self.params.shape_image.clone());
+            self.morph = start_scene(&mut self.params, &target, self.panel.scene_smooth, dur);
+            self.apply_scene_shape(&old_t, &old_i);
+        }
+    }
+
+    /// Avanza el secuenciador `dt` segundos: al agotar la duración de la entrada
+    /// actual, salta a la siguiente válida (o para al final si no hay bucle).
+    fn seq_advance(&mut self, dt: f32) {
+        if self.seq_state != SeqPlayback::Playing || self.panel.seq_playlist.entries.is_empty() {
+            return;
+        }
+        self.seq_timer += dt;
+        let n = self.panel.seq_playlist.entries.len();
+        let cur = self.panel.seq_playlist.entries[self.seq_idx.min(n - 1)]
+            .duration
+            .max(0.1);
+        if self.seq_timer < cur {
+            return;
+        }
+        let next = self.seq_idx + 1;
+        if next >= n && !self.panel.seq_playlist.loop_at_end {
+            // Show terminado: parar (y cerrar la grabación si la arrancó el show).
+            self.seq_state = SeqPlayback::Stopped;
+            self.seq_idx = 0;
+            self.seq_timer = 0.0;
+            if self.panel.seq_playlist.start_on_record {
+                if let Some(r) = self.recorder.take() {
+                    self.finish_recording(r);
+                }
+            }
+        } else if let Some(v) = self.seq_find_valid(next % n, 1) {
+            self.seq_launch(v);
+        } else {
+            self.seq_state = SeqPlayback::Stopped;
+        }
+    }
+
+    /// Recarga en caliente: si `scenes.json` / `playlist.json` / `shapes.json`
+    /// cambiaron en disco (edición externa), los recarga sin reiniciar. Se
+    /// ignoran las escrituras propias (que actualizan el mtime guardado al
+    /// guardar), así solo reacciona a cambios de fuera.
+    fn hot_reload(&mut self, dt: f32) {
+        self.reload_timer += dt;
+        if self.reload_timer < 0.5 {
+            return;
+        }
+        self.reload_timer = 0.0;
+
+        let sm = file_mtime(&shared::scenes_path());
+        if sm != self.scenes_mtime {
+            self.scenes_mtime = sm;
+            self.store = SceneStore::load();
+            self.scene_idx = self.scene_idx.min(self.store.scenes.len().saturating_sub(1));
+            self.refresh_scenes();
+            eprintln!("↻ scenes.json recargado ({} escenas).", self.store.scenes.len());
+        }
+
+        let pm = file_mtime(&shared::playlist_path());
+        if pm != self.playlist_mtime {
+            self.playlist_mtime = pm;
+            self.panel.seq_playlist = Playlist::load();
+            let n = self.panel.seq_playlist.entries.len();
+            if n == 0 {
+                self.seq_state = SeqPlayback::Stopped;
+                self.seq_idx = 0;
+            } else if self.seq_idx >= n {
+                self.seq_idx = n - 1;
+            }
+            eprintln!("↻ playlist.json recargado ({n} entradas).");
+        }
+
+        let hm = file_mtime(&shared::shapes_path());
+        if hm != self.shapes_mtime {
+            self.shapes_mtime = hm;
+            self.shape_store = ShapeStore::load();
+            self.panel.saved_shapes = self.shape_store.shapes.clone();
+            eprintln!("↻ shapes.json recargado ({} formas).", self.shape_store.shapes.len());
+        }
     }
 
     /// Resuelve el subconjunto de eventos del panel que aplican al visor GPU;
@@ -528,10 +703,7 @@ impl State {
             PanelEvent::SetSpeed(v) => self.params.set_speed(v),
             PanelEvent::SaveScene(name) => {
                 self.store.upsert(&name, self.params.settled());
-                if let Err(e) = self.store.save() {
-                    eprintln!("No se pudo guardar scenes.json: {e}");
-                }
-                self.refresh_scenes();
+                self.persist_scenes();
             }
             PanelEvent::LoadScene(name) => {
                 if let Some(pos) = self.store.scenes.iter().position(|s| s.name == name) {
@@ -550,17 +722,11 @@ impl State {
             }
             PanelEvent::DeleteScene(name) => {
                 self.store.remove(&name);
-                if let Err(e) = self.store.save() {
-                    eprintln!("No se pudo guardar scenes.json: {e}");
-                }
-                self.refresh_scenes();
+                self.persist_scenes();
             }
             PanelEvent::SetDefaultScene(name) => {
                 self.store.set_default(&name);
-                if let Err(e) = self.store.save() {
-                    eprintln!("No se pudo guardar scenes.json: {e}");
-                }
-                self.refresh_scenes();
+                self.persist_scenes();
             }
             PanelEvent::NextScene => self.cycle(1),
             PanelEvent::PrevScene => self.cycle(-1),
@@ -640,10 +806,7 @@ impl State {
                     return;
                 };
                 self.shape_store.upsert(&name, text, image);
-                if let Err(e) = self.shape_store.save() {
-                    eprintln!("No se pudo guardar la forma '{name}': {e}");
-                }
-                self.panel.saved_shapes = self.shape_store.shapes.clone();
+                self.persist_shapes();
             }
             PanelEvent::ApplyShape(name) => {
                 if let Some(s) = self.shape_store.get(&name) {
@@ -654,10 +817,62 @@ impl State {
             }
             PanelEvent::DeleteShape(name) => {
                 self.shape_store.remove(&name);
-                if let Err(e) = self.shape_store.save() {
-                    eprintln!("No se pudo borrar la forma '{name}': {e}");
+                self.persist_shapes();
+            }
+            // --- Secuenciador (show) ---
+            PanelEvent::SeqSetPlaylist(pl) => {
+                self.panel.seq_playlist = pl;
+                let n = self.panel.seq_playlist.entries.len();
+                if n == 0 {
+                    self.seq_state = SeqPlayback::Stopped;
+                    self.seq_idx = 0;
+                    self.seq_timer = 0.0;
+                } else if self.seq_idx >= n {
+                    self.seq_idx = n - 1;
                 }
-                self.panel.saved_shapes = self.shape_store.shapes.clone();
+                if let Err(e) = self.panel.seq_playlist.save() {
+                    eprintln!("No se pudo guardar playlist.json: {e}");
+                }
+                self.playlist_mtime = file_mtime(&shared::playlist_path());
+            }
+            PanelEvent::SeqPlay => match self.seq_state {
+                SeqPlayback::Paused => self.seq_state = SeqPlayback::Playing,
+                SeqPlayback::Stopped => {
+                    if let Some(v) = self.seq_find_valid(0, 1) {
+                        self.seq_state = SeqPlayback::Playing;
+                        self.seq_launch(v);
+                    }
+                }
+                SeqPlayback::Playing => {}
+            },
+            PanelEvent::SeqPause => {
+                if self.seq_state == SeqPlayback::Playing {
+                    self.seq_state = SeqPlayback::Paused;
+                }
+            }
+            PanelEvent::SeqStop => {
+                self.seq_state = SeqPlayback::Stopped;
+                self.seq_idx = 0;
+                self.seq_timer = 0.0;
+            }
+            PanelEvent::SeqNext => {
+                if let Some(v) = self.seq_find_valid(self.seq_idx + 1, 1) {
+                    self.seq_launch(v);
+                }
+            }
+            PanelEvent::SeqPrev => {
+                let start = self.seq_idx.saturating_sub(1);
+                if let Some(v) = self.seq_find_valid(start, -1) {
+                    self.seq_launch(v);
+                }
+            }
+            PanelEvent::SeqJump(i) => {
+                if self.panel.seq_playlist.entries.get(i).is_some() {
+                    if self.seq_state == SeqPlayback::Stopped {
+                        self.seq_state = SeqPlayback::Playing;
+                    }
+                    self.seq_launch(i);
+                }
             }
             _ => {}
         }
@@ -693,6 +908,45 @@ impl State {
                 // Anti-aglomeración: disolver bolas hiperdensas (on/off), para
                 // comparar con/sin al vuelo.
                 self.params.anti_clump = !self.params.anti_clump;
+            }
+            // --- Paridad de atajos con la app CPU (los que aplican al visor) ---
+            // Paso a paso (pausa + avanza un frame).
+            Key::Character(c) if c == "." => self.handle_event(PanelEvent::Step),
+            // Vaciar todas las partículas.
+            Key::Character(c) if c.eq_ignore_ascii_case("c") => {
+                self.handle_event(PanelEvent::Clear)
+            }
+            // Llenar aleatoriamente (con la cantidad del panel).
+            Key::Character(c) if c.eq_ignore_ascii_case("f") => {
+                self.handle_event(PanelEvent::Fill(self.panel.fill_count.max(0) as usize))
+            }
+            // Soltar la forma/texto activo (disolución fluida).
+            Key::Character(c) if c.eq_ignore_ascii_case("s") => {
+                self.handle_event(PanelEvent::ReleaseShape)
+            }
+            // Atraer las zonas activas al centro (on/off).
+            Key::Character(c) if c.eq_ignore_ascii_case("a") => {
+                self.params.attract_active = !self.params.attract_active;
+            }
+            // Auto-aleatorizar la matriz cada X s (on/off).
+            Key::Character(c) if c.eq_ignore_ascii_case("x") => {
+                self.params.auto_randomize = !self.params.auto_randomize;
+            }
+            // Deriva lenta y gradual del color/atracción (on/off).
+            Key::Character(c) if c.eq_ignore_ascii_case("v") => {
+                self.params.gradual = !self.params.gradual;
+            }
+            // Estelas de movimiento (on/off).
+            Key::Character(c) if c.eq_ignore_ascii_case("e") => {
+                self.params.trails = !self.params.trails;
+            }
+            // Resplandor cinematográfico / bloom (on/off).
+            Key::Character(c) if c.eq_ignore_ascii_case("y") => {
+                self.params.bloom = !self.params.bloom;
+            }
+            // Formar el texto escrito en el panel (si lo hay).
+            Key::Named(NamedKey::Enter) if !self.panel.shape_text.trim().is_empty() => {
+                self.handle_event(PanelEvent::FormText(self.panel.shape_text.clone()))
             }
             // Velocidad: 1..9 = 10..90 %, 0 = 100 % (como en la app CPU),
             // y +/- para pasos de ±10 % (hasta 300 %). Va por el sistema de
@@ -814,14 +1068,27 @@ impl State {
             self.video_pending = None;
         }
 
-        // Auto-avance de escenas (slideshow), como en la app CPU.
-        if self.panel.scene_autoplay && self.morph.is_none() && self.store.scenes.len() > 1 {
+        // Secuenciador (show): avanza la playlist con la duración por entrada.
+        self.seq_advance(dt);
+        // Auto-avance de escenas (slideshow): como en la app CPU, pero NO cuando
+        // el secuenciador está reproduciendo (tiene prioridad el show).
+        if self.panel.scene_autoplay
+            && self.seq_state != SeqPlayback::Playing
+            && self.morph.is_none()
+            && self.store.scenes.len() > 1
+        {
             self.autoplay_timer += dt;
             if self.autoplay_timer >= self.panel.scene_autoplay_interval.max(0.5) {
                 self.autoplay_timer = 0.0;
                 self.cycle(1);
             }
         }
+        // Recarga en caliente de scenes/playlist/shapes si cambian en disco.
+        self.hot_reload(dt);
+        // Refleja el estado del secuenciador en el panel embebido.
+        self.panel.seq_state = self.seq_state;
+        self.panel.seq_idx = self.seq_idx;
+        self.panel.seq_elapsed = self.seq_timer;
 
         // --- Panel egui (mismo `config_panel` que la app CPU) ---
         let raw = self.egui_state.take_egui_input(&self.window);
@@ -1072,9 +1339,10 @@ fn main() {
         .and_then(|a| a.parse().ok())
         .unwrap_or(20_000);
     eprintln!(
-        "Enjambre GPU · {count} partículas · Espacio pausa · H panel · R graba · M aleatoriza · \
-         U anti-aglomeración · N/P escena · B contorno · G grid/naive · 1..9/0 velocidad · \
-         +/- ±10 % · Esc sale"
+        "Enjambre GPU · {count} partículas · Espacio pausa · . paso · C vaciar · F llenar · \
+         S soltar · Enter formar texto · N/P escena · M aleatoriza · X auto-aleatoriza · \
+         V gradual · E estelas · Y bloom · A atraer-centro · U anti-aglomeración · B contorno · \
+         R graba · H panel · G grid/naive · 1..9/0 velocidad · +/- ±10 % · Esc sale"
     );
     let event_loop = EventLoop::new().expect("bucle de eventos");
     event_loop
