@@ -1,6 +1,9 @@
 use crate::grid::Grid;
-use shared::{hue_bucket, hue_for_index, BoidsScope, Boundary, InteractionMode, SimParams, NUM_COLORS};
-use macroquad::prelude::{Texture2D, Vec2};
+use shared::{
+    hue_bucket, hue_for_index, BoidsScope, Boundary, InteractionMode, SimParams, VideoSource,
+    NUM_COLORS,
+};
+use macroquad::prelude::{Image, Texture2D, Vec2};
 use rand::Rng;
 use rayon::prelude::*;
 
@@ -26,12 +29,33 @@ pub struct Photo {
     pub center: Vec2,
     /// Tamaño de la caja de la foto (mundo).
     pub extent: Vec2,
+    /// Ruta del vídeo, si la foto es un vídeo (`None` = imagen fija). Se guarda
+    /// para arrancar el streaming DIFERIDO: la reproducción no empieza hasta que
+    /// la imagen se ha formado del todo (overlay revelado).
+    video_path: Option<String>,
+    /// Fuente de fotogramas activa (solo tras arrancar la reproducción). Al
+    /// avanzar (`advance_video`) se sube el fotograma más reciente a
+    /// `tex`/`bytes`; al soltar se congela (`frozen`) en el frame visible.
+    video: Option<VideoSource>,
+    video_seq: u64,
+    frozen: bool,
 }
 
 impl Photo {
     /// Esquina superior izquierda de la caja (mundo), para dibujar la textura.
     pub fn origin(&self) -> Vec2 {
         self.center - self.extent * 0.5
+    }
+
+    /// Sustituye el fotograma (misma resolución): actualiza la textura GPU y
+    /// los bytes que muestrea el mosaico (`color_at`).
+    fn update_frame(&mut self, bytes: Vec<u8>) {
+        if bytes.len() != self.w * self.h * 4 {
+            return;
+        }
+        let img = Image { bytes, width: self.w as u16, height: self.h as u16 };
+        self.tex.update(&img);
+        self.bytes = img.bytes;
     }
 
     /// Color RGB [0,1] de la foto en la posición de mundo `p`, o `None` si `p`
@@ -138,10 +162,69 @@ impl Simulation {
             h,
             center: self.world * 0.5,
             extent: Vec2::new(iw * scale, ih * scale),
+            video_path: None,
+            video: None,
+            video_seq: 0,
+            frozen: false,
         });
         self.overlay_reveal = 0.0;
         self.overlay_target = 0.0;
         self.photo_releasing = false;
+    }
+
+    /// Marca la foto ya fijada (`set_photo`) como un vídeo cuya reproducción se
+    /// arrancará de forma diferida (ver `advance_video`).
+    pub fn set_video_path(&mut self, path: String) {
+        if let Some(p) = self.photo.as_mut() {
+            p.video_path = Some(path);
+            p.video = None;
+            p.video_seq = 0;
+            p.frozen = false;
+        }
+    }
+
+    /// Avanza el vídeo de la foto (si lo es). Arranca la reproducción SOLO
+    /// cuando la imagen ya está formada del todo (overlay revelado), para que
+    /// empiece desde el primer fotograma justo al aparecer nítida. Sube el
+    /// fotograma más reciente; cuando el vídeo termina (se reprodujo una vez)
+    /// dispara la salida en reverso. Al soltar se congela en el frame visible.
+    pub fn advance_video(&mut self) {
+        let releasing = self.photo_releasing;
+        let formed = self.overlay_reveal >= 0.99;
+        let mut ended = false;
+        {
+            let Some(p) = self.photo.as_mut() else { return };
+            if p.video_path.is_none() {
+                return; // imagen fija
+            }
+            if releasing {
+                p.frozen = true;
+            }
+            if p.frozen {
+                return;
+            }
+            // Arranque diferido: abre el streaming al terminar de formarse.
+            if p.video.is_none() && formed {
+                if let Some(path) = p.video_path.as_deref() {
+                    p.video = VideoSource::open(path, 720);
+                    p.video_seq = 0;
+                }
+            }
+            if p.video.is_some() {
+                let mut seq = p.video_seq;
+                let new = p.video.as_ref().and_then(|v| v.poll(&mut seq));
+                ended = p.video.as_ref().map(|v| v.ended()).unwrap_or(false);
+                p.video_seq = seq;
+                if let Some(bytes) = new {
+                    p.update_frame(bytes);
+                }
+            }
+        }
+        // Reproducido una vez → salir (reverso): la imagen se desvanece y luego
+        // se sueltan las partículas.
+        if ended && !self.photo_releasing {
+            self.photo_releasing = true;
+        }
     }
 
     /// Suelta la foto en REVERSO: primero se desvanece la imagen (dejando ver

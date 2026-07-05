@@ -424,6 +424,10 @@ pub struct GpuSim {
     overlay_bind: wgpu::BindGroup,
     /// Vista de la textura de la foto activa; 1×1 vacía si no hay foto.
     photo_view: wgpu::TextureView,
+    /// Textura de la foto (para reescribir fotogramas de vídeo con
+    /// `update_photo_frame` sin recrear bind groups) y sus dimensiones.
+    photo_tex: wgpu::Texture,
+    photo_dims: (u32, u32),
     blit_layout: wgpu::BindGroupLayout,
     blit_bind: wgpu::BindGroup,
     sampler: wgpu::Sampler,
@@ -934,7 +938,7 @@ impl GpuSim {
         });
         // Textura de la foto: arranca 1×1 vacía; `upload_photo` la sustituye y
         // recrea `overlay_bind`.
-        let photo_view = make_empty_photo(device);
+        let (photo_tex, photo_view) = make_empty_photo(device);
         let overlay_bind =
             make_overlay_bind(device, &photo_layout, &overlay_buf, &photo_view, &sampler);
         // Tras el paso A→B se pinta B; tras B→A se pinta A.
@@ -998,6 +1002,8 @@ impl GpuSim {
             overlay_buf,
             overlay_bind,
             photo_view,
+            photo_tex,
+            photo_dims: (1, 1),
             blit_layout,
             blit_bind,
             sampler,
@@ -1079,7 +1085,10 @@ impl GpuSim {
     /// bind group del overlay. Se llama al elegir/cambiar la imagen en modo
     /// "recrear colores de la foto".
     pub fn upload_photo(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, rgba: &[u8], w: u32, h: u32) {
-        self.photo_view = make_photo_texture(device, queue, rgba, w, h);
+        let (tex, view) = make_photo_texture(device, queue, rgba, w, h);
+        self.photo_tex = tex;
+        self.photo_view = view;
+        self.photo_dims = (w.max(1), h.max(1));
         // La textura la leen tanto el mosaico (render de partículas) como la
         // superposición: recreamos ambos bind groups.
         self.render_bind = make_render_binds(
@@ -1098,6 +1107,31 @@ impl GpuSim {
             &self.overlay_buf,
             &self.photo_view,
             &self.sampler,
+        );
+    }
+
+    /// Reescribe el fotograma de la foto (vídeo) en la MISMA textura, sin
+    /// recrear bind groups. `rgba` debe tener las dimensiones subidas por el
+    /// último `upload_photo`; si no, se ignora.
+    pub fn update_photo_frame(&self, queue: &wgpu::Queue, rgba: &[u8]) {
+        let (w, h) = self.photo_dims;
+        if rgba.len() != (w as usize) * (h as usize) * 4 {
+            return;
+        }
+        queue.write_texture(
+            wgpu::TexelCopyTextureInfo {
+                texture: &self.photo_tex,
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            rgba,
+            wgpu::TexelCopyBufferLayout {
+                offset: 0,
+                bytes_per_row: Some(4 * w),
+                rows_per_image: Some(h),
+            },
+            wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 },
         );
     }
 
@@ -1376,8 +1410,8 @@ fn mk_blit_bind(
 }
 
 /// Textura 1×1 vacía para la foto (placeholder mientras no hay imagen; nunca
-/// se muestrea de verdad porque `photo_on = 0`).
-fn make_empty_photo(device: &wgpu::Device) -> wgpu::TextureView {
+/// se muestrea de verdad porque `photo_on = 0`). Devuelve la textura y su vista.
+fn make_empty_photo(device: &wgpu::Device) -> (wgpu::Texture, wgpu::TextureView) {
     let tex = device.create_texture(&wgpu::TextureDescriptor {
         label: Some("foto vacía"),
         size: wgpu::Extent3d { width: 1, height: 1, depth_or_array_layers: 1 },
@@ -1391,18 +1425,20 @@ fn make_empty_photo(device: &wgpu::Device) -> wgpu::TextureView {
         usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
         view_formats: &[],
     });
-    tex.create_view(&wgpu::TextureViewDescriptor::default())
+    let view = tex.create_view(&wgpu::TextureViewDescriptor::default());
+    (tex, view)
 }
 
-/// Sube una imagen RGBA8 (`w`×`h`) a una textura nueva y devuelve su vista,
-/// para el revelado de la foto.
+/// Sube una imagen RGBA8 (`w`×`h`) a una textura nueva y devuelve la textura y
+/// su vista, para el revelado de la foto. La textura se conserva para poder
+/// reescribir fotogramas (vídeo) sin recrear los bind groups.
 fn make_photo_texture(
     device: &wgpu::Device,
     queue: &wgpu::Queue,
     rgba: &[u8],
     w: u32,
     h: u32,
-) -> wgpu::TextureView {
+) -> (wgpu::Texture, wgpu::TextureView) {
     let (w, h) = (w.max(1), h.max(1));
     let tex = device.create_texture(&wgpu::TextureDescriptor {
         label: Some("foto"),
@@ -1430,7 +1466,8 @@ fn make_photo_texture(
         },
         wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 },
     );
-    tex.create_view(&wgpu::TextureViewDescriptor::default())
+    let view = tex.create_view(&wgpu::TextureViewDescriptor::default());
+    (tex, view)
 }
 
 /// (Re)crea los dos bind groups del render (uno por sentido del ping-pong),

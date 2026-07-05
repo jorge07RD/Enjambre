@@ -11,9 +11,10 @@ use ::rand::Rng;
 use render::Renderer;
 use shared::ipc::{decode, read_frame, socket_path, write_msg, IPC_VERSION};
 use shared::{
-    config_panel, example_store, hue_for_index, scenes_path, AudioTarget, BeatAction, Boundary,
-    Brush, ControlMsg, ControlState, InteractionMode, PanelEvent, PanelState, Playlist,
-    SceneStore, SeqPlayback, ShapeStore, SimParams, TelemetryMsg, Tool, FRAME_PRESETS,
+    config_panel, example_store, hue_for_index, is_video_path, scenes_path, AudioTarget,
+    BeatAction, Boundary, Brush, ControlMsg, ControlState, InteractionMode, PanelEvent, PanelState,
+    Playlist, SceneStore, SeqPlayback, ShapeStore, SimParams, TelemetryMsg, Tool, VideoSource,
+    FRAME_PRESETS,
 };
 use simulation::Simulation;
 
@@ -366,6 +367,18 @@ fn load_photo(path: &str) -> Option<(Texture2D, Vec<u8>, usize, usize)> {
     }
 }
 
+/// Decodifica el PRIMER fotograma de un vídeo como (textura, bytes RGBA, ancho,
+/// alto) para arrancar el mosaico/overlay. El streaming de la reproducción se
+/// abre luego de forma diferida (`advance_video`), cuando la imagen ya se ha
+/// formado. `None` si `ffmpeg`/`ffprobe` fallan.
+fn load_video(path: &str) -> Option<(Texture2D, Vec<u8>, usize, usize)> {
+    let (first, w, h) = VideoSource::decode_first_frame(path, 720)?;
+    let img = Image { bytes: first.clone(), width: w as u16, height: h as u16 };
+    let tex = Texture2D::from_image(&img);
+    tex.set_filter(FilterMode::Linear);
+    Some((tex, first, w as usize, h as usize))
+}
+
 /// Rasteriza `text` a un `render_target` y devuelve sus puntos meta (mundo).
 fn text_to_points(text: &str, world: Vec2, count: usize, rng: &mut impl Rng) -> Vec<Vec2> {
     let font_size: u16 = 180;
@@ -446,15 +459,29 @@ fn mosaic_points(rgba: &[u8], w: usize, h: usize, c: Vec2, e: Vec2, count: usize
 /// la silueta.
 fn build_shape(sim: &mut Simulation, params: &SimParams, rng: &mut impl Rng) {
     // Modo foto: acomodar en rejilla + colorear (fase A) y preparar la foto.
+    // Un vídeo se trata igual que una foto pero sus fotogramas se refrescan en
+    // el tiempo (mismo efecto de entrada/salida; el mosaico usa el primer
+    // fotograma para reclutar).
     if params.shape_photo_color && !params.shape_image.is_empty() {
-        match load_photo(&params.shape_image) {
+        let is_video = is_video_path(&params.shape_image);
+        let loaded = if is_video {
+            load_video(&params.shape_image)
+        } else {
+            load_photo(&params.shape_image)
+        };
+        match loaded {
             Some((tex, bytes, w, h)) => {
                 let mask = bytes.clone();
                 sim.set_photo(tex, bytes, w, h);
+                if is_video {
+                    // La reproducción arranca diferida (al formarse la imagen).
+                    sim.set_video_path(params.shape_image.clone());
+                }
                 if let Some(photo) = sim.photo.as_ref() {
                     let (c, e) = (photo.center, photo.extent);
                     // Reclutar SOLO en la zona opaca (PNG sin fondo → nada en lo
-                    // transparente); el resto se desvanece (ver render).
+                    // transparente); el resto se desvanece (ver render). Un
+                    // vídeo suele ser opaco entero, así que recluta toda la caja.
                     let recruit = (sim.particles.len() * 9 / 10).max(1);
                     let pts = mosaic_points(&mask, w, h, c, e, recruit);
                     sim.set_shape(pts);
@@ -1233,6 +1260,9 @@ async fn main() {
             }
             // Aparición/disolución fluida de la forma (fase A, posición + color).
             sim.advance_shape(get_frame_time(), params.shape_transition_duration);
+            // Vídeo: sube el fotograma actual (si la foto es un vídeo); al
+            // soltar se congela en el frame visible para el reverso.
+            sim.advance_video();
             // Efecto foto (fase B + salida en reverso): la imagen se funde tras
             // acomodarse; al soltar, se va primero la imagen y luego la forma.
             sim.advance_photo_effect(get_frame_time(), params.shape_transition_duration);
@@ -1692,17 +1722,30 @@ async fn main() {
                 }
                 PanelEvent::FormImagePick => {
                     if let Some(path) = rfd::FileDialog::new()
-                        .add_filter("Imagen", &["png", "jpg", "jpeg", "webp", "bmp"])
+                        .add_filter("Imagen o vídeo", &[
+                            "png", "jpg", "jpeg", "webp", "bmp", "mp4", "mov", "mkv", "webm",
+                            "avi", "m4v",
+                        ])
                         .pick_file()
                     {
                         params.shape_image = path.to_string_lossy().into_owned();
                         params.shape_text = String::new();
+                        // El vídeo solo tiene sentido con el efecto de color
+                        // (mosaico + overlay animado); lo activamos solo.
+                        if is_video_path(&params.shape_image) {
+                            params.shape_photo_color = true;
+                            params.shape_tint = false;
+                        }
                         build_shape(&mut sim, &params, &mut rng);
                     }
                 }
                 PanelEvent::FormImagePath(path) => {
                     params.shape_image = path;
                     params.shape_text = String::new();
+                    if is_video_path(&params.shape_image) {
+                        params.shape_photo_color = true;
+                        params.shape_tint = false;
+                    }
                     build_shape(&mut sim, &params, &mut rng);
                 }
                 PanelEvent::ReleaseShape => {

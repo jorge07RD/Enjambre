@@ -22,8 +22,8 @@ mod shape;
 use gpu_sim::{GpuSim, Mosaic, ShapeDrive};
 use rand::Rng;
 use shared::{
-    config_panel, example_store, hue_for_index, ui_theme, PanelEvent, PanelState, SceneStore,
-    ShapeStore, SimParams, NUM_COLORS,
+    config_panel, example_store, hue_for_index, is_video_path, ui_theme, PanelEvent, PanelState,
+    SceneStore, ShapeStore, SimParams, VideoSource, NUM_COLORS,
 };
 use std::sync::Arc;
 use std::time::Instant;
@@ -190,6 +190,15 @@ struct State {
     /// En salida: la imagen se desvanece primero y luego se sueltan las
     /// partículas (transición de entrada en reverso).
     photo_releasing: bool,
+    /// Ruta del vídeo pendiente de reproducir: se rellena al cargar el vídeo y
+    /// la reproducción arranca DIFERIDA (cuando la imagen ya se formó del todo)
+    /// vaciándola en `video`. `None` = imagen fija o ya reproduciendo.
+    video_pending: Option<String>,
+    /// Fuente de fotogramas en streaming (solo tras arrancar). `video_frozen` se
+    /// activa al soltar para congelar el frame visible durante el reverso.
+    video: Option<VideoSource>,
+    video_seq: u64,
+    video_frozen: bool,
     recorder: Option<rec::Recorder>,
     // Panel egui embebido (mismo `config_panel` que `sim` y `panel`).
     panel: PanelState,
@@ -303,6 +312,10 @@ impl State {
             photo_extent: [WORLD[0], WORLD[1]],
             photo_loaded: false,
             photo_releasing: false,
+            video_pending: None,
+            video: None,
+            video_seq: 0,
+            video_frozen: false,
             recorder: None,
             panel,
             panel_visible: true,
@@ -373,6 +386,7 @@ impl State {
         // Una nueva forma (texto/silueta) reemplaza al efecto foto.
         self.photo_loaded = false;
         self.photo_releasing = false;
+        self.video = None;
         self.shape.n = self.sim.upload_shape_targets(&self.queue, &pts);
         self.shape.blend = 0.0;
         self.shape.target = 1.0;
@@ -386,9 +400,34 @@ impl State {
     /// una rejilla que cubre la imagen y toman su color (mosaico); (B) la foto
     /// real se funde encima al terminar de acomodarse (ver el bucle).
     fn start_photo(&mut self) {
-        let Some((rgba, w, h)) = shape::decode_image_rgba(&self.params.shape_image) else {
-            self.overlay_target = 0.0;
-            return;
+        // Vídeo o imagen fija: en ambos casos arrancamos con un primer
+        // fotograma RGBA. El vídeo, además, refresca la textura en el bucle
+        // (`advance_video`) hasta que se suelta (se congela en el frame visible).
+        let (rgba, w, h) = if is_video_path(&self.params.shape_image) {
+            match VideoSource::open(&self.params.shape_image, 720) {
+                Some(v) => {
+                    let (w, h) = v.dims();
+                    let Some(first) = v.first_frame(std::time::Duration::from_secs(5)) else {
+                        self.overlay_target = 0.0;
+                        return;
+                    };
+                    self.video = Some(v);
+                    self.video_seq = 0;
+                    self.video_frozen = false;
+                    (first, w, h)
+                }
+                None => {
+                    self.overlay_target = 0.0;
+                    return;
+                }
+            }
+        } else {
+            self.video = None;
+            let Some(frame) = shape::decode_image_rgba(&self.params.shape_image) else {
+                self.overlay_target = 0.0;
+                return;
+            };
+            frame
         };
         self.sim.upload_photo(&self.device, &self.queue, &rgba, w, h);
         // Caja de la foto en mundo: 90% del lienzo, centrada, aspecto preservado.
@@ -537,17 +576,30 @@ impl State {
             }
             PanelEvent::FormImagePick => {
                 if let Some(p) = rfd::FileDialog::new()
-                    .add_filter("Imagen", &["png", "jpg", "jpeg", "webp", "bmp", "gif"])
+                    .add_filter("Imagen o vídeo", &[
+                        "png", "jpg", "jpeg", "webp", "bmp", "gif", "mp4", "mov", "mkv", "webm",
+                        "avi", "m4v",
+                    ])
                     .pick_file()
                 {
                     self.params.shape_image = p.to_string_lossy().into_owned();
                     self.params.shape_text.clear();
+                    // El vídeo solo funciona con el efecto de color (mosaico +
+                    // overlay animado); lo activamos solo.
+                    if is_video_path(&self.params.shape_image) {
+                        self.params.shape_photo_color = true;
+                        self.params.shape_tint = false;
+                    }
                     self.build_shape();
                 }
             }
             PanelEvent::FormImagePath(p) => {
                 self.params.shape_image = p;
                 self.params.shape_text.clear();
+                if is_video_path(&self.params.shape_image) {
+                    self.params.shape_photo_color = true;
+                    self.params.shape_tint = false;
+                }
                 self.build_shape();
             }
             PanelEvent::ReleaseShape => {
@@ -688,6 +740,20 @@ impl State {
         self.params.advance_speed(dt);
         self.shape
             .advance(dt, self.params.shape_transition_duration);
+        // Vídeo: sube el fotograma más reciente a la textura de la foto (la leen
+        // el mosaico y el overlay). Al soltar se congela en el frame visible,
+        // que es el que se ve al desvanecerse el overlay en el reverso.
+        if self.photo_releasing {
+            self.video_frozen = true;
+        }
+        if !self.video_frozen && self.video.is_some() {
+            let mut seq = self.video_seq;
+            let new = self.video.as_ref().and_then(|v| v.poll(&mut seq));
+            self.video_seq = seq;
+            if let Some(bytes) = new {
+                self.sim.update_photo_frame(&self.queue, &bytes);
+            }
+        }
         // Entrada: la foto se funde encima SOLO cuando las partículas ya se
         // acomodaron (fase A casi completa).
         if self.photo_loaded && !self.photo_releasing && self.shape.blend >= 0.95 {
@@ -712,6 +778,7 @@ impl State {
         if self.photo_loaded && self.photo_releasing && self.shape.n == 0 && self.overlay_reveal <= 1e-4 {
             self.photo_loaded = false;
             self.photo_releasing = false;
+            self.video = None;
         }
 
         // Auto-avance de escenas (slideshow), como en la app CPU.
