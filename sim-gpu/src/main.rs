@@ -9,7 +9,11 @@
 //! Hito 6: formas/texto (shape.rs + resortes en el kernel) y grabación de
 //! vídeo con música (rec.rs, R o el botón del panel).
 //!
-//! Uso: `cargo run --release -p sim-gpu [n_partículas]` (por defecto 20000).
+//! Uso: `cargo run --release -p sim-gpu [n_partículas] [vertical] [2k|4k]` (por
+//! defecto 20000, horizontal, 1080p). `vertical` (o `v`/`movil`) abre en retrato
+//! 9:19.5 (pantalla completa de móvil); `2k`/`4k` graban a 1440/2160 de lado
+//! menor (si no, Full HD 1080). La grabación se renderiza a esa resolución, NO a
+//! la de la ventana, así sale nítida y en la orientación elegida.
 //! Teclas: Espacio = pausa · . = paso · C = vaciar · F = llenar · S = soltar
 //! forma · Enter = formar el texto del panel · N/P = escena sig./ant. ·
 //! M = aleatorizar matriz · X = auto-aleatorizar · V = deriva gradual ·
@@ -38,7 +42,30 @@ use winit::keyboard::{Key, NamedKey};
 use winit::window::{Window, WindowId};
 
 /// Mundo fijo (como el bench de la CPU); la ventana lo estira a su tamaño.
-const WORLD: [f32; 2] = [1600.0, 1000.0];
+/// Mundo horizontal (16:10, por defecto) y vertical (9:16, para móvil/TikTok).
+/// El vertical se elige con el argumento `vertical`; la ventana y la grabación
+/// salen en retrato automáticamente (la grabación captura el tamaño de ventana).
+const WORLD_H: [f32; 2] = [1600.0, 1000.0];
+/// Vertical 9:19.5 (pantalla completa de móviles modernos, p. ej. Galaxy S23).
+const WORLD_V: [f32; 2] = [900.0, 1950.0];
+/// Tamaño lógico inicial de ventana en cada orientación (mismo aspecto que el
+/// mundo, para que las partículas no se deformen).
+const WIN_H: (f64, f64) = (1280.0, 800.0);
+const WIN_V: (f64, f64) = (405.0, 878.0);
+
+/// Dimensiones de grabación (pares) para una calidad `minor` (el lado MENOR:
+/// ancho en vertical, alto en horizontal), respetando el aspecto del mundo.
+/// 1080 = Full HD, 1440 = 2K. Independiente del tamaño de ventana.
+fn rec_dims(world: [f32; 2], minor: u32) -> (u32, u32) {
+    let (ww, wh) = (world[0], world[1]);
+    let m = minor as f32;
+    let (w, h) = if wh >= ww {
+        (m, m * wh / ww) // retrato: el ancho es el lado menor
+    } else {
+        (m * ww / wh, m) // apaisado: el alto es el lado menor
+    };
+    (((w.round() as u32) & !1).max(2), ((h.round() as u32) & !1).max(2))
+}
 
 /// Transición de escena en curso (port del `SceneMorph` de `sim/src/main.rs`):
 /// interpola los parámetros numéricos de `from` a `target`; el cruce del
@@ -179,6 +206,16 @@ struct State {
     config: wgpu::SurfaceConfiguration,
     sim: GpuSim,
     params: SimParams,
+    /// Dimensiones del mundo (horizontal o vertical). Antes era la constante
+    /// `WORLD`; ahora runtime para poder elegir orientación al arrancar.
+    world: [f32; 2],
+    /// Calidad de grabación: lado menor en píxeles (1080 = Full HD, 1440 = 2K).
+    /// La grabación se renderiza a esta resolución, no a la de la ventana.
+    rec_minor: u32,
+    /// Hook de prueba (`ENJAMBRE_AUTOREC=segundos`): graba automáticamente al
+    /// arrancar y sale al terminar, para verificar la grabación sin teclado.
+    /// `None` en uso normal.
+    autorec_left: Option<u32>,
     // Escenas: la misma biblioteca (`scenes.json`) que la app CPU. Aquí solo
     // se lee/escribe bajo demanda; el `sim` sigue siendo el dueño habitual.
     store: SceneStore,
@@ -239,7 +276,7 @@ struct State {
 }
 
 impl State {
-    async fn new(window: Arc<Window>, count: u32) -> State {
+    async fn new(window: Arc<Window>, count: u32, world: [f32; 2], rec_minor: u32) -> State {
         let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor::default());
         let surface = instance.create_surface(window.clone()).expect("superficie wgpu");
         let adapter = instance
@@ -285,7 +322,7 @@ impl State {
             &device,
             config.format,
             &params,
-            WORLD,
+            world,
             count,
             (config.width, config.height),
             &mut rng,
@@ -330,6 +367,12 @@ impl State {
             config,
             sim,
             params,
+            world,
+            rec_minor,
+            autorec_left: std::env::var("ENJAMBRE_AUTOREC")
+                .ok()
+                .and_then(|s| s.parse::<f32>().ok())
+                .map(|secs| (secs.max(0.0) * rec::REC_FPS as f32) as u32),
             store,
             scene_idx,
             morph: None,
@@ -346,7 +389,7 @@ impl State {
             shape: ShapeState::default(),
             overlay_reveal: 0.0,
             overlay_target: 0.0,
-            photo_extent: [WORLD[0], WORLD[1]],
+            photo_extent: [world[0], world[1]],
             photo_loaded: false,
             photo_releasing: false,
             video_pending: None,
@@ -356,7 +399,9 @@ impl State {
             rec_music: false,
             recorder: None,
             panel,
-            panel_visible: true,
+            // En vertical la ventana es estrecha: ocultamos el panel por defecto
+            // para ver el lienzo completo (se muestra con H). En horizontal, visible.
+            panel_visible: world[0] >= world[1],
             egui_state,
             egui_renderer,
             step_once: false,
@@ -399,9 +444,9 @@ impl State {
         let count = ((self.sim.count as usize) * 7 / 10).max(1);
         let mut rng = rand::thread_rng();
         let pts = if !self.params.shape_text.trim().is_empty() {
-            shape::text_to_points(&self.params.shape_text, WORLD, count, &mut rng)
+            shape::text_to_points(&self.params.shape_text, self.world, count, &mut rng)
         } else if !self.params.shape_image.is_empty() {
-            shape::image_points_from_path(&self.params.shape_image, WORLD, count, &mut rng)
+            shape::image_points_from_path(&self.params.shape_image, self.world, count, &mut rng)
                 .unwrap_or_default()
         } else {
             Vec::new()
@@ -464,7 +509,7 @@ impl State {
         self.sim.upload_photo(&self.device, &self.queue, &rgba, w, h);
         // Caja de la foto en mundo: 90% del lienzo, centrada, aspecto preservado.
         let (iw, ih) = (w as f32, h as f32);
-        let scale = (WORLD[0] * 0.9 / iw).min(WORLD[1] * 0.9 / ih);
+        let scale = (self.world[0] * 0.9 / iw).min(self.world[1] * 0.9 / ih);
         self.photo_extent = [iw * scale, ih * scale];
         self.photo_loaded = true;
         self.photo_releasing = false;
@@ -475,7 +520,7 @@ impl State {
         // (en un PNG sin fondo, nada de partículas en lo transparente); toman
         // su color. Las no reclutadas se desvanecen (ver particles.wgsl).
         let recruit = ((self.sim.count as usize) * 9 / 10).max(1);
-        let center = [WORLD[0] * 0.5, WORLD[1] * 0.5];
+        let center = [self.world[0] * 0.5, self.world[1] * 0.5];
         let pts = shape::mosaic_points(&rgba, w as usize, h as usize, center, self.photo_extent, recruit);
         self.shape.n = self.sim.upload_shape_targets(&self.queue, &pts);
         self.shape.blend = 0.0;
@@ -498,6 +543,9 @@ impl State {
             let offset = start_frame as f32 / rec::REC_FPS as f32;
             shared::video::overlay_audio(&path, &src, offset, self.rec_music);
         }
+        // Restaura la textura de escena al tamaño de ventana (durante la
+        // grabación se subió a la resolución de grabación).
+        self.sim.resize(&self.device, self.config.width, self.config.height);
         self.panel.recording = false;
     }
 
@@ -507,10 +555,15 @@ impl State {
             self.finish_recording(r);
             return;
         }
+        // Grabar a la resolución elegida (1080/2K), no a la de la ventana:
+        // renderizamos la escena a una textura HDR de ese tamaño (nítida) y la
+        // capturamos; la ventana solo muestra una reducción.
+        let (rw, rh) = rec_dims(self.world, self.rec_minor);
+        self.sim.resize(&self.device, rw, rh);
         match rec::Recorder::start(
             &self.device,
-            self.config.width,
-            self.config.height,
+            rw,
+            rh,
             &self.panel.video_dir,
             &self.panel.music_path,
         ) {
@@ -528,7 +581,11 @@ impl State {
                     }
                 }
             }
-            Err(e) => eprintln!("No se pudo iniciar la grabación (¿está ffmpeg?): {e}"),
+            Err(e) => {
+                eprintln!("No se pudo iniciar la grabación (¿está ffmpeg?): {e}");
+                // Restaura el offscreen al tamaño de ventana (lo subimos arriba).
+                self.sim.resize(&self.device, self.config.width, self.config.height);
+            }
         }
     }
 
@@ -969,6 +1026,20 @@ impl State {
     }
 
     fn render(&mut self) {
+        // Hook de prueba: graba `ENJAMBRE_AUTOREC` segundos y sale (verifica la
+        // grabación a la resolución elegida sin teclado). Sin efecto si no está.
+        if let Some(left) = self.autorec_left {
+            if self.recorder.is_none() {
+                self.toggle_record();
+            }
+            if left == 0 {
+                if let Some(r) = self.recorder.take() {
+                    self.finish_recording(r);
+                }
+                std::process::exit(0);
+            }
+            self.autorec_left = Some(left - 1);
+        }
         // dt real del frame para las transiciones (limitado por si hay un
         // parón). Grabando, cada frame = 1/60 s de vídeo: las transiciones y
         // el show salen exactos en el .mp4 aunque el volcado vaya más lento
@@ -1158,7 +1229,7 @@ impl State {
             on: self.photo_loaded,
             reveal: mb * mb * (3.0 - 2.0 * mb),
             n: self.shape.n,
-            center: [WORLD[0] * 0.5, WORLD[1] * 0.5],
+            center: [self.world[0] * 0.5, self.world[1] * 0.5],
             extent: self.photo_extent,
         };
         self.sim
@@ -1168,8 +1239,8 @@ impl State {
         let r = self.overlay_reveal.clamp(0.0, 1.0);
         let reveal = r * r * (3.0 - 2.0 * r);
         let half = [
-            self.photo_extent[0] / WORLD[0],
-            self.photo_extent[1] / WORLD[1],
+            self.photo_extent[0] / self.world[0],
+            self.photo_extent[1] / self.world[1],
         ];
         let draw_photo = self.photo_loaded && reveal > 0.001;
 
@@ -1275,6 +1346,12 @@ impl State {
 struct App {
     state: Option<State>,
     count: u32,
+    /// Mundo (horizontal o vertical) y tamaño lógico de ventana, según la
+    /// orientación elegida al arrancar.
+    world: [f32; 2],
+    win_size: (f64, f64),
+    /// Calidad de grabación (lado menor en px: 1080 o 1440).
+    rec_minor: u32,
 }
 
 impl ApplicationHandler for App {
@@ -1284,11 +1361,15 @@ impl ApplicationHandler for App {
                 el.create_window(
                     Window::default_attributes()
                         .with_title("Enjambre GPU")
-                        .with_inner_size(winit::dpi::LogicalSize::new(1280.0, 800.0)),
+                        .with_inner_size(winit::dpi::LogicalSize::new(
+                            self.win_size.0,
+                            self.win_size.1,
+                        )),
                 )
                 .expect("ventana"),
             );
-            let mut state = pollster::block_on(State::new(window, self.count));
+            let mut state =
+                pollster::block_on(State::new(window, self.count, self.world, self.rec_minor));
             // Si la escena predeterminada trae un mensaje/imagen, formarlo ya.
             if !state.params.shape_text.trim().is_empty() || !state.params.shape_image.is_empty()
             {
@@ -1334,18 +1415,41 @@ impl ApplicationHandler for App {
 }
 
 fn main() {
-    let count: u32 = std::env::args()
-        .nth(1)
-        .and_then(|a| a.parse().ok())
+    // Argumentos (en cualquier orden): un número = nº de partículas; una palabra
+    // de orientación = vertical (móvil/TikTok 9:16). Ej: `sim-gpu 40000 vertical`.
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    let count: u32 = args
+        .iter()
+        .find_map(|a| a.parse().ok())
         .unwrap_or(20_000);
+    let lc: Vec<String> = args.iter().map(|a| a.to_ascii_lowercase()).collect();
+    let has = |opts: &[&str]| lc.iter().any(|a| opts.contains(&a.as_str()));
+    let vertical = has(&["vertical", "v", "-v", "--vertical", "movil", "móvil", "portrait"]);
+    // Calidad de grabación (lado menor): 4K = 2160, 2K = 1440, si no Full HD 1080.
+    let rec_minor = if has(&["4k", "2160", "2160p", "uhd"]) {
+        2160
+    } else if has(&["2k", "1440", "1440p", "qhd"]) {
+        1440
+    } else {
+        1080
+    };
+    let (world, win_size) = if vertical {
+        (WORLD_V, WIN_V)
+    } else {
+        (WORLD_H, WIN_H)
+    };
+    let (rw, rh) = rec_dims(world, rec_minor);
     eprintln!(
-        "Enjambre GPU · {count} partículas · Espacio pausa · . paso · C vaciar · F llenar · \
-         S soltar · Enter formar texto · N/P escena · M aleatoriza · X auto-aleatoriza · \
-         V gradual · E estelas · Y bloom · A atraer-centro · U anti-aglomeración · B contorno · \
-         R graba · H panel · G grid/naive · 1..9/0 velocidad · +/- ±10 % · Esc sale"
+        "Enjambre GPU · {count} partículas · {} · graba {rw}×{rh} ({}) · Espacio pausa · . paso · \
+         C vaciar · F llenar · S soltar · Enter formar texto · N/P escena · M aleatoriza · \
+         X auto-aleatoriza · V gradual · E estelas · Y bloom · A atraer-centro · \
+         U anti-aglomeración · B contorno · R graba · H panel · G grid/naive · 1..9/0 velocidad · \
+         +/- ±10 % · Esc sale",
+        if vertical { "VERTICAL 9:19.5 (móvil)" } else { "horizontal 16:10" },
+        if rec_minor >= 2160 { "4K" } else if rec_minor >= 1440 { "2K" } else { "1080p" }
     );
     let event_loop = EventLoop::new().expect("bucle de eventos");
     event_loop
-        .run_app(&mut App { state: None, count })
+        .run_app(&mut App { state: None, count, world, win_size, rec_minor })
         .expect("bucle de la app");
 }
