@@ -27,11 +27,12 @@ mod gpu_sim;
 mod rec;
 mod shape;
 
-use gpu_sim::{GpuSim, Mosaic, ShapeDrive};
+use gpu_sim::{AudioDrive, GpuSim, Mosaic, ShapeDrive};
 use rand::Rng;
 use shared::{
-    config_panel, example_store, hue_for_index, is_video_path, ui_theme, PanelEvent, PanelState,
-    Playlist, SceneStore, SeqPlayback, ShapeStore, SimParams, VideoSource, NUM_COLORS,
+    config_panel, example_store, hue_for_index, is_video_path, ui_theme, AudioSource, AudioTarget,
+    BeatAction, PanelEvent, PanelState, Playlist, SceneStore, SeqPlayback, ShapeStore, SimParams,
+    VideoSource, NUM_COLORS,
 };
 use std::sync::Arc;
 use std::time::Instant;
@@ -52,6 +53,10 @@ const WORLD_V: [f32; 2] = [900.0, 1950.0];
 /// mundo, para que las partículas no se deformen).
 const WIN_H: (f64, f64) = (1280.0, 800.0);
 const WIN_V: (f64, f64) = (405.0, 878.0);
+
+/// Ganancia del empuje de la onda de choque sobre `pulse_gain` (se integra
+/// como aceleración ×force×dt en sim.wgsl; ajustar aquí si empuja poco/mucho).
+const SHOCK_GAIN: f32 = 12.0;
 
 /// Dimensiones de grabación (pares) para una calidad `minor` (el lado MENOR:
 /// ancho en vertical, alto en horizontal), respetando el aspecto del mundo.
@@ -262,6 +267,37 @@ struct State {
     rec_video: Option<(String, u32)>,
     rec_music: bool,
     recorder: Option<rec::Recorder>,
+    // --- Audio en vivo + sincronía con la pista (port del bucle CPU) ---
+    /// Captura en vivo (micrófono o sistema); `None` si `audio_reactive` está
+    /// apagado o no se pudo abrir. `audio_source_active` es la fuente con la
+    /// que se abrió, para reiniciar la captura si el panel la cambia.
+    audio_in: Option<shared::audio::AudioIn>,
+    audio_source_active: AudioSource,
+    /// Nivel de audio suavizado 0..1 (ataque rápido, caída lenta).
+    audio_level: f32,
+    /// Energía por banda suavizada de la captura en vivo (graves/medios/agudos).
+    audio_bands_live: [f32; 3],
+    /// Resultado del análisis de la pista (envolvente + bandas + onsets/bpm) y
+    /// el canal del hilo de fondo mientras se analiza.
+    music: Option<shared::music::MusicAnalysis>,
+    music_rx: Option<std::sync::mpsc::Receiver<std::io::Result<shared::music::MusicAnalysis>>>,
+    /// Ruta a la que corresponde `music_rx` (si el usuario cambia de pista a
+    /// medio análisis, el resultado que llegue no vale).
+    music_rx_path: String,
+    /// Ruta a la que corresponde `music` (si no coincide con `panel.music_path`,
+    /// el análisis está desactualizado y la sincronía no actúa).
+    music_path_analyzed: String,
+    /// Preescucha de la pista (`ffplay`); su reloj aproximado conduce la
+    /// sincronía en vivo (grabando, el reloj exacto es `recorder.frames/60`).
+    preview: Option<shared::music::Preview>,
+    /// Cursor sobre los onsets analizados y contador para el divisor de beats.
+    beat_cursor: usize,
+    beat_count: u32,
+    /// Pulso transitorio de beat (decae ~0.2 s) que alimenta `audio_gain`.
+    beat_pulse: f32,
+    /// Empuje transitorio de la onda de choque (decae ~0.25 s), sube al kernel
+    /// de física como `GpuParams::shock`.
+    shock_pulse: f32,
     // Panel egui embebido (mismo `config_panel` que `sim` y `panel`).
     panel: PanelState,
     panel_visible: bool,
@@ -358,6 +394,19 @@ impl State {
         let scenes_mtime = file_mtime(&shared::scenes_path());
         let playlist_mtime = file_mtime(&shared::playlist_path());
         let shapes_mtime = file_mtime(&shared::shapes_path());
+        let audio_source_active = params.audio_source;
+
+        // Hook de prueba (`ENJAMBRE_MUSIC=<ruta>`): fija la pista, activa la
+        // sincronía y arranca el análisis ya, para poder verificar la
+        // reactividad al audio grabando sin tocar el panel.
+        let mut music_rx = None;
+        let mut music_rx_path = String::new();
+        if let Ok(path) = std::env::var("ENJAMBRE_MUSIC") {
+            panel.music_path = path.clone();
+            panel.music_sync.enabled = true;
+            music_rx_path = path.clone();
+            music_rx = Some(shared::music::analyze_async(path));
+        }
 
         State {
             window,
@@ -398,6 +447,19 @@ impl State {
             rec_video: None,
             rec_music: false,
             recorder: None,
+            audio_in: None,
+            audio_source_active,
+            audio_level: 0.0,
+            audio_bands_live: [0.0; 3],
+            music: None,
+            music_rx,
+            music_rx_path,
+            music_path_analyzed: String::new(),
+            preview: None,
+            beat_cursor: 0,
+            beat_count: 0,
+            beat_pulse: 0.0,
+            shock_pulse: 0.0,
             panel,
             // En vertical la ventana es estrecha: ocultamos el panel por defecto
             // para ver el lienzo completo (se muestra con H). En horizontal, visible.
@@ -572,6 +634,11 @@ impl State {
                 self.rec_music = !self.panel.music_path.is_empty();
                 self.rec_video = None;
                 self.panel.recording = true;
+                // El reloj musical de la grabación arranca en 0 (frames/60):
+                // rebobinar el cursor de beats para que no venga adelantado de
+                // una preescucha previa.
+                self.beat_cursor = 0;
+                self.beat_count = 0;
                 // Show ligado a la grabación: arranca la secuencia desde el
                 // principio junto con ella (y, sin bucle, la para al terminar).
                 if self.panel.seq_playlist.start_on_record {
@@ -800,6 +867,27 @@ impl State {
                     .pick_file()
                 {
                     self.panel.music_path = p.to_string_lossy().into_owned();
+                    // Analiza ya la pista elegida (en el CPU hay que pulsar
+                    // "Analizar pista" a mano; aquí lo hacemos solo por comodidad).
+                    self.music_rx_path = self.panel.music_path.clone();
+                    self.music_rx = Some(shared::music::analyze_async(self.panel.music_path.clone()));
+                }
+            }
+            PanelEvent::MusicAnalyze => {
+                if self.panel.music_path.is_empty() {
+                    eprintln!("Elige primero una pista de música (sección Grabación).");
+                } else if self.music_rx.is_none() {
+                    eprintln!("Analizando '{}'…", self.panel.music_path);
+                    self.music_rx_path = self.panel.music_path.clone();
+                    self.music_rx = Some(shared::music::analyze_async(self.panel.music_path.clone()));
+                }
+            }
+            PanelEvent::MusicPreviewToggle => {
+                if self.preview.take().is_none() && !self.panel.music_path.is_empty() {
+                    self.preview = shared::music::Preview::start(&self.panel.music_path);
+                    // La preescucha arranca la pista en 0: rebobinar beats.
+                    self.beat_cursor = 0;
+                    self.beat_count = 0;
                 }
             }
             PanelEvent::FormText(t) => {
@@ -1183,6 +1271,158 @@ impl State {
         let paused = self.panel.paused && !self.step_once;
         self.step_once = false;
 
+        // --- Audio en vivo + sincronía con la pista (port del bucle CPU) ---
+        // Resultado del análisis de la música, si hay uno en marcha.
+        if let Some(rx) = &self.music_rx {
+            match rx.try_recv() {
+                Ok(Ok(a)) => {
+                    eprintln!(
+                        "Música analizada: {} beats{} · {:.0} s",
+                        a.onsets.len(),
+                        a.bpm.map(|b| format!(" · ~{b:.0} BPM")).unwrap_or_default(),
+                        a.duration
+                    );
+                    self.music = Some(a);
+                    self.music_path_analyzed = self.music_rx_path.clone();
+                    self.music_rx = None;
+                    self.beat_cursor = 0;
+                    self.beat_count = 0;
+                }
+                Ok(Err(e)) => {
+                    eprintln!("No se pudo analizar la música: {e}");
+                    self.music_rx = None;
+                }
+                Err(std::sync::mpsc::TryRecvError::Empty) => {}
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => self.music_rx = None,
+            }
+        }
+        // Preescucha que terminó por sí sola (fin de la pista).
+        if self.preview.as_mut().is_some_and(|p| p.finished()) {
+            self.preview = None;
+        }
+
+        // Captura en vivo: arrancar/reiniciar si `audio_reactive` está activo y
+        // (no hay captura o el usuario cambió de fuente); parar si se apagó.
+        let want_capture = self.params.audio_reactive;
+        if want_capture
+            && (self.audio_in.is_none() || self.audio_source_active != self.params.audio_source)
+        {
+            self.audio_source_active = self.params.audio_source;
+            self.audio_in = shared::audio::start(self.audio_source_active);
+            if self.audio_in.is_none() {
+                eprintln!("Audio: sin captura para esa fuente.");
+            }
+        }
+        if !want_capture && self.audio_in.is_some() {
+            self.audio_in = None;
+        }
+
+        // Reloj musical: grabando es el frame de vídeo (exacto por
+        // construcción, el audio del .mp4 empieza en 0 con el frame 0); en
+        // vivo, el tiempo de la preescucha menos la latencia configurada.
+        // `None` = la sincronía no actúa este frame.
+        let music_t: Option<f32> = if self.panel.music_sync.enabled
+            && self.music.is_some()
+            && self.music_path_analyzed == self.panel.music_path
+        {
+            if let Some(r) = &self.recorder {
+                Some(r.frames as f32 / rec::REC_FPS as f32)
+            } else {
+                self.preview
+                    .as_ref()
+                    .map(|p| (p.elapsed() - self.panel.music_sync.latency_offset).max(0.0))
+            }
+        } else {
+            None
+        };
+
+        // Nivel y bandas de audio en vivo, suavizados (ataque rápido, caída
+        // lenta). Se calculan cada frame, aun en pausa (afectan al render).
+        let audio_raw = self.audio_in.as_ref().map(|a| a.level()).unwrap_or(0.0);
+        let audio_goal = (audio_raw * 6.0).clamp(0.0, 1.0);
+        let k = if audio_goal > self.audio_level { 0.5 } else { 0.08 };
+        self.audio_level += (audio_goal - self.audio_level) * k;
+
+        let bands_raw = self.audio_in.as_ref().map(|a| a.bands()).unwrap_or([0.0; 3]);
+        for (raw, live) in bands_raw.iter().zip(self.audio_bands_live.iter_mut()) {
+            let goal = (raw * 8.0).clamp(0.0, 1.0);
+            let k = if goal > *live { 0.5 } else { 0.08 };
+            *live += (goal - *live) * k;
+        }
+
+        // Con sincronía activa, la envolvente/bandas analizadas de la pista
+        // sustituyen a la captura en vivo (mismo objetivo/intensidad de audio).
+        let env_drive = music_t.is_some() && self.panel.music_sync.envelope_drive;
+        let mut bands = self.audio_bands_live;
+        if let (Some(t), Some(m)) = (music_t, &self.music) {
+            if env_drive {
+                self.audio_level = m.envelope_at(t);
+            }
+            if self.params.audio_bands {
+                bands = m.bands_at(t);
+            }
+        }
+
+        // Beats: al cruzar cada onset, dispara la acción configurada cada
+        // `beat_divisor` golpes. El pulso decae en ~0.2 s, la onda en ~0.25 s.
+        self.beat_pulse *= (-dt / 0.2).exp();
+        self.shock_pulse *= (-dt / 0.25).exp();
+        if let Some(t) = music_t {
+            let onsets_len = self.music.as_ref().map_or(0, |m| m.onsets.len());
+            while self.beat_cursor < onsets_len
+                && self.music.as_ref().unwrap().onsets[self.beat_cursor] <= t
+            {
+                self.beat_cursor += 1;
+                self.beat_count += 1;
+                if self.beat_count % self.panel.music_sync.beat_divisor.max(1) != 0 {
+                    continue;
+                }
+                match self.panel.music_sync.beat_action {
+                    BeatAction::None => {}
+                    BeatAction::Pulse => self.beat_pulse = self.panel.music_sync.pulse_gain,
+                    BeatAction::Shockwave => {
+                        self.shock_pulse = self.panel.music_sync.pulse_gain * SHOCK_GAIN;
+                    }
+                    BeatAction::RandomizeMatrix => {
+                        let snap = self.params.current_snapshot();
+                        self.params.randomize_matrix(&mut rand::thread_rng());
+                        self.params.start_matrix_blend(snap);
+                    }
+                    BeatAction::NextScene => {
+                        if self.seq_state == SeqPlayback::Playing {
+                            // El beat fuerza el paso a la siguiente entrada del
+                            // show (el cronómetro se reinicia en seq_launch).
+                            let n = self.panel.seq_playlist.entries.len();
+                            if n > 0 {
+                                if let Some(v) = self.seq_find_valid((self.seq_idx + 1) % n, 1) {
+                                    self.seq_launch(v);
+                                }
+                            }
+                        } else {
+                            self.cycle(1);
+                        }
+                    }
+                }
+            }
+        }
+
+        // La modulación de audio actúa con la captura en vivo, con la
+        // envolvente de la pista o mientras quede pulso de beat vivo.
+        let audio_mod_on = self.params.audio_reactive || env_drive || self.beat_pulse > 1e-3;
+        let mut audio_gain = 1.0;
+        if self.params.audio_reactive || env_drive {
+            audio_gain += self.audio_level * self.params.audio_intensity;
+        }
+        audio_gain += self.beat_pulse;
+
+        // Telemetría de la música para el panel (solo para mostrar).
+        self.panel.music_analyzed =
+            self.music.is_some() && self.music_path_analyzed == self.panel.music_path;
+        self.panel.music_duration = self.music.as_ref().map_or(0.0, |m| m.duration);
+        self.panel.music_onsets = self.music.as_ref().map_or(0, |m| m.onsets.len());
+        self.panel.music_bpm = self.music.as_ref().and_then(|m| m.bpm);
+        self.panel.music_previewing = self.preview.is_some();
+
         // Auto-aleatorizado de la matriz (modo Matriz), con cruce suave.
         if !paused
             && self.params.auto_randomize
@@ -1232,8 +1472,49 @@ impl State {
             center: [self.world[0] * 0.5, self.world[1] * 0.5],
             extent: self.photo_extent,
         };
+        // Modulación de audio transitoria (velocidad/fuerza/brillo/tamaño/
+        // resplandor): se aplica solo para esta subida y se restaura, para no
+        // pisar el valor base ni las transiciones en curso (escena, velocidad).
+        let saved = (
+            self.params.time_scale,
+            self.params.force,
+            self.params.brightness,
+            self.params.point_size,
+            self.params.bloom_intensity,
+        );
+        if audio_mod_on {
+            match self.params.audio_target {
+                AudioTarget::Speed => self.params.time_scale *= audio_gain,
+                AudioTarget::Force => self.params.force *= audio_gain,
+                AudioTarget::Brightness => {
+                    self.params.brightness = (saved.2 * audio_gain).min(1.0);
+                }
+                AudioTarget::Size => {
+                    self.params.point_size = (saved.3 * audio_gain).min(80.0);
+                }
+                AudioTarget::Bloom => {
+                    self.params.bloom_intensity = (saved.4 * audio_gain).min(4.0);
+                }
+            }
+        }
+        // "Bandas → colores": la ganancia (0 = apagado) solo cuando el efecto
+        // está activo y hay una fuente de nivel (captura en vivo o envolvente).
+        let audio_drive = AudioDrive {
+            bands,
+            bands_gain: if self.params.audio_bands && (self.params.audio_reactive || env_drive) {
+                self.params.audio_intensity
+            } else {
+                0.0
+            },
+            shock: self.shock_pulse,
+        };
         self.sim
-            .upload_params(&self.queue, &self.params, &drive, &mosaic, dt);
+            .upload_params(&self.queue, &self.params, &drive, &mosaic, &audio_drive, dt);
+        self.params.time_scale = saved.0;
+        self.params.force = saved.1;
+        self.params.brightness = saved.2;
+        self.params.point_size = saved.3;
+        self.params.bloom_intensity = saved.4;
 
         // Fase B (superposición): mitad de la caja en NDC y opacidad (ease).
         let r = self.overlay_reveal.clamp(0.0, 1.0);

@@ -286,6 +286,19 @@ fn finish(i: u32, pi: vec2f, A: Acc) {
             acc += (toward / dd) * (P.attract_strength * activity);
         }
     }
+    // Onda de choque (beat): empuje radial transitorio desde el centro del
+    // mundo. `shock` decae en la CPU (~0.25 s); escala como las demás fuerzas
+    // (integrate multiplica por force*dt).
+    if P.shock > 0.001 {
+        var away = pi - P.world * 0.5;
+        if P.boundary == 0u {
+            away = min_image(away);
+        }
+        let dd = length(away);
+        if dd > 1.0 {
+            acc += (away / dd) * P.shock;
+        }
+    }
     // Forma: solo las partículas asignadas van al texto (interacción residual
     // + resorte hacia su punto meta); el resto sigue con la animación.
     if i < P.n_shape {

@@ -2,8 +2,10 @@
 //! proceso del panel de control (`panel`, eframe): los parámetros de la
 //! simulación, la UI egui del panel (para no duplicarla) y el canal IPC.
 
+pub mod audio;
 pub mod config;
 pub mod ipc;
+pub mod music;
 pub mod panel_ui;
 pub mod playlist;
 pub mod scenes;

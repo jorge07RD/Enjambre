@@ -7,7 +7,7 @@
 //! que cada proceso las resuelva a su manera (localmente o por IPC).
 
 use crate::config::{
-    palette, AudioTarget, BeatAction, BoidsScope, Boundary, Brush, InteractionMode,
+    palette, AudioSource, AudioTarget, BeatAction, BoidsScope, Boundary, Brush, InteractionMode,
     InteractionSnapshot, MusicSync, RenderStyle, SimParams, Tool, COLOR_NAMES, FRAME_PRESETS,
     NUM_COLORS,
 };
@@ -649,13 +649,32 @@ pub fn config_panel(
             ui.checkbox(&mut params.audio_reactive, "Reaccionar al sonido");
             if params.audio_reactive {
                 ui.horizontal(|ui| {
+                    ui.label("Fuente:");
+                    ui.selectable_value(&mut params.audio_source, AudioSource::Mic, "Micrófono");
+                    ui.selectable_value(&mut params.audio_source, AudioSource::System, "Sistema")
+                        .on_hover_text(
+                            "Lo que suena en el equipo (monitor de PulseAudio/PipeWire)",
+                        );
+                });
+                ui.horizontal_wrapped(|ui| {
                     ui.label("Modula:");
                     ui.selectable_value(&mut params.audio_target, AudioTarget::Speed, "Velocidad");
                     ui.selectable_value(&mut params.audio_target, AudioTarget::Force, "Fuerza");
                     ui.selectable_value(&mut params.audio_target, AudioTarget::Brightness, "Brillo");
+                    ui.selectable_value(&mut params.audio_target, AudioTarget::Size, "Tamaño");
+                    ui.selectable_value(&mut params.audio_target, AudioTarget::Bloom, "Resplandor")
+                        .on_hover_text("Requiere el bloom activo (Apariencia)");
                 });
                 ui.add(egui::Slider::new(&mut params.audio_intensity, 0.0..=4.0).text("Intensidad"));
-                ui.label("Usa el micrófono/entrada por defecto del sistema.");
+                ui.checkbox(&mut params.audio_bands, "Bandas → colores").on_hover_text(
+                    "Cada banda ilumina sus colores: graves = rojo/amarillo, \
+                     medios = verde/cian, agudos = azul/magenta (motor GPU)",
+                );
+                ui.label(if params.audio_source == AudioSource::System {
+                    "Captura el audio del sistema (lo que suena en el equipo)."
+                } else {
+                    "Usa el micrófono/entrada por defecto del sistema."
+                });
             }
         });
 
@@ -1275,6 +1294,14 @@ pub fn config_panel(
                             "Escena siguiente",
                         );
                     });
+                    ui.horizontal(|ui| {
+                        ui.selectable_value(
+                            &mut st.music_sync.beat_action,
+                            BeatAction::Shockwave,
+                            "Onda de choque",
+                        )
+                        .on_hover_text("Empuje radial desde el centro en cada beat (motor GPU)");
+                    });
                     if st.music_sync.beat_action != BeatAction::None {
                         let mut div = st.music_sync.beat_divisor.max(1) as i32;
                         if ui
@@ -1284,7 +1311,10 @@ pub fn config_panel(
                             st.music_sync.beat_divisor = div as u32;
                         }
                     }
-                    if st.music_sync.beat_action == BeatAction::Pulse {
+                    if matches!(
+                        st.music_sync.beat_action,
+                        BeatAction::Pulse | BeatAction::Shockwave
+                    ) {
                         ui.add(
                             egui::Slider::new(&mut st.music_sync.pulse_gain, 0.0..=4.0)
                                 .text("Fuerza del pulso"),

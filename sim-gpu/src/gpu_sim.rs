@@ -129,6 +129,16 @@ impl Default for ShapeDrive {
     }
 }
 
+/// Conductores de audio del frame (los calcula `main.rs`): niveles por banda
+/// —en vivo o de la pista analizada— y la ganancia del efecto "bandas →
+/// colores" (0 = apagado), más el empuje radial vivo de la onda de choque.
+#[derive(Clone, Copy, Default)]
+pub struct AudioDrive {
+    pub bands: [f32; 3],
+    pub bands_gain: f32,
+    pub shock: f32,
+}
+
 /// Espejo plano de los parámetros que usan los kernels (ver params.wgsl). Las
 /// matrices 6×6 viajan empaquetadas en 9 vec4 por la alineación de uniform.
 #[repr(C)]
@@ -179,19 +189,22 @@ struct GpuParams {
     _pad2: u32,
     clump_thr: f32,
     clump_strength: f32,
-    _pad3: f32,
+    // Empuje radial transitorio de la onda de choque (beat): decae en la CPU.
+    shock: f32,
     _pad4: f32,
     matrix: [[f32; 4]; 9],
     from_matrix: [[f32; 4]; 9],
 }
 
 impl GpuParams {
+    #[allow(clippy::too_many_arguments)]
     fn from(
         params: &SimParams,
         world: [f32; 2],
         count: u32,
         grid: &GridDims,
         shape: &ShapeDrive,
+        audio: &AudioDrive,
         frame_dt: f32,
         color_seed: u32,
     ) -> Self {
@@ -258,7 +271,7 @@ impl GpuParams {
             _pad2: 0,
             clump_thr,
             clump_strength: params.anti_clump_strength,
-            _pad3: 0.0,
+            shock: audio.shock,
             _pad4: 0.0,
             matrix: pack_matrix(&params.matrix),
             from_matrix: pack_matrix(&params.from_state.matrix),
@@ -302,10 +315,15 @@ struct RenderParams {
     _pad2: u32,
     photo_center: [f32; 2],
     photo_extent: [f32; 2],
+    // Efecto "bandas → colores" (ver particles.wgsl `band_boost`): niveles por
+    // banda (x=graves, y=medios, z=agudos) y w=ganancia (0 = efecto apagado).
+    // Al final de la struct: un buffer mayor que el struct WGSL de post.wgsl
+    // (que solo lee hasta `_pad`) es válido, así que ese shader no cambia.
+    bands: [f32; 4],
 }
 
 impl RenderParams {
-    fn from(params: &SimParams, world: [f32; 2], mosaic: &Mosaic) -> Self {
+    fn from(params: &SimParams, world: [f32; 2], mosaic: &Mosaic, audio: &AudioDrive) -> Self {
         Self {
             // Mundo completo a NDC; la Y del mundo crece hacia abajo.
             scale: [2.0 / world[0], -2.0 / world[1]],
@@ -324,6 +342,7 @@ impl RenderParams {
             _pad2: 0,
             photo_center: mosaic.center,
             photo_extent: mosaic.extent,
+            bands: [audio.bands[0], audio.bands[1], audio.bands[2], audio.bands_gain],
         }
     }
 }
@@ -534,6 +553,7 @@ impl GpuSim {
                 count,
                 &grid,
                 &ShapeDrive::default(),
+                &AudioDrive::default(),
                 0.0,
                 0,
             )),
@@ -541,7 +561,12 @@ impl GpuSim {
         });
         let render_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("render params"),
-            contents: bytemuck::bytes_of(&RenderParams::from(params, world, &Mosaic::default())),
+            contents: bytemuck::bytes_of(&RenderParams::from(
+                params,
+                world,
+                &Mosaic::default(),
+                &AudioDrive::default(),
+            )),
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
         });
 
@@ -1032,15 +1057,16 @@ impl GpuSim {
         params: &SimParams,
         shape: &ShapeDrive,
         mosaic: &Mosaic,
+        audio: &AudioDrive,
         frame_dt: f32,
     ) {
         self.grid = GridDims::new(self.world, params.r_max);
         self.color_seed = self.color_seed.wrapping_add(1);
         let gp = GpuParams::from(
-            params, self.world, self.count, &self.grid, shape, frame_dt, self.color_seed,
+            params, self.world, self.count, &self.grid, shape, audio, frame_dt, self.color_seed,
         );
         queue.write_buffer(&self.params_buf, 0, bytemuck::bytes_of(&gp));
-        let rp = RenderParams::from(params, self.world, mosaic);
+        let rp = RenderParams::from(params, self.world, mosaic, audio);
         queue.write_buffer(&self.render_buf, 0, bytemuck::bytes_of(&rp));
         // Si las estelas se acaban de apagar, el Clear por frame ya limpia.
         self.trails = params.trails;

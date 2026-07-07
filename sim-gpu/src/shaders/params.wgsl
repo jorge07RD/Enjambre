@@ -68,7 +68,9 @@ struct Params {
     // densidad media en la CPU; 0 = desactivado) y fuerza de dispersión.
     clump_thr: f32,
     clump_strength: f32,
-    _pad3: f32,
+    // Onda de choque (beat): empuje radial transitorio desde el centro del
+    // mundo; decae en la CPU (~0.25 s). 0 = sin empuje este frame.
+    shock: f32,
     _pad4: f32,
     // Matrices 6×6 empaquetadas en 9 vec4 (alineación de uniform): la del
     // modo objetivo y la congelada de la transición.

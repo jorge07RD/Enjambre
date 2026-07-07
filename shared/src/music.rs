@@ -36,6 +36,11 @@ pub struct MusicAnalysis {
     /// Envolvente de energía (RMS) a [`ENV_RATE`] muestras/s, normalizada a
     /// ~0..1 (percentil 95, robusto a picos aislados).
     pub envelope: Vec<f32>,
+    /// Envolventes por banda de frecuencia —`[graves, medios, agudos]`— a
+    /// [`ENV_RATE`] muestras/s, cada una normalizada a su propio percentil 95.
+    /// Un puñado de muestras más corta que `envelope` (el ancho de la ventana
+    /// FFT); fuera de rango, [`Self::bands_at`] devuelve 0.
+    pub band_env: [Vec<f32>; 3],
     /// Tiempos (s) de los beats/onsets detectados, ordenados.
     pub onsets: Vec<f32>,
     /// Tempo estimado (autocorrelación del flujo espectral). Informativo.
@@ -52,6 +57,20 @@ impl MusicAnalysis {
             .get((t * ENV_RATE as f32) as usize)
             .copied()
             .unwrap_or(0.0)
+    }
+
+    /// Energía por banda —`[graves, medios, agudos]`— en el tiempo `t` (s);
+    /// 0 fuera de la pista (incluida la cola sin cubrir por la ventana FFT).
+    pub fn bands_at(&self, t: f32) -> [f32; 3] {
+        if t < 0.0 {
+            return [0.0; 3];
+        }
+        let i = (t * ENV_RATE as f32) as usize;
+        [
+            self.band_env[0].get(i).copied().unwrap_or(0.0),
+            self.band_env[1].get(i).copied().unwrap_or(0.0),
+            self.band_env[2].get(i).copied().unwrap_or(0.0),
+        ]
     }
 }
 
@@ -112,6 +131,21 @@ pub fn analyze_async(path: String) -> mpsc::Receiver<io::Result<MusicAnalysis>> 
     rx
 }
 
+/// Normaliza `v` in-place a ~0..1 dividiendo por su percentil 95 (robusto a
+/// picos aislados); satura a 1.0. Usado por la envolvente y por cada banda.
+fn normalize_p95(v: &mut [f32]) {
+    let mut sorted = v.to_vec();
+    sorted.sort_by(f32::total_cmp);
+    let p95 = sorted
+        .get(sorted.len() * 95 / 100)
+        .copied()
+        .unwrap_or(0.0)
+        .max(1e-6);
+    for x in v.iter_mut() {
+        *x = (*x / p95).min(1.0);
+    }
+}
+
 /// Núcleo del análisis, puro y testeable (recibe las muestras ya decodificadas).
 fn analyze_samples(samples: &[f32]) -> MusicAnalysis {
     let duration = samples.len() as f32 / SR as f32;
@@ -121,16 +155,7 @@ fn analyze_samples(samples: &[f32]) -> MusicAnalysis {
         .chunks(HOP)
         .map(|c| (c.iter().map(|v| v * v).sum::<f32>() / c.len() as f32).sqrt())
         .collect();
-    let mut sorted = envelope.clone();
-    sorted.sort_by(f32::total_cmp);
-    let p95 = sorted
-        .get(sorted.len() * 95 / 100)
-        .copied()
-        .unwrap_or(0.0)
-        .max(1e-6);
-    for v in &mut envelope {
-        *v = (*v / p95).min(1.0);
-    }
+    normalize_p95(&mut envelope);
 
     // --- Flujo espectral: FFT con ventana de Hann cada HOP muestras ---
     let n_frames = if samples.len() >= WIN {
@@ -150,6 +175,14 @@ fn analyze_samples(samples: &[f32]) -> MusicAnalysis {
     let mut spec = fft.make_output_vec();
     let mut prev_mag = vec![0.0f32; spec.len()];
     let mut flux = Vec::with_capacity(n_frames);
+    // Bandas de frecuencia (SR 44100, WIN 2048 → Δf 21.53 Hz): graves bins
+    // 1..12 (<250 Hz), medios 12..93 (250–2000 Hz), agudos 93..372 (2000–8000
+    // Hz). Energía RMS de las magnitudes del bloque, por banda y por frame.
+    let mut band_raw: [Vec<f32>; 3] = [
+        Vec::with_capacity(n_frames),
+        Vec::with_capacity(n_frames),
+        Vec::with_capacity(n_frames),
+    ];
     for t in 0..n_frames {
         let s = &samples[t * HOP..t * HOP + WIN];
         for i in 0..WIN {
@@ -159,6 +192,8 @@ fn analyze_samples(samples: &[f32]) -> MusicAnalysis {
         // Solo los incrementos de magnitud (energía que APARECE) cuentan: así
         // los finales de nota no disparan beats.
         let mut f = 0.0;
+        let mut band_sq = [0.0f32; 3];
+        let mut band_n = [0u32; 3];
         for (k, c) in spec.iter().enumerate() {
             let m = c.norm();
             let d = m - prev_mag[k];
@@ -166,12 +201,36 @@ fn analyze_samples(samples: &[f32]) -> MusicAnalysis {
                 f += d;
             }
             prev_mag[k] = m;
+            let bi = if (1..12).contains(&k) {
+                Some(0)
+            } else if (12..93).contains(&k) {
+                Some(1)
+            } else if (93..372).contains(&k) {
+                Some(2)
+            } else {
+                None
+            };
+            if let Some(bi) = bi {
+                band_sq[bi] += m * m;
+                band_n[bi] += 1;
+            }
         }
         flux.push(f);
+        for bi in 0..3 {
+            let amp = if band_n[bi] > 0 {
+                (band_sq[bi] / band_n[bi] as f32).sqrt()
+            } else {
+                0.0
+            };
+            band_raw[bi].push(amp);
+        }
     }
     let fmax = flux.iter().cloned().fold(0.0f32, f32::max).max(1e-6);
     for v in &mut flux {
         *v /= fmax;
+    }
+    for band in &mut band_raw {
+        normalize_p95(band);
     }
 
     // --- Onsets: pico local sobre umbral adaptativo, con refractario ---
@@ -200,6 +259,7 @@ fn analyze_samples(samples: &[f32]) -> MusicAnalysis {
     MusicAnalysis {
         duration,
         envelope,
+        band_env: band_raw,
         onsets,
         bpm,
     }
@@ -326,7 +386,7 @@ mod tests {
 
     /// End-to-end con ffmpeg real: genera una pista de clics a 120 BPM y la
     /// decodifica + analiza por el camino completo. Ignorada por defecto
-    /// (requiere ffmpeg); correr con `cargo test -p sim -- --ignored`.
+    /// (requiere ffmpeg); correr con `cargo test -p shared -- --ignored`.
     #[test]
     #[ignore]
     fn analiza_pista_generada_con_ffmpeg() {
@@ -356,5 +416,44 @@ mod tests {
         );
         let bpm = a.bpm.expect("bpm");
         assert!((bpm - 120.0).abs() < 10.0, "bpm = {bpm}");
+    }
+
+    /// Señal sintética de 6 s con 3 tramos de 2 s a 100 Hz / 1 kHz / 5 kHz (misma
+    /// amplitud): en cada tramo debe dominar su banda (graves/medios/agudos).
+    #[test]
+    fn bandas_de_senal_sintetica() {
+        let dur_s = 6.0f32;
+        let n = (SR as f32 * dur_s) as usize;
+        let mut samples = vec![0.0f32; n];
+        let freqs = [100.0f32, 1000.0, 5000.0];
+        for (i, s) in samples.iter_mut().enumerate() {
+            let t = i as f32 / SR as f32;
+            let tramo = ((t / 2.0) as usize).min(2);
+            *s = 0.8 * (std::f32::consts::TAU * freqs[tramo] * t).sin();
+        }
+
+        let a = analyze_samples(&samples);
+
+        let dominant = |t: f32| -> usize {
+            let b = a.bands_at(t);
+            let mut best = 0;
+            for i in 1..3 {
+                if b[i] > b[best] {
+                    best = i;
+                }
+            }
+            best
+        };
+        let b1 = a.bands_at(1.0);
+        assert_eq!(dominant(1.0), 0, "t=1.0 bandas={b1:?}");
+        assert!(b1[0] > 0.7 && b1[1] < 0.3 && b1[2] < 0.3, "t=1.0 bandas={b1:?}");
+
+        let b3 = a.bands_at(3.0);
+        assert_eq!(dominant(3.0), 1, "t=3.0 bandas={b3:?}");
+        assert!(b3[1] > 0.7 && b3[0] < 0.3 && b3[2] < 0.3, "t=3.0 bandas={b3:?}");
+
+        let b5 = a.bands_at(5.0);
+        assert_eq!(dominant(5.0), 2, "t=5.0 bandas={b5:?}");
+        assert!(b5[2] > 0.7 && b5[0] < 0.3 && b5[1] < 0.3, "t=5.0 bandas={b5:?}");
     }
 }

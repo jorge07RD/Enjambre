@@ -29,6 +29,9 @@ struct RenderParams {
     _pad2: u32,
     photo_center: vec2f,
     photo_extent: vec2f,
+    // Efecto "bandas → colores": niveles por banda (x=graves, y=medios,
+    // z=agudos) y w=ganancia (0 = efecto apagado). Ver `band_boost`.
+    bands: vec4f,
 };
 
 @group(0) @binding(0) var<uniform> R: RenderParams;
@@ -73,6 +76,23 @@ fn particle_color(ii: u32) -> vec3f {
     return base;
 }
 
+// Factor de brillo del efecto "bandas → colores": el cubo de matiz elige su
+// banda (0-1 graves, 2-3 medios, 4-5 agudos); banda callada = tenue, banda
+// fuerte = refuerzo. `bands.w` es la ganancia (audio_intensity); 0 = apagado.
+fn band_boost(ii: u32) -> f32 {
+    if R.bands.w <= 0.0 {
+        return 1.0;
+    }
+    let band = min(u32(fract(hue[ii]) * 6.0), 5u) / 2u;
+    var lvl = R.bands.x;
+    if band == 1u {
+        lvl = R.bands.y;
+    } else if band == 2u {
+        lvl = R.bands.z;
+    }
+    return clamp(0.15 + lvl * (0.85 + R.bands.w * 0.5), 0.0, 2.0);
+}
+
 struct VsOut {
     @builtin(position) clip: vec4f,
     // Coordenada -1..1 dentro del quad (distancia radial en el fragmento).
@@ -100,7 +120,7 @@ fn vs_disc(@builtin(vertex_index) vi: u32, @builtin(instance_index) ii: u32) -> 
     // factores que las texturas de la CPU).
     var mult = 1.6; // Brillo
     if R.style == 1u { mult = 1.0; } else if R.style == 2u { mult = 1.8; }
-    let a = R.brightness * (1.0 - R.orient);
+    let a = min(R.brightness * (1.0 - R.orient) * band_boost(ii), 1.0);
     return quad_vertex(vi, pos[ii], R.point_size * mult, particle_color(ii), a);
 }
 
@@ -131,7 +151,7 @@ fn fs_disc(in: VsOut) -> @location(0) vec4f {
 fn vs_bloom(@builtin(vertex_index) vi: u32, @builtin(instance_index) ii: u32) -> VsOut {
     // La intensidad va en el alfa (la mezcla aditiva pondera por alfa),
     // atenuada ×0.5 para que se acumule con gracia (= `draw_bloom`).
-    let ga = clamp(R.brightness * R.bloom_intensity * 0.5, 0.0, 1.0);
+    let ga = clamp(R.brightness * R.bloom_intensity * 0.5 * band_boost(ii), 0.0, 1.0);
     let s = R.point_size * max(R.bloom_radius, 0.1);
     return quad_vertex(vi, pos[ii], s, particle_color(ii), ga);
 }
@@ -167,7 +187,7 @@ fn vs_arrow(@builtin(vertex_index) vi: u32, @builtin(instance_index) ii: u32) ->
     out.clip = vec4f(w * R.scale + R.offset, 0.0, 1.0);
     out.uv = vec2f(0.0);
     out.color = particle_color(ii);
-    out.alpha = R.brightness * R.orient;
+    out.alpha = min(R.brightness * R.orient * band_boost(ii), 1.0);
     return out;
 }
 

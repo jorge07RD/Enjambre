@@ -135,6 +135,21 @@ pub enum AudioTarget {
     Speed,
     Force,
     Brightness,
+    /// Tamaño del punto (`point_size`). Barato en la CPU; efecto completo
+    /// ("bandas → colores") solo en el motor GPU.
+    Size,
+    /// Intensidad del resplandor (`bloom_intensity`; requiere `bloom` activo).
+    Bloom,
+}
+
+/// De dónde sale el sonido en vivo para la reactividad al audio: el micrófono
+/// (entrada por defecto) o el audio del sistema (monitor del sink por defecto
+/// de PulseAudio/PipeWire — lo que suena en el equipo).
+#[derive(Clone, Copy, PartialEq, Serialize, Deserialize, Default)]
+pub enum AudioSource {
+    #[default]
+    Mic,
+    System,
 }
 
 /// Acción que dispara cada beat de la música analizada (ver `MusicSync`).
@@ -149,12 +164,15 @@ pub enum BeatAction {
     RandomizeMatrix,
     /// Avanzar el show del secuenciador (o la escena siguiente si no suena).
     NextScene,
+    /// Empuje radial desde el centro del mundo (onda de choque). Solo tiene
+    /// efecto visible en el motor GPU (`sim-gpu`); no-op en la CPU.
+    Shockwave,
 }
 
 /// Sincronía con la pista de música elegida para el vídeo: la envolvente y los
-/// beats salen de un análisis offline de la pista (`sim/src/music.rs`), no del
-/// micrófono. Grabando, el reloj musical es el frame de vídeo (k/60 s), así el
-/// resultado queda clavado al audio del `.mp4` por construcción.
+/// beats salen de un análisis offline de la pista (`shared/src/music.rs`), no
+/// del micrófono. Grabando, el reloj musical es el frame de vídeo (k/60 s), así
+/// el resultado queda clavado al audio del `.mp4` por construcción.
 #[derive(Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct MusicSync {
@@ -455,12 +473,18 @@ pub struct SimParams {
     pub shape_image: String,
 
     // --- Reactivo al audio ---
-    /// Si está activo, el audio del micrófono modula un parámetro.
+    /// Si está activo, el audio en vivo modula un parámetro.
     pub audio_reactive: bool,
     /// Qué parámetro modula el audio.
     pub audio_target: AudioTarget,
     /// Intensidad de la modulación (cuánto empuja la amplitud del sonido).
     pub audio_intensity: f32,
+    /// De dónde sale el sonido en vivo (micrófono o audio del sistema).
+    pub audio_source: AudioSource,
+    /// Efecto "bandas → colores": los graves iluminan rojo/amarillo, los
+    /// medios verde/cian y los agudos azul/magenta (por cubo de matiz).
+    /// Solo tiene efecto visible en el motor GPU (`sim-gpu`).
+    pub audio_bands: bool,
 
     // --- Bloom (resplandor cinematográfico) ---
     /// Añade un halo aditivo alrededor de cada partícula (look de neón/brillo).
@@ -537,6 +561,8 @@ impl Default for SimParams {
             audio_reactive: false,
             audio_target: AudioTarget::Speed,
             audio_intensity: 1.0,
+            audio_source: AudioSource::Mic,
+            audio_bands: false,
             shape_strength: 0.5,
             shape_transition_duration: 1.5,
             shape_tint: false,

@@ -1,6 +1,4 @@
-mod audio;
 mod grid;
-mod music;
 mod render;
 mod simulation;
 
@@ -912,8 +910,10 @@ async fn main() {
     let mut auto_rng_timer = 0.0f32;
     // Buffer de acumulación para las estelas (se recrea si cambia la ventana).
     let mut trails_rt: Option<RenderTarget> = None;
-    // Captura de audio (mantener vivo el stream) + nivel suavizado 0..1.
-    let audio_in = audio::start();
+    // Captura de audio (mantener vivo el stream) + nivel suavizado 0..1. Se
+    // reinicia si el usuario cambia la fuente (Micrófono/Sistema) en el panel.
+    let mut audio_source_active = params.audio_source;
+    let mut audio_in = shared::audio::start(audio_source_active);
     if audio_in.is_none() {
         eprintln!("Audio: sin dispositivo de entrada; 'Reactivo al audio' no tendrá efecto.");
     }
@@ -921,14 +921,15 @@ async fn main() {
     // Sincronía con la música: análisis (resultado + canal del hilo de fondo),
     // preescucha, y estado de beats (cursor sobre los onsets, contador para el
     // divisor y pulso con decaimiento).
-    let mut music: Option<music::MusicAnalysis> = None;
-    let mut music_rx: Option<std::sync::mpsc::Receiver<std::io::Result<music::MusicAnalysis>>> =
-        None;
+    let mut music: Option<shared::music::MusicAnalysis> = None;
+    let mut music_rx: Option<
+        std::sync::mpsc::Receiver<std::io::Result<shared::music::MusicAnalysis>>,
+    > = None;
     // Ruta a la que corresponden `music`/`music_rx` (si el usuario cambia de
     // pista, el análisis viejo deja de valer).
     let mut music_path_analyzed = String::new();
     let mut music_rx_path = String::new();
-    let mut preview: Option<music::Preview> = None;
+    let mut preview: Option<shared::music::Preview> = None;
     let mut beat_cursor = 0usize;
     let mut beat_count = 0u32;
     let mut beat_pulse = 0.0f32;
@@ -1153,6 +1154,16 @@ async fn main() {
             None
         };
 
+        // Reiniciar la captura si el usuario cambió de fuente en el panel
+        // (Micrófono/Sistema).
+        if params.audio_source != audio_source_active {
+            audio_source_active = params.audio_source;
+            audio_in = shared::audio::start(audio_source_active);
+            if audio_in.is_none() {
+                eprintln!("Audio: sin captura para esa fuente.");
+            }
+        }
+
         // Nivel de audio suavizado (ataque rápido, caída lenta) para la
         // reactividad. Se calcula cada frame, aun en pausa (afecta al brillo).
         let audio_raw = audio_in.as_ref().map(|a| a.level()).unwrap_or(0.0);
@@ -1181,7 +1192,9 @@ async fn main() {
                     continue;
                 }
                 match st.music_sync.beat_action {
-                    BeatAction::None => {}
+                    // "Onda de choque" es un efecto GPU-only (empuje radial en
+                    // el kernel del motor GPU); no-op en la CPU.
+                    BeatAction::None | BeatAction::Shockwave => {}
                     BeatAction::Pulse => beat_pulse = st.music_sync.pulse_gain,
                     BeatAction::RandomizeMatrix => {
                         let snap = params.current_snapshot();
@@ -1268,7 +1281,9 @@ async fn main() {
                 match params.audio_target {
                     AudioTarget::Speed => params.time_scale *= audio_gain,
                     AudioTarget::Force => params.force *= audio_gain,
-                    AudioTarget::Brightness => {}
+                    // Brillo/Tamaño/Resplandor se aplican en el render (más
+                    // abajo); "Bandas → colores" es efecto GPU-only.
+                    AudioTarget::Brightness | AudioTarget::Size | AudioTarget::Bloom => {}
                 }
             }
             // Fase A: con foto activa, fijación alta para que las partículas se
@@ -1943,12 +1958,12 @@ async fn main() {
                     } else if music_rx.is_none() {
                         eprintln!("Analizando '{}'…", st.music_path);
                         music_rx_path = st.music_path.clone();
-                        music_rx = Some(music::analyze_async(st.music_path.clone()));
+                        music_rx = Some(shared::music::analyze_async(st.music_path.clone()));
                     }
                 }
                 PanelEvent::MusicPreviewToggle => {
                     if preview.take().is_none() && !st.music_path.is_empty() {
-                        preview = music::Preview::start(&st.music_path);
+                        preview = shared::music::Preview::start(&st.music_path);
                         // La preescucha arranca la pista en 0: rebobinar beats.
                         beat_cursor = 0;
                         beat_count = 0;
@@ -2157,11 +2172,25 @@ async fn main() {
             }
         }
 
-        // Modulación de audio sobre el brillo (transitoria durante el render y la
-        // grabación; se restaura tras volcar el frame).
+        // Modulación de audio sobre brillo/tamaño/resplandor (transitoria durante
+        // el render y la grabación; se restaura tras volcar el frame). El efecto
+        // "bandas → colores" es GPU-only, aquí no tiene equivalente barato.
         let saved_brightness = params.brightness;
-        if audio_mod_on && params.audio_target == AudioTarget::Brightness {
-            params.brightness = (params.brightness * audio_gain).min(1.0);
+        let saved_point_size = params.point_size;
+        let saved_bloom_intensity = params.bloom_intensity;
+        if audio_mod_on {
+            match params.audio_target {
+                AudioTarget::Brightness => {
+                    params.brightness = (params.brightness * audio_gain).min(1.0);
+                }
+                AudioTarget::Size => {
+                    params.point_size = (params.point_size * audio_gain).min(80.0);
+                }
+                AudioTarget::Bloom => {
+                    params.bloom_intensity = (params.bloom_intensity * audio_gain).min(4.0);
+                }
+                AudioTarget::Speed | AudioTarget::Force => {}
+            }
         }
 
         // Overlays del lienzo (borde + recuadro de encuadre) en coordenadas de
@@ -2281,8 +2310,10 @@ async fn main() {
                 finish_recording(rec.take().unwrap(), &mut rec_video, rec_music);
             }
         }
-        // Restaurar el brillo base tras el render/grabación.
+        // Restaurar brillo/tamaño/resplandor base tras el render/grabación.
         params.brightness = saved_brightness;
+        params.point_size = saved_point_size;
+        params.bloom_intensity = saved_bloom_intensity;
         if let Some(r) = &rec {
             draw_text(
                 &format!("● REC  {:.1}s", r.frames as f32 / REC_FPS as f32),
