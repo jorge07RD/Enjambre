@@ -58,6 +58,9 @@ struct PanelApp {
     disconnected: Arc<AtomicBool>,
     /// Hasta recibir el `Init` no enviamos nada, para no pisar el estado del sim.
     initialized: bool,
+    /// Última carpeta usada por cada tipo de diálogo nativo (los diálogos se
+    /// abren en este proceso, ver comentarios junto a cada `rfd::FileDialog`).
+    dialog_dirs: shared::DialogDirs,
 }
 
 impl PanelApp {
@@ -98,6 +101,7 @@ impl PanelApp {
             tele_rx,
             disconnected,
             initialized: false,
+            dialog_dirs: shared::DialogDirs::load(),
         }
     }
 
@@ -282,32 +286,62 @@ impl eframe::App for PanelApp {
                     // El diálogo de carpeta se abre en ESTE proceso (donde está el
                     // botón); la ruta viaja al sim por el `State` del próximo frame.
                     PanelEvent::PickVideoDir => {
-                        if let Some(dir) = rfd::FileDialog::new().pick_folder() {
+                        if let Some(dir) = shared::dialog_dirs::pick_folder(
+                            &mut self.dialog_dirs,
+                            shared::DirKind::Video,
+                        ) {
                             self.st.video_dir = dir.to_string_lossy().into_owned();
                         }
                     }
                     // La música también se elige en ESTE proceso; la ruta viaja al
                     // sim por el `State` (campo music_path de ControlState).
                     PanelEvent::PickMusic => {
-                        if let Some(path) = rfd::FileDialog::new()
-                            .add_filter("Audio", &["mp3", "wav", "flac", "m4a", "ogg", "aac"])
-                            .pick_file()
-                        {
+                        if let Some(path) = shared::dialog_dirs::pick_file(
+                            &mut self.dialog_dirs,
+                            shared::DirKind::Music,
+                            "Audio",
+                            &["mp3", "wav", "flac", "m4a", "ogg", "aac"],
+                        ) {
                             self.st.music_path = path.to_string_lossy().into_owned();
                         }
                     }
                     // El diálogo de imagen se abre aquí; la ruta viaja al sim, que
                     // es quien genera los puntos meta de la forma.
                     PanelEvent::FormImagePick => {
-                        if let Some(path) = rfd::FileDialog::new()
-                            .add_filter("Imagen", &["png", "jpg", "jpeg", "webp", "bmp"])
-                            .pick_file()
-                        {
+                        if let Some(path) = shared::dialog_dirs::pick_file(
+                            &mut self.dialog_dirs,
+                            shared::DirKind::Image,
+                            "Imagen",
+                            &["png", "jpg", "jpeg", "webp", "bmp"],
+                        ) {
                             let _ = write_msg(
                                 &mut self.write_stream,
                                 &ControlMsg::Event(PanelEvent::FormImagePath(
                                     path.to_string_lossy().into_owned(),
                                 )),
+                            );
+                        }
+                    }
+                    // Selección múltiple: el diálogo también se abre aquí; las
+                    // rutas viajan todas juntas para que el sim las guarde en
+                    // la biblioteca de una sola vez.
+                    PanelEvent::FormImagesPick => {
+                        if let Some(paths) = shared::dialog_dirs::pick_files(
+                            &mut self.dialog_dirs,
+                            shared::DirKind::Image,
+                            "Imagen o vídeo",
+                            &[
+                                "png", "jpg", "jpeg", "webp", "bmp", "mp4", "mov", "mkv", "webm",
+                                "avi", "m4v",
+                            ],
+                        ) {
+                            let paths = paths
+                                .into_iter()
+                                .map(|p| p.to_string_lossy().into_owned())
+                                .collect();
+                            let _ = write_msg(
+                                &mut self.write_stream,
+                                &ControlMsg::Event(PanelEvent::FormImagePaths(paths)),
                             );
                         }
                     }

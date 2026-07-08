@@ -87,6 +87,10 @@ pub struct PanelState {
     pub fps: i32,
     /// `true` mientras la simulación está grabando vídeo (rótulo del botón).
     pub recording: bool,
+    /// Segundos grabados hasta ahora (0 si no se está grabando). Telemetría
+    /// para el contador del HUD; el `sim`/`sim-gpu` lo derivan de
+    /// `recorder.frames / REC_FPS` (exacto, no de reloj de pared).
+    pub recording_secs: f32,
     /// Estado del recuadro de encuadre (lo evoluciona el ratón en el `sim`).
     pub show_frame: bool,
     pub frame_preset: usize,
@@ -137,6 +141,7 @@ impl Default for PanelState {
             particle_count: 0,
             fps: 0,
             recording: false,
+            recording_secs: 0.0,
             show_frame: false,
             frame_preset: 0,
             frame_w: FRAME_PRESETS[0].1,
@@ -204,6 +209,13 @@ pub enum PanelEvent {
     /// Formar la imagen del fichero indicado (lo emite el panel separado tras
     /// abrir su propio diálogo).
     FormImagePath(String),
+    /// Abrir un diálogo para elegir VARIAS imágenes/vídeos de una vez: todas
+    /// se guardan en la biblioteca (nombradas por su fichero) y la última se
+    /// aplica de inmediato.
+    FormImagesPick,
+    /// Rutas elegidas en el diálogo múltiple (lo emite el panel separado tras
+    /// abrir su propio diálogo).
+    FormImagePaths(Vec<String>),
     /// Soltar la forma actual (volver al modo de interacción).
     ReleaseShape,
     /// Guardar la forma activa (texto o imagen) en la biblioteca.
@@ -294,10 +306,16 @@ pub fn config_panel(
                     events.push(PanelEvent::HidePanel);
                 }
                 if st.recording {
+                    let s = st.recording_secs.max(0.0) as u32;
                     ui.label(
-                        egui::RichText::new(format!("{} REC", icon::REC))
-                            .color(egui::Color32::from_rgb(230, 70, 70))
-                            .strong(),
+                        egui::RichText::new(format!(
+                            "{} REC {:02}:{:02}",
+                            icon::REC,
+                            s / 60,
+                            s % 60
+                        ))
+                        .color(egui::Color32::from_rgb(230, 70, 70))
+                        .strong(),
                     );
                 }
             });
@@ -745,6 +763,16 @@ pub fn config_panel(
             ui.horizontal(|ui| {
                 if ui.button(format!("{} Imagen…", icon::IMAGE)).clicked() {
                     events.push(PanelEvent::FormImagePick);
+                }
+                if ui
+                    .button(format!("{} Varias…", icon::IMAGE))
+                    .on_hover_text(
+                        "Elegir varias imágenes/vídeos a la vez: se guardan todas en la \
+                         biblioteca (la última queda aplicada).",
+                    )
+                    .clicked()
+                {
+                    events.push(PanelEvent::FormImagesPick);
                 }
                 if ui
                     .button(format!("{} Guardar", icon::SAVE))

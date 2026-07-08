@@ -370,7 +370,10 @@ fn load_photo(path: &str) -> Option<(Texture2D, Vec<u8>, usize, usize)> {
 /// abre luego de forma diferida (`advance_video`), cuando la imagen ya se ha
 /// formado. `None` si `ffmpeg`/`ffprobe` fallan.
 fn load_video(path: &str) -> Option<(Texture2D, Vec<u8>, usize, usize)> {
-    let (first, w, h) = VideoSource::decode_first_frame(path, 720)?;
+    // Debe coincidir con el tope usado en `Simulation::advance_video`
+    // (`simulation.rs`) o el mosaico y el streaming quedan de tamaños
+    // distintos y los fotogramas se rechazan en silencio (pantalla negra).
+    let (first, w, h) = VideoSource::decode_first_frame(path, 1440)?;
     let img = Image { bytes: first.clone(), width: w as u16, height: h as u16 };
     let tex = Texture2D::from_image(&img);
     tex.set_filter(FilterMode::Linear);
@@ -515,6 +518,42 @@ fn build_shape(sim: &mut Simulation, params: &SimParams, rng: &mut impl Rng) {
     }
     if params.shape_tint {
         sim.tint_shape(hue_for_index(params.shape_color));
+    }
+}
+
+/// Guarda cada ruta en la biblioteca (nombrada por su fichero) y aplica la
+/// última como forma activa, para importar varias imágenes/vídeos de una
+/// sola vez (selección múltiple).
+fn import_shapes(
+    paths: Vec<std::path::PathBuf>,
+    shape_store: &mut ShapeStore,
+    params: &mut SimParams,
+    sim: &mut Simulation,
+    rng: &mut impl Rng,
+    shapes_dirty: &mut bool,
+) {
+    if paths.is_empty() {
+        return;
+    }
+    for p in &paths {
+        let name = p
+            .file_stem()
+            .map(|s| s.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "imagen".to_string());
+        shape_store.upsert(&name, String::new(), p.to_string_lossy().into_owned());
+    }
+    if let Err(e) = shape_store.save() {
+        eprintln!("No se pudo guardar las formas importadas: {e}");
+    }
+    *shapes_dirty = true;
+    if let Some(last) = paths.last() {
+        params.shape_image = last.to_string_lossy().into_owned();
+        params.shape_text = String::new();
+        if is_video_path(&params.shape_image) {
+            params.shape_photo_color = true;
+            params.shape_tint = false;
+        }
+        build_shape(sim, params, rng);
     }
 }
 
@@ -852,6 +891,8 @@ fn apply_local_event(
         | PanelEvent::FormText(_)
         | PanelEvent::FormImagePick
         | PanelEvent::FormImagePath(_)
+        | PanelEvent::FormImagesPick
+        | PanelEvent::FormImagePaths(_)
         | PanelEvent::ReleaseShape
         | PanelEvent::SaveShape
         | PanelEvent::ApplyShape(_)
@@ -907,6 +948,9 @@ async fn main() {
     let mut frame_height = screen_height() * 0.8;
     let mut frame_drag: Option<FrameDrag> = None;
     let mut video_dir = String::new();
+    // Recuerda la última carpeta usada por cada tipo de diálogo (vídeo,
+    // música, imagen/vídeo de forma, exportar/importar escenas).
+    let mut dialog_dirs = shared::DialogDirs::load();
     let mut auto_rng_timer = 0.0f32;
     // Buffer de acumulación para las estelas (se recrea si cambia la ventana).
     let mut trails_rt: Option<RenderTarget> = None;
@@ -1644,15 +1688,19 @@ async fn main() {
                     show_frame = true;
                 }
                 PanelEvent::PickVideoDir => {
-                    if let Some(dir) = rfd::FileDialog::new().pick_folder() {
+                    if let Some(dir) =
+                        shared::dialog_dirs::pick_folder(&mut dialog_dirs, shared::DirKind::Video)
+                    {
                         video_dir = dir.to_string_lossy().into_owned();
                     }
                 }
                 PanelEvent::PickMusic => {
-                    if let Some(path) = rfd::FileDialog::new()
-                        .add_filter("Audio", &["mp3", "wav", "flac", "m4a", "ogg", "aac"])
-                        .pick_file()
-                    {
+                    if let Some(path) = shared::dialog_dirs::pick_file(
+                        &mut dialog_dirs,
+                        shared::DirKind::Music,
+                        "Audio",
+                        &["mp3", "wav", "flac", "m4a", "ogg", "aac"],
+                    ) {
                         st.music_path = path.to_string_lossy().into_owned();
                     }
                 }
@@ -1715,21 +1763,25 @@ async fn main() {
                     }
                 }
                 PanelEvent::ExportScenes => {
-                    if let Some(path) = rfd::FileDialog::new()
-                        .add_filter("JSON", &["json"])
-                        .set_file_name("escenas_enjambre.json")
-                        .save_file()
-                    {
+                    if let Some(path) = shared::dialog_dirs::save_file(
+                        &mut dialog_dirs,
+                        shared::DirKind::Scenes,
+                        "JSON",
+                        &["json"],
+                        "escenas_enjambre.json",
+                    ) {
                         if let Err(e) = store.export_to(&path) {
                             eprintln!("No se pudo exportar las escenas: {e}");
                         }
                     }
                 }
                 PanelEvent::ImportScenes => {
-                    if let Some(path) = rfd::FileDialog::new()
-                        .add_filter("JSON", &["json"])
-                        .pick_file()
-                    {
+                    if let Some(path) = shared::dialog_dirs::pick_file(
+                        &mut dialog_dirs,
+                        shared::DirKind::Scenes,
+                        "JSON",
+                        &["json"],
+                    ) {
                         match SceneStore::import_from(&path) {
                             Ok(other) => {
                                 store.merge(other);
@@ -1762,12 +1814,15 @@ async fn main() {
                     build_shape(&mut sim, &params, &mut rng);
                 }
                 PanelEvent::FormImagePick => {
-                    if let Some(path) = rfd::FileDialog::new()
-                        .add_filter("Imagen o vídeo", &[
+                    if let Some(path) = shared::dialog_dirs::pick_file(
+                        &mut dialog_dirs,
+                        shared::DirKind::Image,
+                        "Imagen o vídeo",
+                        &[
                             "png", "jpg", "jpeg", "webp", "bmp", "mp4", "mov", "mkv", "webm",
                             "avi", "m4v",
-                        ])
-                        .pick_file()
+                        ],
+                    )
                     {
                         params.shape_image = path.to_string_lossy().into_owned();
                         params.shape_text = String::new();
@@ -1788,6 +1843,36 @@ async fn main() {
                         params.shape_tint = false;
                     }
                     build_shape(&mut sim, &params, &mut rng);
+                }
+                PanelEvent::FormImagesPick => {
+                    if let Some(paths) = shared::dialog_dirs::pick_files(
+                        &mut dialog_dirs,
+                        shared::DirKind::Image,
+                        "Imagen o vídeo",
+                        &[
+                            "png", "jpg", "jpeg", "webp", "bmp", "mp4", "mov", "mkv", "webm",
+                            "avi", "m4v",
+                        ],
+                    ) {
+                        import_shapes(
+                            paths,
+                            &mut shape_store,
+                            &mut params,
+                            &mut sim,
+                            &mut rng,
+                            &mut shapes_dirty,
+                        );
+                    }
+                }
+                PanelEvent::FormImagePaths(paths) => {
+                    import_shapes(
+                        paths.into_iter().map(std::path::PathBuf::from).collect(),
+                        &mut shape_store,
+                        &mut params,
+                        &mut sim,
+                        &mut rng,
+                        &mut shapes_dirty,
+                    );
                 }
                 PanelEvent::ReleaseShape => {
                     params.shape_text = String::new();

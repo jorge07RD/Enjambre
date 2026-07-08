@@ -4,6 +4,7 @@
 
 pub mod audio;
 pub mod config;
+pub mod dialog_dirs;
 pub mod ipc;
 pub mod music;
 pub mod panel_ui;
@@ -14,6 +15,7 @@ pub mod ui_theme;
 pub mod video;
 
 pub use config::*;
+pub use dialog_dirs::{dialog_dirs_path, DialogDirs, DirKind};
 pub use ipc::{ControlMsg, ControlState, TelemetryMsg};
 pub use panel_ui::{config_panel, PanelEvent, PanelState};
 pub use playlist::{playlist_path, Playlist, PlaylistEntry, SeqPlayback};

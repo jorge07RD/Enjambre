@@ -7,6 +7,7 @@
 <p align="center">
   <img src="https://img.shields.io/badge/Rust-2021-000000?logo=rust&logoColor=white" alt="Rust">
   <img src="https://img.shields.io/badge/render-macroquad-FF6B00" alt="macroquad">
+  <img src="https://img.shields.io/badge/GPU-wgpu%20(experimental)-CC6600" alt="wgpu">
   <img src="https://img.shields.io/badge/UI-egui%20%2F%20eframe-1E88E5?logo=egui&logoColor=white" alt="egui / eframe">
   <img src="https://img.shields.io/badge/paralelismo-rayon-8E44AD" alt="rayon">
   <img src="https://img.shields.io/badge/Linux-Wayland%20%2F%20Hyprland-1793D1?logo=linux&logoColor=white" alt="Linux · Wayland/Hyprland">
@@ -80,12 +81,20 @@ programe explícitamente.
   cada X segundos** para animaciones que evolucionan solas.
 - 🎥 **Grabación de vídeo:** define con un **recuadro ajustable** sobre el lienzo (mover/redimensionar,
   con rejilla de tercios; tecla **`G`** para mostrar/ocultar) la zona a grabar, elige un **tamaño
-  sugerido** (TikTok 9:16, 4:5, 1:1, 16:9…) y graba a 120 fps con la tecla **`R`** o el botón. El
-  vídeo se codifica con `ffmpeg` a H.264; puedes **elegir la carpeta de guardado** desde la app.
+  sugerido** (TikTok 9:16, 4:5, 1:1, 16:9…) y graba a 120 fps con la tecla **`R`** o el botón (contador
+  `REC mm:ss` en el HUD mientras graba). El vídeo se codifica con `ffmpeg` a H.264; puedes **elegir la
+  carpeta de guardado** desde la app (recuerda la última carpeta usada, también para música e imágenes).
 - 🎞️ **Escenas:** guarda la configuración actual como una **instantánea con nombre** para reproducir un
   escenario cuando quieras, marca una como **predeterminada** (se carga al arrancar) y **cambia entre
   escenas** de forma instantánea o con una **transición suave** (interpola los parámetros y cruza el
   modo de interacción). Se guardan en `~/.config/enjambre/scenes.json`.
+- 🎬 **Secuenciador de escenas (playlist):** encadena escenas con una **duración propia por entrada**
+  (transición incluida) para montar un *show* completo y reproducible; reordena, repite al terminar
+  (**loop**) o arranca la secuencia automáticamente **al empezar a grabar**. Transporte ⏮ ▶ ⏸ ⏭ y salto
+  directo a cualquier entrada. Se guarda en `~/.config/enjambre/playlist.json`.
+- 🎧 **Sincronía con música:** analiza una pista (**envolvente de energía + bandas de graves/medios/agudos
+  + beats/onsets + BPM estimado**, vía `ffmpeg`) para disparar acciones sobre el enjambre al ritmo —además
+  de la modulación en vivo por micrófono— con preescucha (`ffplay`) para comprobar la detección antes de grabar.
 - 🖼️ **Lienzo + cámara:** lienzo de tamaño variable con zoom y desplazamiento (rueda para
   zoom hacia el cursor, botón derecho para mover). Botón **«Lienzo = pantalla»** que iguala
   el mundo a los píxeles de la ventana (1:1), para que llene el lienzo sea cual sea el
@@ -122,25 +131,29 @@ programe explícitamente.
 
 | Componente | Biblioteca |
 |------------|------------|
-| Render / ventana (lienzo) | [`macroquad`](https://crates.io/crates/macroquad) |
-| Panel embebido | [`egui-macroquad`](https://crates.io/crates/egui-macroquad) |
+| Render / ventana (lienzo, `sim`) | [`macroquad`](https://crates.io/crates/macroquad) |
+| Motor GPU experimental (`sim-gpu`) | [`wgpu`](https://crates.io/crates/wgpu) (compute shaders WGSL) / [`winit`](https://crates.io/crates/winit) |
+| Panel embebido | [`egui-macroquad`](https://crates.io/crates/egui-macroquad) (`sim`) / [`egui-wgpu`](https://crates.io/crates/egui-wgpu) (`sim-gpu`) |
 | Panel en ventana aparte | [`eframe`](https://crates.io/crates/eframe) / [`egui`](https://crates.io/crates/egui) |
 | IPC panel ↔ simulación | socket Unix + [`serde`](https://crates.io/crates/serde) (JSON) |
 | Paralelismo | [`rayon`](https://crates.io/crates/rayon) |
 | Aleatoriedad | [`rand`](https://crates.io/crates/rand) |
-| Diálogo de carpeta | [`rfd`](https://crates.io/crates/rfd) (portal XDG) |
+| Diálogo de carpeta/fichero | [`rfd`](https://crates.io/crates/rfd) (portal XDG) |
 | Vídeo (grabar + decodificar fotogramas), audio | [`ffmpeg`](https://ffmpeg.org/) / `ffprobe` (externo) |
+| Análisis de música (envolvente/beats/BPM) | [`realfft`](https://crates.io/crates/realfft) + `ffmpeg` (decodificación) |
+| Formas de texto (`sim-gpu`) | [`ab_glyph`](https://crates.io/crates/ab_glyph) (fuente del sistema) + [`image`](https://crates.io/crates/image) |
 
 ## 🚀 Compilar y ejecutar
 
 Necesitas [Rust](https://rustup.rs/) instalado.
 
-El proyecto es un *workspace* de Cargo con tres crates: `sim` (la simulación y el
-lienzo), `panel` (el panel en ventana aparte) y `shared` (parámetros, UI y el canal IPC
-comunes).
+El proyecto es un *workspace* de Cargo con cuatro crates: `sim` (la simulación en CPU
+y el lienzo, la app principal), `sim-gpu` (motor experimental con la física entera en
+compute shaders wgpu, ver más abajo), `panel` (el panel en ventana aparte) y `shared`
+(parámetros, UI del panel, escenas/playlist/formas y utilidades comunes a los tres).
 
 ```bash
-# 1) Compilar TODO el workspace (sim + panel) en modo optimizado
+# 1) Compilar TODO el workspace (sim + sim-gpu + panel) en modo optimizado
 cargo build --release
 
 # 2) Ejecutar la simulación (va mucho más fluido en release)
@@ -238,6 +251,61 @@ Las escenas se guardan en `~/.config/enjambre/scenes.json` (solo los ajustes; la
 rehacen con las nuevas reglas). **En el primer arranque** se siembran unas escenas de ejemplo
 (Enjambres, Células, Cazadores, Cíclico, Espuma, Opuestos).
 
+## 🎼 Secuenciador (montar un show) y sincronía con música
+
+En la sección **Secuenciador** del panel se arma una **playlist**: cada entrada es una escena +
+duración (+ transición propia opcional). Con **▶** se reproduce la secuencia completa cambiando de
+escena sola; **«Repetir al terminar»** la vuelve a empezar en bucle y **«Arrancar con la grabación»**
+hace que pulsar `R` dispare el show desde el principio — ideal para grabar un vídeo largo sin tocar
+nada. Se guarda en `~/.config/enjambre/playlist.json`.
+
+En la sección **Grabación** también está la **sincronía con música**: elige una pista y pulsa
+**Analizar** para extraer su envolvente de energía, beats/onsets y BPM estimado (todo con `ffmpeg`,
+en segundo plano); el botón de **preescucha** la reproduce con `ffplay` para comprobar la detección.
+Con eso, el modo **«Reactivo al audio»** puede seguir la pista ya analizada además del micrófono en vivo.
+
+## 🖥️ Motor GPU experimental (`sim-gpu`)
+
+Segundo motor, independiente de `sim`, con la física entera corriendo en **compute shaders** (wgpu)
+y el render leyendo los buffers de partículas sin pasar por la CPU. Reutiliza el mismo panel
+(`shared::config_panel`, embebido vía `egui-wgpu`) y las mismas escenas/playlist/formas — pensado para
+enjambres mucho más grandes o hardware sin CPU multinúcleo potente. Tiene paridad casi completa con
+`sim`: los ocho modos de interacción y Boids, ambos contornos, transiciones suaves, estilos/flechas/
+bloom/estelas, formas de texto e imagen (con física de resortes en el propio shader), y grabación de
+vídeo con audio/música. Recarga en caliente: si editas `scenes.json`/`playlist.json`/`shapes.json` a
+mano mientras `sim-gpu` está abierto, los relee del disco automáticamente, sin reiniciar.
+
+```bash
+# Por defecto: 20 000 partículas, horizontal, grabación a 1080p
+cargo run -p sim-gpu --release
+
+# Vertical (retrato 9:19.5, pantalla completa de móvil) grabando en 4K
+cargo run -p sim-gpu --release -- 40000 vertical 4k
+```
+
+Argumentos posicionales (en cualquier orden): número de partículas · `vertical`/`v`/`movil` (por
+defecto horizontal) · `2k`/`4k` (por defecto 1080p) — la calidad afecta solo a la **grabación**, que
+se renderiza a esa resolución exacta independientemente del tamaño de la ventana. Tecla **`H`** para
+mostrar/ocultar el panel, **`R`** para grabar; el resto de atajos son los mismos que en `sim` (ver
+la cabecera de `sim-gpu/src/main.rs` para el listado completo). Por ahora no tiene panel separable
+por IPC ni recuadro de encuadre arrastrable: la ventana entera es el lienzo.
+
+## 🗒️ Autoría de escenas/playlist/formas por JSON
+
+Los tres ficheros de `~/.config/enjambre/` (`scenes.json`, `playlist.json`, `shapes.json`) se pueden
+editar directamente a mano —además de desde el panel— para crear escenas, montar un show o añadir
+formas sin abrir la app. Antes de escribir, valida contra los tipos reales:
+
+```bash
+cargo run -q -p shared --example validate_json -- scenes ~/.config/enjambre/scenes.json
+cargo run -q -p shared --example validate_json -- playlist ~/.config/enjambre/playlist.json
+cargo run -q -p shared --example validate_json -- shapes ~/.config/enjambre/shapes.json
+```
+
+> ⚠️ Si `sim`/`sim-gpu` está abierto, es dueño de estos JSON en memoria y los sobreescribe al hacer
+> cualquier operación de escena (guardar/borrar/predeterminada) — edítalos con la app cerrada, o haz
+> una copia de seguridad antes y verifica el contenido después de guardar.
+
 ## 🗂️ Estructura del código
 
 | Archivo | Responsabilidad |
@@ -246,9 +314,18 @@ rehacen con las nuevas reglas). **En el primer arranque** se siembran unas escen
 | `sim/src/simulation.rs` | Partículas, integración de la física y perfil de fuerza. |
 | `sim/src/grid.rs` | Hash espacial uniforme (CSR) para buscar vecinos rápido. |
 | `sim/src/render.rs` | Dibujo por lotes de las partículas con texturas (sólido/glow/halo). |
-| `shared/src/config.rs` | Parámetros, modos de interacción y utilidades de color. |
-| `shared/src/panel_ui.rs` | UI egui del panel, compartida por ambos procesos. |
+| `sim-gpu/src/main.rs` | App wgpu/winit: ventana, entrada, panel embebido, secuenciador, recarga en caliente de los JSON. |
+| `sim-gpu/src/gpu_sim.rs` | Buffers y *compute shaders* (`shaders/*.wgsl`): física, color, render de partículas. |
+| `sim-gpu/src/rec.rs` | Grabación de vídeo en GPU (blit a textura + anillo de *staging buffers*). |
+| `sim-gpu/src/shape.rs` | Rasterizado de texto/imagen para las formas del enjambre en `sim-gpu`. |
+| `shared/src/config.rs` | Parámetros (`SimParams`), modos de interacción y utilidades de color. |
+| `shared/src/panel_ui.rs` | UI egui del panel, compartida por los tres binarios. |
 | `shared/src/ipc.rs` | Tipos de mensaje y encuadre del socket Unix. |
+| `shared/src/scenes.rs` / `playlist.rs` / `shapes.rs` | Persistencia en JSON de escenas, secuenciador y biblioteca de formas. |
+| `shared/src/music.rs` / `audio.rs` | Análisis offline de pistas (envolvente/beats/BPM) y entrada de audio en vivo. |
+| `shared/src/video.rs` | Streaming de fotogramas de vídeo (`ffmpeg`) para el efecto foto/vídeo. |
+| `shared/src/dialog_dirs.rs` | Recuerda la última carpeta usada por cada diálogo nativo (`rfd`). |
+| `shared/examples/validate_json.rs` | Validador de `scenes.json`/`playlist.json`/`shapes.json` contra los tipos reales. |
 | `panel/src/main.rs` | Panel en ventana del SO aparte (cliente IPC, `eframe`). |
 
 ---

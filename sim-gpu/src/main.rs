@@ -267,6 +267,9 @@ struct State {
     rec_video: Option<(String, u32)>,
     rec_music: bool,
     recorder: Option<rec::Recorder>,
+    /// Última carpeta usada por cada tipo de diálogo nativo (vídeo, música,
+    /// imagen/vídeo de forma), para no tener que volver a navegar cada vez.
+    dialog_dirs: shared::DialogDirs,
     // --- Audio en vivo + sincronía con la pista (port del bucle CPU) ---
     /// Captura en vivo (micrófono o sistema); `None` si `audio_reactive` está
     /// apagado o no se pudo abrir. `audio_source_active` es la fuente con la
@@ -447,6 +450,7 @@ impl State {
             rec_video: None,
             rec_music: false,
             recorder: None,
+            dialog_dirs: shared::DialogDirs::load(),
             audio_in: None,
             audio_source_active,
             audio_level: 0.0,
@@ -551,7 +555,9 @@ impl State {
         let (rgba, w, h) = if is_video_path(&self.params.shape_image) {
             // Solo el primer fotograma para el mosaico/overlay; el streaming se
             // abre diferido (cuando la imagen se forma del todo).
-            let Some(frame) = VideoSource::decode_first_frame(&self.params.shape_image, 720) else {
+            let Some(frame) =
+                VideoSource::decode_first_frame(&self.params.shape_image, self.rec_minor.max(720))
+            else {
                 self.overlay_target = 0.0;
                 return;
             };
@@ -679,6 +685,32 @@ impl State {
         }
         self.shapes_mtime = file_mtime(&shared::shapes_path());
         self.panel.saved_shapes = self.shape_store.shapes.clone();
+    }
+
+    /// Guarda cada ruta en la biblioteca (nombrada por su fichero) y aplica
+    /// la última como forma activa, para importar varias imágenes/vídeos de
+    /// una sola vez (selección múltiple).
+    fn import_shapes(&mut self, paths: Vec<std::path::PathBuf>) {
+        if paths.is_empty() {
+            return;
+        }
+        for p in &paths {
+            let name = p
+                .file_stem()
+                .map(|s| s.to_string_lossy().into_owned())
+                .unwrap_or_else(|| "imagen".to_string());
+            self.shape_store.upsert(&name, String::new(), p.to_string_lossy().into_owned());
+        }
+        self.persist_shapes();
+        if let Some(last) = paths.last() {
+            self.params.shape_image = last.to_string_lossy().into_owned();
+            self.params.shape_text.clear();
+            if is_video_path(&self.params.shape_image) {
+                self.params.shape_photo_color = true;
+                self.params.shape_tint = false;
+            }
+            self.build_shape();
+        }
     }
 
     /// Cambia a la escena siguiente (+1) o anterior (-1).
@@ -857,15 +889,19 @@ impl State {
             PanelEvent::HidePanel => self.panel_visible = false,
             PanelEvent::ToggleRecord => self.toggle_record(),
             PanelEvent::PickVideoDir => {
-                if let Some(dir) = rfd::FileDialog::new().pick_folder() {
+                if let Some(dir) =
+                    shared::dialog_dirs::pick_folder(&mut self.dialog_dirs, shared::DirKind::Video)
+                {
                     self.panel.video_dir = dir.to_string_lossy().into_owned();
                 }
             }
             PanelEvent::PickMusic => {
-                if let Some(p) = rfd::FileDialog::new()
-                    .add_filter("Audio", &["mp3", "wav", "flac", "ogg", "m4a", "aac", "opus"])
-                    .pick_file()
-                {
+                if let Some(p) = shared::dialog_dirs::pick_file(
+                    &mut self.dialog_dirs,
+                    shared::DirKind::Music,
+                    "Audio",
+                    &["mp3", "wav", "flac", "ogg", "m4a", "aac", "opus"],
+                ) {
                     self.panel.music_path = p.to_string_lossy().into_owned();
                     // Analiza ya la pista elegida (en el CPU hay que pulsar
                     // "Analizar pista" a mano; aquí lo hacemos solo por comodidad).
@@ -896,13 +932,15 @@ impl State {
                 self.build_shape();
             }
             PanelEvent::FormImagePick => {
-                if let Some(p) = rfd::FileDialog::new()
-                    .add_filter("Imagen o vídeo", &[
+                if let Some(p) = shared::dialog_dirs::pick_file(
+                    &mut self.dialog_dirs,
+                    shared::DirKind::Image,
+                    "Imagen o vídeo",
+                    &[
                         "png", "jpg", "jpeg", "webp", "bmp", "gif", "mp4", "mov", "mkv", "webm",
                         "avi", "m4v",
-                    ])
-                    .pick_file()
-                {
+                    ],
+                ) {
                     self.params.shape_image = p.to_string_lossy().into_owned();
                     self.params.shape_text.clear();
                     // El vídeo solo funciona con el efecto de color (mosaico +
@@ -922,6 +960,22 @@ impl State {
                     self.params.shape_tint = false;
                 }
                 self.build_shape();
+            }
+            PanelEvent::FormImagesPick => {
+                if let Some(paths) = shared::dialog_dirs::pick_files(
+                    &mut self.dialog_dirs,
+                    shared::DirKind::Image,
+                    "Imagen o vídeo",
+                    &[
+                        "png", "jpg", "jpeg", "webp", "bmp", "gif", "mp4", "mov", "mkv", "webm",
+                        "avi", "m4v",
+                    ],
+                ) {
+                    self.import_shapes(paths);
+                }
+            }
+            PanelEvent::FormImagePaths(paths) => {
+                self.import_shapes(paths.into_iter().map(std::path::PathBuf::from).collect());
             }
             PanelEvent::ReleaseShape => {
                 self.params.shape_text.clear();
@@ -1176,7 +1230,10 @@ impl State {
                 if let Some(r) = self.recorder.as_ref() {
                     self.rec_video = Some((path.clone(), r.frames));
                 }
-                self.video = VideoSource::open(&path, 720);
+                // Antes capado fijo a 720px: se veía borroso con clips de
+                // calidad mayor (p. ej. Manim en 2K). Usa la calidad de
+                // grabación elegida (1080/2K/4K) como tope.
+                self.video = VideoSource::open(&path, self.rec_minor.max(720));
                 self.video_frozen = false;
             }
         }
@@ -1248,11 +1305,17 @@ impl State {
         self.panel.seq_state = self.seq_state;
         self.panel.seq_idx = self.seq_idx;
         self.panel.seq_elapsed = self.seq_timer;
+        self.panel.recording_secs = self
+            .recorder
+            .as_ref()
+            .map_or(0.0, |r| r.frames as f32 / rec::REC_FPS as f32);
 
         // --- Panel egui (mismo `config_panel` que la app CPU) ---
         let raw = self.egui_state.take_egui_input(&self.window);
         let ctx = self.egui_state.egui_ctx().clone();
         let panel_visible = self.panel_visible;
+        let recording_secs = self.panel.recording_secs;
+        let is_recording = self.recorder.is_some();
         let mut events = Vec::new();
         let out = ctx.run(raw, |ctx| {
             if panel_visible {
@@ -1260,6 +1323,23 @@ impl State {
                     .default_width(330.0)
                     .show(ctx, |ui| {
                         events = config_panel(ui, &mut self.params, &mut self.panel);
+                    });
+            }
+            // Contador de grabación SIEMPRE visible (incluso con el panel
+            // oculto con H), igual que el "● REC Ns" que dibuja la app CPU
+            // directamente sobre el lienzo.
+            if is_recording {
+                let s = recording_secs.max(0.0) as u32;
+                egui::Area::new(egui::Id::new("rec_hud"))
+                    .anchor(egui::Align2::LEFT_TOP, egui::vec2(12.0, 12.0))
+                    .interactable(false)
+                    .show(ctx, |ui| {
+                        ui.label(
+                            egui::RichText::new(format!("● REC {:02}:{:02}", s / 60, s % 60))
+                                .color(egui::Color32::from_rgb(230, 70, 70))
+                                .size(22.0)
+                                .strong(),
+                        );
                     });
             }
         });

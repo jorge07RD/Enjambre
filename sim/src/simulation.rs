@@ -206,7 +206,9 @@ impl Simulation {
             // Arranque diferido: abre el streaming al terminar de formarse.
             if p.video.is_none() && formed {
                 if let Some(path) = p.video_path.as_deref() {
-                    p.video = VideoSource::open(path, 720);
+                    // Antes 720 (se veía borroso con clips de más calidad,
+                    // p. ej. Manim en 2K); 1440 cubre grabaciones "2K".
+                    p.video = VideoSource::open(path, 1440);
                     just_started = p.video.is_some();
                 }
             }
