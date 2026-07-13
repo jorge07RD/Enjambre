@@ -122,8 +122,12 @@ programe explícitamente.
   los colores reales de la imagen y, ya formadas, la foto nítida se **funde encima**. Con **vídeo**,
   una vez formada la imagen **se reproduce sobre el enjambre** y, al acabar, **sale sola** en reverso
   (la imagen se desvanece, quedan las partículas con la silueta y se liberan). Las partículas que no
-  forman la imagen siguen su comportamiento y **chocan** con ella. Al **grabar**, el **audio del vídeo**
-  se incluye en el `.mp4`. (Requiere `ffmpeg`.)
+  forman la imagen **esquivan** la figura/foto/vídeo (slider **«Repulsión del fondo»**, un hueco
+  cerrado en la silueta se detecta y se trata como ocupado, así el enjambre nunca queda atrapado
+  dentro) en vez de colisionar con ella tapándola. Al **grabar**, el **audio del vídeo** se incluye
+  en el `.mp4`. Con vídeos de fondo negro puro (p. ej. renders de Manim), la opción **«Quitar fondo
+  negro del vídeo»** vuelve transparentes esos píxeles fotograma a fotograma para que se vean las
+  partículas debajo. (Requiere `ffmpeg`.)
 
 ![Modo "matriz": clústeres orgánicos mezclando colores según la tabla 6×6](docs/img/02-matriz.png)
 
@@ -323,7 +327,8 @@ cargo run -q -p shared --example validate_json -- shapes ~/.config/enjambre/shap
 | `shared/src/ipc.rs` | Tipos de mensaje y encuadre del socket Unix. |
 | `shared/src/scenes.rs` / `playlist.rs` / `shapes.rs` | Persistencia en JSON de escenas, secuenciador y biblioteca de formas. |
 | `shared/src/music.rs` / `audio.rs` | Análisis offline de pistas (envolvente/beats/BPM) y entrada de audio en vivo. |
-| `shared/src/video.rs` | Streaming de fotogramas de vídeo (`ffmpeg`) para el efecto foto/vídeo. |
+| `shared/src/video.rs` | Streaming de fotogramas de vídeo (`ffmpeg`) para el efecto foto/vídeo, más chroma-key de fondo negro. |
+| `shared/src/mask.rs` | Relleno de huecos encerrados en la rejilla de ocupación de la forma (evita que el enjambre quede atrapado dentro). |
 | `shared/src/dialog_dirs.rs` | Recuerda la última carpeta usada por cada diálogo nativo (`rfd`). |
 | `shared/examples/validate_json.rs` | Validador de `scenes.json`/`playlist.json`/`shapes.json` contra los tipos reales. |
 | `panel/src/main.rs` | Panel en ventana del SO aparte (cliente IPC, `eframe`). |
