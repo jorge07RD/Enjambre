@@ -3184,6 +3184,8 @@ dependencies = [
  "egui",
  "image 0.25.10",
  "rand 0.8.6",
+ "realfft",
+ "rfd",
  "serde",
  "serde_json",
 ]
@@ -3212,7 +3214,6 @@ dependencies = [
  "macroquad",
  "rand 0.8.6",
  "rayon",
- "realfft",
  "rfd",
  "shared",
 ]

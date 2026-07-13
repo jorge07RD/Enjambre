@@ -64,7 +64,11 @@ fn points_from_mask(
 /// PNG sin fondo, las partículas se reclutan únicamente donde hay imagen (las
 /// zonas transparentes se quedan sin partículas). `rgba`/`w`/`h` es la imagen.
 /// Las coordenadas coinciden con las de la textura superpuesta (fila 0 =
-/// arriba), así el mosaico y la imagen quedan alineados.
+/// arriba), así el mosaico y la imagen quedan alineados. Las celdas
+/// transparentes ENCERRADAS por celdas opacas (p. ej. el interior de un
+/// círculo/anillo) también se reclutan (`shared::mask::fill_enclosed`): si
+/// no, el enjambre queda atrapado dentro de la forma, rodeado de repulsión
+/// sin salida — distrae y no debería pasar nunca.
 pub fn mosaic_points(
     rgba: &[u8],
     w: usize,
@@ -81,13 +85,20 @@ pub fn mosaic_points(
     let cols = ((count as f32 * aspect).sqrt().round().max(1.0)) as usize;
     let rows = ((count as f32 / aspect).sqrt().round().max(1.0)) as usize;
     let (x0, y0) = (c[0] - e[0] * 0.5, c[1] - e[1] * 0.5);
-    let mut pts = Vec::with_capacity(cols * rows);
+    let mut occ = vec![false; cols * rows];
     for gy in 0..rows {
         let py = (((gy as f32 + 0.5) / rows as f32 * h as f32) as usize).min(h - 1);
-        let wy = y0 + (gy as f32 + 0.5) / rows as f32 * e[1];
         for gx in 0..cols {
             let px = (((gx as f32 + 0.5) / cols as f32 * w as f32) as usize).min(w - 1);
-            if rgba[(py * w + px) * 4 + 3] > 128 {
+            occ[gy * cols + gx] = rgba[(py * w + px) * 4 + 3] > 128;
+        }
+    }
+    shared::mask::fill_enclosed(&mut occ, cols, rows);
+    let mut pts = Vec::with_capacity(cols * rows);
+    for gy in 0..rows {
+        let wy = y0 + (gy as f32 + 0.5) / rows as f32 * e[1];
+        for gx in 0..cols {
+            if occ[gy * cols + gx] {
                 let wx = x0 + (gx as f32 + 0.5) / cols as f32 * e[0];
                 pts.push([wx, wy]);
             }

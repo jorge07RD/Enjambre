@@ -58,6 +58,11 @@ const WIN_V: (f64, f64) = (405.0, 878.0);
 /// como aceleración ×force×dt en sim.wgsl; ajustar aquí si empuja poco/mucho).
 const SHOCK_GAIN: f32 = 12.0;
 
+/// Cada cuántos segundos se recalcula la rejilla del mosaico foto/vídeo con el
+/// fotograma actual (ver `State::update`/bucle principal): sigue el contenido
+/// en vivo del vídeo sin recalcular cada frame (coste) ni verse a saltos.
+const MOSAIC_REFRESH_SECS: f32 = 0.12;
+
 /// Dimensiones de grabación (pares) para una calidad `minor` (el lado MENOR:
 /// ancho en vertical, alto en horizontal), respetando el aspecto del mundo.
 /// 1080 = Full HD, 1440 = 2K. Independiente del tamaño de ventana.
@@ -187,7 +192,7 @@ impl ShapeState {
     /// Factores que consumen los kernels (mismas curvas que la CPU): mezcla
     /// suavizada (ease-in/out) escalando resorte, interacción residual y
     /// evasión del fondo.
-    fn drive(&self, shape_strength: f32) -> ShapeDrive {
+    fn drive(&self, shape_strength: f32, avoid_gain: f32) -> ShapeDrive {
         let sb = self.blend.clamp(0.0, 1.0);
         let b = sb * sb * (3.0 - 2.0 * sb);
         if self.n == 0 || b <= 1e-3 {
@@ -198,7 +203,7 @@ impl ShapeState {
             n: self.n,
             k: (0.02 + fix * 0.38) * b,
             inter: 1.0 - b * (1.0 - 0.35 * (1.0 - fix)),
-            avoid: 2.5 * b,
+            avoid: avoid_gain.max(0.0) * b,
         }
     }
 }
@@ -262,6 +267,14 @@ struct State {
     /// activa al soltar para congelar el frame visible durante el reverso.
     video: Option<VideoSource>,
     video_frozen: bool,
+    /// Copia CPU del último fotograma subido (RGBA), para poder recalcular el
+    /// mosaico (`mosaic_refresh_timer`) sin leer la textura de vuelta desde la
+    /// GPU. `None` si aún no hay vídeo o es una imagen fija.
+    latest_video_frame: Option<(Vec<u8>, u32, u32)>,
+    /// Acumulador para refrescar la rejilla del mosaico con el fotograma
+    /// actual cada `MOSAIC_REFRESH_SECS` (ver el bucle principal): mantiene la
+    /// "expulsión" (`shape_avoid`) pegada al contenido en vivo del vídeo.
+    mosaic_refresh_timer: f32,
     /// Para muxear el audio del vídeo en la grabación: (ruta, frame de grabación
     /// en que arrancó la reproducción) y si la grabación lleva música.
     rec_video: Option<(String, u32)>,
@@ -447,6 +460,8 @@ impl State {
             video_pending: None,
             video: None,
             video_frozen: false,
+            latest_video_frame: None,
+            mosaic_refresh_timer: 0.0,
             rec_video: None,
             rec_music: false,
             recorder: None,
@@ -552,12 +567,15 @@ impl State {
         // Vídeo o imagen fija: en ambos casos arrancamos con un primer
         // fotograma RGBA. El vídeo, además, refresca la textura en el bucle
         // (`advance_video`) hasta que se suelta (se congela en el frame visible).
-        let (rgba, w, h) = if is_video_path(&self.params.shape_image) {
+        let is_video = is_video_path(&self.params.shape_image);
+        let (rgba, w, h) = if is_video {
             // Solo el primer fotograma para el mosaico/overlay; el streaming se
             // abre diferido (cuando la imagen se forma del todo).
-            let Some(frame) =
-                VideoSource::decode_first_frame(&self.params.shape_image, self.rec_minor.max(720))
-            else {
+            let Some(frame) = VideoSource::decode_first_frame(
+                &self.params.shape_image,
+                self.rec_minor.max(720),
+                self.params.video_key_black,
+            ) else {
                 self.overlay_target = 0.0;
                 return;
             };
@@ -593,6 +611,8 @@ impl State {
         self.shape.n = self.sim.upload_shape_targets(&self.queue, &pts);
         self.shape.blend = 0.0;
         self.shape.target = 1.0;
+        self.mosaic_refresh_timer = 0.0;
+        self.latest_video_frame = if is_video { Some((rgba, w, h)) } else { None };
     }
 
     /// Al cambiar de escena: reconstruye la forma SOLO si el descriptor
@@ -1233,7 +1253,8 @@ impl State {
                 // Antes capado fijo a 720px: se veía borroso con clips de
                 // calidad mayor (p. ej. Manim en 2K). Usa la calidad de
                 // grabación elegida (1080/2K/4K) como tope.
-                self.video = VideoSource::open(&path, self.rec_minor.max(720));
+                self.video =
+                    VideoSource::open(&path, self.rec_minor.max(720), self.params.video_key_black);
                 self.video_frozen = false;
             }
         }
@@ -1245,9 +1266,13 @@ impl State {
             self.video_frozen = true;
         }
         if !self.video_frozen && self.video.is_some() {
+            let dims = self.video.as_ref().map(|v| v.dims());
             let new = self.video.as_mut().and_then(|v| v.advance(dt));
             if let Some(bytes) = new {
                 self.sim.update_photo_frame(&self.queue, &bytes);
+                if let Some((w, h)) = dims {
+                    self.latest_video_frame = Some((bytes, w, h));
+                }
             }
             // Reproducido una vez → salida en reverso automática.
             let ended = self.video.as_ref().map(|v| v.ended()).unwrap_or(false);
@@ -1255,6 +1280,35 @@ impl State {
                 self.photo_releasing = true;
                 self.overlay_target = 0.0;
             }
+        }
+        // Refresca el mosaico foto/vídeo con el fotograma actual (no solo el
+        // primero): las partículas no reclutadas son repelidas por las
+        // reclutadas (`shape_avoid`, en `sim.wgsl`), así que mantener la
+        // rejilla pegada al contenido en vivo hace que la "expulsión" siga lo
+        // que pasa en el vídeo en cada momento, en vez de quedarse en la
+        // silueta con la que arrancó. No toca `shape.blend`/`shape.target`:
+        // las partículas ya formadas se retargetan suavemente (resorte
+        // `shape_k`), sin reiniciar la animación de aparición.
+        if self.params.shape_photo_color {
+            self.mosaic_refresh_timer += dt;
+            if self.mosaic_refresh_timer >= MOSAIC_REFRESH_SECS {
+                self.mosaic_refresh_timer = 0.0;
+                if let Some((rgba, w, h)) = self.latest_video_frame.as_ref() {
+                    let recruit = ((self.sim.count as usize) * 9 / 10).max(1);
+                    let center = [self.world[0] * 0.5, self.world[1] * 0.5];
+                    let pts = shape::mosaic_points(
+                        rgba,
+                        *w as usize,
+                        *h as usize,
+                        center,
+                        self.photo_extent,
+                        recruit,
+                    );
+                    self.shape.n = self.sim.upload_shape_targets(&self.queue, &pts);
+                }
+            }
+        } else {
+            self.mosaic_refresh_timer = 0.0;
         }
         // Entrada: la foto se funde encima SOLO cuando las partículas ya se
         // acomodaron (fase A casi completa).
@@ -1541,7 +1595,7 @@ impl State {
         // se asienten en la rejilla. El fondo REPELE a la figura como con el
         // texto (el resto del enjambre choca/rodea la imagen, no la atraviesa).
         let fix = if self.photo_loaded { 0.9 } else { self.params.shape_strength };
-        let drive = self.shape.drive(fix);
+        let drive = self.shape.drive(fix, self.params.shape_avoid_gain);
         // Color del mosaico: sigue la mezcla de aparición de la forma (las
         // reclutadas toman el color de la foto según se acomodan).
         let mb = self.shape.blend.clamp(0.0, 1.0);

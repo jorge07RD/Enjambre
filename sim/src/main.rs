@@ -91,6 +91,10 @@ fn cam_w2s(cam: &Camera2D, p: Vec2, canvas: Rect) -> Vec2 {
 const REC_FPS: i32 = 60;
 /// Factor de supersampling de la grabación (antialias). 2 = 4× de píxeles.
 const SSAA: u32 = 2;
+/// Cada cuántos segundos se recalcula la rejilla del mosaico foto/vídeo con el
+/// fotograma actual (ver el bucle principal): sigue el contenido en vivo del
+/// vídeo sin recalcular cada frame (coste) ni verse a saltos (muy seguido).
+const MOSAIC_REFRESH_SECS: f32 = 0.12;
 
 /// Arrastre en curso del recuadro de encuadre.
 #[derive(Clone, Copy)]
@@ -369,11 +373,11 @@ fn load_photo(path: &str) -> Option<(Texture2D, Vec<u8>, usize, usize)> {
 /// alto) para arrancar el mosaico/overlay. El streaming de la reproducción se
 /// abre luego de forma diferida (`advance_video`), cuando la imagen ya se ha
 /// formado. `None` si `ffmpeg`/`ffprobe` fallan.
-fn load_video(path: &str) -> Option<(Texture2D, Vec<u8>, usize, usize)> {
+fn load_video(path: &str, key_black: bool) -> Option<(Texture2D, Vec<u8>, usize, usize)> {
     // Debe coincidir con el tope usado en `Simulation::advance_video`
     // (`simulation.rs`) o el mosaico y el streaming quedan de tamaños
     // distintos y los fotogramas se rechazan en silencio (pantalla negra).
-    let (first, w, h) = VideoSource::decode_first_frame(path, 1440)?;
+    let (first, w, h) = VideoSource::decode_first_frame(path, 1440, key_black)?;
     let img = Image { bytes: first.clone(), width: w as u16, height: h as u16 };
     let tex = Texture2D::from_image(&img);
     tex.set_filter(FilterMode::Linear);
@@ -425,7 +429,11 @@ fn image_points_from_path(
 
 /// Puntos meta (mundo) de una rejilla `~count` sobre la caja de la foto, SOLO
 /// en las celdas con píxel opaco: en un PNG sin fondo, las partículas se
-/// reclutan únicamente donde hay imagen. `rgba`/`w`/`h` es la imagen.
+/// reclutan únicamente donde hay imagen. `rgba`/`w`/`h` es la imagen. Las
+/// celdas transparentes ENCERRADAS por celdas opacas (p. ej. el interior de
+/// un círculo/anillo) también se reclutan (`shared::mask::fill_enclosed`):
+/// si no, el enjambre queda atrapado dentro de la forma, rodeado de
+/// repulsión sin salida — distrae y no debería pasar nunca.
 fn mosaic_points(rgba: &[u8], w: usize, h: usize, c: Vec2, e: Vec2, count: usize) -> Vec<Vec2> {
     let count = count.max(1);
     if w == 0 || h == 0 {
@@ -435,15 +443,22 @@ fn mosaic_points(rgba: &[u8], w: usize, h: usize, c: Vec2, e: Vec2, count: usize
     let cols = ((count as f32 * aspect).sqrt().round().max(1.0)) as usize;
     let rows = ((count as f32 / aspect).sqrt().round().max(1.0)) as usize;
     let (x0, y0) = (c.x - e.x * 0.5, c.y - e.y * 0.5);
-    let mut pts = Vec::with_capacity(cols * rows);
+    let mut occ = vec![false; cols * rows];
     for gy in 0..rows {
         // `py` invertida (Y de la cámara del CPU al revés), para que la máscara
         // coincida con el color (`Photo::color_at`) y la textura superpuesta.
         let py = ((((rows - 1 - gy) as f32 + 0.5) / rows as f32 * h as f32) as usize).min(h - 1);
-        let wy = y0 + (gy as f32 + 0.5) / rows as f32 * e.y;
         for gx in 0..cols {
             let px = (((gx as f32 + 0.5) / cols as f32 * w as f32) as usize).min(w - 1);
-            if rgba[(py * w + px) * 4 + 3] > 128 {
+            occ[gy * cols + gx] = rgba[(py * w + px) * 4 + 3] > 128;
+        }
+    }
+    shared::mask::fill_enclosed(&mut occ, cols, rows);
+    let mut pts = Vec::with_capacity(cols * rows);
+    for gy in 0..rows {
+        let wy = y0 + (gy as f32 + 0.5) / rows as f32 * e.y;
+        for gx in 0..cols {
+            if occ[gy * cols + gx] {
                 let wx = x0 + (gx as f32 + 0.5) / cols as f32 * e.x;
                 pts.push(Vec2::new(wx, wy));
             }
@@ -466,7 +481,7 @@ fn build_shape(sim: &mut Simulation, params: &SimParams, rng: &mut impl Rng) {
     if params.shape_photo_color && !params.shape_image.is_empty() {
         let is_video = is_video_path(&params.shape_image);
         let loaded = if is_video {
-            load_video(&params.shape_image)
+            load_video(&params.shape_image, params.video_key_black)
         } else {
             load_photo(&params.shape_image)
         };
@@ -952,6 +967,11 @@ async fn main() {
     // música, imagen/vídeo de forma, exportar/importar escenas).
     let mut dialog_dirs = shared::DialogDirs::load();
     let mut auto_rng_timer = 0.0f32;
+    // Cada cuánto se recalcula la rejilla del mosaico foto/vídeo a partir del
+    // fotograma ACTUAL (no solo el primero): así la "expulsión" de partículas
+    // (`shape_avoid`) sigue el contenido en vivo del vídeo en vez de quedar
+    // fija en la silueta del arranque.
+    let mut mosaic_refresh_timer = 0.0f32;
     // Buffer de acumulación para las estelas (se recrea si cambia la ventana).
     let mut trails_rt: Option<RenderTarget> = None;
     // Captura de audio (mantener vivo el stream) + nivel suavizado 0..1. Se
@@ -1341,10 +1361,31 @@ async fn main() {
             // es un vídeo, sube el fotograma actual; al soltar se congela en el
             // frame visible para el reverso. Al arrancar la reproducción durante
             // una grabación, anota el offset para muxear su audio al terminar.
-            if sim.advance_video(show_dt) {
+            if sim.advance_video(show_dt, params.video_key_black) {
                 if let (Some(r), Some(path)) = (rec.as_ref(), sim.video_path()) {
                     rec_video = Some((path.to_string(), r.frames));
                 }
+            }
+            // Refresca el mosaico foto/vídeo con el fotograma actual (no solo
+            // el primero): las partículas no reclutadas son repelidas por las
+            // reclutadas (`shape_avoid`), así que mantener la rejilla pegada
+            // al contenido en vivo hace que la "expulsión" siga lo que pasa en
+            // el vídeo en cada momento, en vez de quedarse en la silueta con
+            // la que arrancó.
+            if params.shape_photo_color && is_video_path(&params.shape_image) {
+                mosaic_refresh_timer += show_dt;
+                if mosaic_refresh_timer >= MOSAIC_REFRESH_SECS {
+                    mosaic_refresh_timer = 0.0;
+                    if let Some(photo) = sim.photo.as_ref() {
+                        let (bytes, w, h, c, e) =
+                            (photo.bytes.clone(), photo.w, photo.h, photo.center, photo.extent);
+                        let recruit = (sim.particles.len() * 9 / 10).max(1);
+                        let pts = mosaic_points(&bytes, w, h, c, e, recruit);
+                        sim.retarget_shape(pts);
+                    }
+                }
+            } else {
+                mosaic_refresh_timer = 0.0;
             }
             // Efecto foto (fase B + salida en reverso): la imagen se funde tras
             // acomodarse; al soltar, se va primero la imagen y luego la forma.

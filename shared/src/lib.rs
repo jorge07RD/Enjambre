@@ -6,6 +6,7 @@ pub mod audio;
 pub mod config;
 pub mod dialog_dirs;
 pub mod ipc;
+pub mod mask;
 pub mod music;
 pub mod panel_ui;
 pub mod playlist;

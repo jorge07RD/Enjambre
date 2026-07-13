@@ -14,6 +14,7 @@ use crate::config::{
 use crate::playlist::{Playlist, PlaylistEntry, SeqPlayback};
 use crate::shapes::SavedShape;
 use crate::ui_theme::icon;
+use crate::video::is_video_path;
 use serde::{Deserialize, Serialize};
 
 /// Estado de UI no contenido en `SimParams`, más telemetría de solo lectura.
@@ -811,6 +812,14 @@ pub fn config_panel(
                     .text("Fluidez (s)"),
             );
             ui.add(egui::Slider::new(&mut params.shape_strength, 0.0..=1.0).text("Fijación"));
+            ui.add(
+                egui::Slider::new(&mut params.shape_avoid_gain, 0.0..=30.0)
+                    .text("Repulsión del fondo"),
+            )
+            .on_hover_text(
+                "Cuánto esquiva el resto del enjambre a la figura/foto/vídeo: más alto = se \
+                 lee mejor el contenido, menos partículas encima.",
+            );
             if ui.checkbox(&mut params.shape_tint, "Teñir de un color").changed()
                 && params.shape_tint
             {
@@ -841,6 +850,14 @@ pub fn config_panel(
                     && params.shape_photo_color
                 {
                     params.shape_tint = false; // mutuamente excluyentes
+                }
+                if is_video_path(&params.shape_image) {
+                    ui.checkbox(&mut params.video_key_black, "Quitar fondo negro del vídeo")
+                        .on_hover_text(
+                            "Los píxeles casi negros del vídeo se vuelven transparentes: se ven \
+                             las partículas donde no hay contenido (ideal para clips con fondo \
+                             negro, p. ej. Manim).",
+                        );
                 }
             }
             ui.label(

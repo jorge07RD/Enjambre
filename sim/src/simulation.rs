@@ -22,9 +22,9 @@ pub struct Particle {
 /// píxeles); (B) la textura se superpone encima con un fundido (`tex`).
 pub struct Photo {
     pub tex: Texture2D,
-    bytes: Vec<u8>,
-    w: usize,
-    h: usize,
+    pub(crate) bytes: Vec<u8>,
+    pub(crate) w: usize,
+    pub(crate) h: usize,
     /// Centro de la caja de la foto (mundo).
     pub center: Vec2,
     /// Tamaño de la caja de la foto (mundo).
@@ -144,6 +144,20 @@ impl Simulation {
         }
     }
 
+    /// Reemplaza los puntos meta de la forma SIN reiniciar la animación de
+    /// aparición (`shape_blend`/`shape_target` no se tocan). Pensado para el
+    /// efecto foto/vídeo: al reconstruir el mosaico con el fotograma actual
+    /// (en vez de solo el primero), las partículas ya formadas se retargetan
+    /// suavemente (por el resorte `shape_k`) hacia la nueva posición en vez de
+    /// rehacer la formación desde cero. No-op si `targets` está vacío (se
+    /// conserva la forma anterior en vez de soltarla, a diferencia de
+    /// `set_shape`).
+    pub fn retarget_shape(&mut self, targets: Vec<Vec2>) {
+        if !targets.is_empty() {
+            self.shape = Some(targets);
+        }
+    }
+
     /// Fija la foto (textura + píxeles `bytes` de `w`×`h`) del efecto: encuadra
     /// al 90% del lienzo, centrada y con el aspecto preservado. La fase A
     /// (acomodar + colorear) la arranca `set_shape` con la rejilla; la fase B
@@ -187,7 +201,7 @@ impl Simulation {
     /// una vez) dispara la salida en reverso. Al soltar se congela en el frame
     /// visible. Devuelve `true` justo en el frame en que arranca la
     /// reproducción (para marcar el offset de audio al grabar).
-    pub fn advance_video(&mut self, dt: f32) -> bool {
+    pub fn advance_video(&mut self, dt: f32, key_black: bool) -> bool {
         let releasing = self.photo_releasing;
         let formed = self.overlay_reveal >= 0.99;
         let mut ended = false;
@@ -208,7 +222,7 @@ impl Simulation {
                 if let Some(path) = p.video_path.as_deref() {
                     // Antes 720 (se veía borroso con clips de más calidad,
                     // p. ej. Manim en 2K); 1440 cubre grabaciones "2K".
-                    p.video = VideoSource::open(path, 1440);
+                    p.video = VideoSource::open(path, 1440, key_black);
                     just_started = p.video.is_some();
                 }
             }
@@ -475,7 +489,7 @@ impl Simulation {
         // a la figura (para no invadirla). Ganancia de esa evasión (crece con la
         // mezcla). También aplica en modo foto: el enjambre choca/rodea la
         // imagen, no la atraviesa.
-        let shape_avoid = 2.5 * shape_blend;
+        let shape_avoid = params.shape_avoid_gain.max(0.0) * shape_blend;
 
         // Bandada (Boids): física vectorial que sustituye a la fuerza radial.
         // Como Boids no usa el coeficiente escalar, no puede mezclarse con el

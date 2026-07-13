@@ -453,6 +453,10 @@ pub struct SimParams {
     /// "Fijación" de la forma: 0 = las partículas fluyen con la física (texto
     /// vivo), 1 = se fijan nítidas en la forma. Solo actúa si hay una forma.
     pub shape_strength: f32,
+    /// Ganancia de la repulsión con la que el fondo (partículas no
+    /// reclutadas) esquiva a la figura/foto/vídeo, para que nunca la tape ni
+    /// quede atrapado dentro. 0 = sin evitación.
+    pub shape_avoid_gain: f32,
     /// Duración (s) de la aparición/disolución fluida de la forma al aplicarla o
     /// soltarla. 0 = instantáneo.
     pub shape_transition_duration: f32,
@@ -465,6 +469,11 @@ pub struct SimParams {
     /// vez de un tinte único. Solo aplica a imágenes (el texto no tiene
     /// color propio); mutuamente excluyente con `shape_tint` en la UI.
     pub shape_photo_color: bool,
+    /// Solo vídeo: los píxeles casi negros de cada fotograma se vuelven
+    /// transparentes (chroma-key por luminancia), para que las partículas se
+    /// vean donde el vídeo no tiene contenido en vez de taparlas con su
+    /// fondo negro. No afecta a imágenes fijas.
+    pub video_key_black: bool,
     /// Descriptor de la forma activa (para poder guardarla en una escena y
     /// reconstruirla al cargarla). Los posee el `sim`. Vacíos = sin forma.
     /// Mensaje de texto activo (prioritario sobre la imagen).
@@ -564,10 +573,12 @@ impl Default for SimParams {
             audio_source: AudioSource::Mic,
             audio_bands: false,
             shape_strength: 0.5,
+            shape_avoid_gain: 16.0,
             shape_transition_duration: 1.5,
             shape_tint: false,
             shape_color: 0,
             shape_photo_color: false,
+            video_key_black: false,
             shape_text: String::new(),
             shape_image: String::new(),
             bloom: false,

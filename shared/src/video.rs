@@ -28,6 +28,39 @@ const VIDEO_EXTS: &[&str] = &["mp4", "mov", "mkv", "webm", "avi", "m4v"];
 /// FPS por defecto si `ffprobe` no reporta uno válido.
 const DEFAULT_FPS: f32 = 30.0;
 
+/// Luminancia (BT.709) por debajo de la cual un píxel se considera "fondo
+/// negro" y se vuelve transparente del todo con `key_out_black`.
+const BLACK_KEY_THRESHOLD: f32 = 0.06;
+/// Ancho de la rampa suave entre transparente y opaco por encima del umbral
+/// (evita bordes duros/aliasing en los contornos del contenido).
+const BLACK_KEY_SOFTNESS: f32 = 0.10;
+
+/// Vuelve transparentes (alfa→0) los píxeles casi negros de un fotograma RGBA
+/// `in-place`, con una transición suave entre `threshold` y
+/// `threshold+softness` de luminancia. Pensado para vídeos con fondo negro
+/// puro sin canal alfa real (p. ej. renders de Manim sin `-t`): al aplicarlo,
+/// el fotograma se comporta como un PNG con fondo transparente, así que el
+/// resto de la tubería (mosaico + overlay) deja ver las partículas donde no
+/// hay contenido, sin más cambios.
+pub fn key_out_black(rgba: &mut [u8], threshold: f32, softness: f32) {
+    let t0 = threshold.clamp(0.0, 1.0);
+    let t1 = (t0 + softness.max(0.0)).clamp(t0, 1.0);
+    for px in rgba.chunks_exact_mut(4) {
+        let r = px[0] as f32 / 255.0;
+        let g = px[1] as f32 / 255.0;
+        let b = px[2] as f32 / 255.0;
+        let luma = 0.2126 * r + 0.7152 * g + 0.0722 * b;
+        let k = if t1 > t0 {
+            ((luma - t0) / (t1 - t0)).clamp(0.0, 1.0)
+        } else if luma >= t1 {
+            1.0
+        } else {
+            0.0
+        };
+        px[3] = ((px[3] as f32 / 255.0) * k * 255.0).round() as u8;
+    }
+}
+
 /// `true` si la ruta apunta a un contenedor de vídeo (por extensión).
 pub fn is_video_path(path: &str) -> bool {
     std::path::Path::new(path)
@@ -52,13 +85,19 @@ pub struct VideoSource {
     acc: f32,
     /// El emisor se desconectó y la cola se vació: el vídeo terminó.
     finished: bool,
+    /// Si está activo, cada fotograma pasa por `key_out_black` antes de
+    /// entregarse (fondo negro → transparente, ver `advance`).
+    key_black: bool,
 }
 
 impl VideoSource {
     /// Abre `path` con `ffmpeg`, escalando para que el lado mayor no supere
     /// `max_dim` (aspecto preservado, dimensiones pares). Se reproduce UNA vez.
-    /// `None` si `ffprobe`/`ffmpeg` fallan.
-    pub fn open(path: &str, max_dim: u32) -> Option<VideoSource> {
+    /// `key_black`: si es `true`, los píxeles casi negros de cada fotograma se
+    /// vuelven transparentes (ver `key_out_black`), para dejar ver las
+    /// partículas donde el vídeo no tiene contenido. `None` si `ffprobe`/
+    /// `ffmpeg` fallan.
+    pub fn open(path: &str, max_dim: u32, key_black: bool) -> Option<VideoSource> {
         let (nw, nh) = probe_dims(path)?;
         let (w, h) = scaled_even(nw, nh, max_dim.max(2));
         let fps = probe_fps(path).unwrap_or(DEFAULT_FPS);
@@ -118,13 +157,26 @@ impl VideoSource {
             })
         };
 
-        Some(VideoSource { w, h, fps, rx, stop, child, _reader: reader, acc: 0.0, finished: false })
+        Some(VideoSource {
+            w,
+            h,
+            fps,
+            rx,
+            stop,
+            child,
+            _reader: reader,
+            acc: 0.0,
+            finished: false,
+            key_black,
+        })
     }
 
     /// Decodifica SOLO el primer fotograma (RGBA) con las mismas dimensiones
     /// que produciría `open`. Para arrancar la textura/mosaico sin lanzar el
-    /// streaming todavía. Devuelve `(bytes, w, h)`.
-    pub fn decode_first_frame(path: &str, max_dim: u32) -> Option<(Vec<u8>, u32, u32)> {
+    /// streaming todavía. `key_black`: igual que en `open`, aplica
+    /// `key_out_black` al fotograma antes de devolverlo. Devuelve
+    /// `(bytes, w, h)`.
+    pub fn decode_first_frame(path: &str, max_dim: u32, key_black: bool) -> Option<(Vec<u8>, u32, u32)> {
         let (nw, nh) = probe_dims(path)?;
         let (w, h) = scaled_even(nw, nh, max_dim.max(2));
         let out = Command::new("ffmpeg")
@@ -154,7 +206,11 @@ impl VideoSource {
             eprintln!("Primer fotograma de '{path}' con tamaño inesperado.");
             return None;
         }
-        Some((out.stdout, w, h))
+        let mut bytes = out.stdout;
+        if key_black {
+            key_out_black(&mut bytes, BLACK_KEY_THRESHOLD, BLACK_KEY_SOFTNESS);
+        }
+        Some((bytes, w, h))
     }
 
     /// Dimensiones (ya escaladas) del fotograma.
@@ -195,6 +251,11 @@ impl VideoSource {
                     self.finished = true;
                     break;
                 }
+            }
+        }
+        if self.key_black {
+            if let Some(frame) = latest.as_mut() {
+                key_out_black(frame, BLACK_KEY_THRESHOLD, BLACK_KEY_SOFTNESS);
             }
         }
         latest
@@ -365,12 +426,13 @@ mod tests {
             return;
         };
         // Primer fotograma one-shot.
-        let (first, w, h) = VideoSource::decode_first_frame(&path, 720).expect("primer fotograma");
+        let (first, w, h) =
+            VideoSource::decode_first_frame(&path, 720, false).expect("primer fotograma");
         assert!(w % 2 == 0 && h % 2 == 0);
         assert_eq!(first.len(), (w * h * 4) as usize);
 
         // Streaming: avanzando ~1 s de simulación deben salir fotogramas.
-        let mut src = VideoSource::open(&path, 720).expect("abrir vídeo");
+        let mut src = VideoSource::open(&path, 720, false).expect("abrir vídeo");
         assert_eq!(src.dims(), (w, h));
         let mut got = 0;
         let start = std::time::Instant::now();
@@ -382,5 +444,26 @@ mod tests {
             std::thread::sleep(std::time::Duration::from_millis(8));
         }
         assert!(got > 0, "no salió ningún fotograma del streaming");
+    }
+
+    #[test]
+    fn key_out_black_vuelve_transparente_el_negro_y_respeta_el_resto() {
+        // Negro puro, blanco puro, y un gris a mitad de la rampa entre
+        // BLACK_KEY_THRESHOLD y BLACK_KEY_SOFTNESS.
+        let mid_luma = BLACK_KEY_THRESHOLD + BLACK_KEY_SOFTNESS * 0.5;
+        let mid_byte = (mid_luma * 255.0).round() as u8;
+        let mut rgba = vec![
+            0, 0, 0, 255, // negro → transparente
+            255, 255, 255, 255, // blanco → sin cambio
+            mid_byte, mid_byte, mid_byte, 200, // gris a mitad de rampa, alfa original 200
+        ];
+        key_out_black(&mut rgba, BLACK_KEY_THRESHOLD, BLACK_KEY_SOFTNESS);
+        assert_eq!(rgba[3], 0, "negro debe quedar totalmente transparente");
+        assert_eq!(rgba[7], 255, "blanco debe conservar su alfa");
+        assert!(
+            rgba[11] > 0 && rgba[11] < 200,
+            "gris a mitad de rampa debe quedar parcialmente transparente, fue {}",
+            rgba[11]
+        );
     }
 }
