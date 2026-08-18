@@ -4,6 +4,7 @@
   <em>Simulador interactivo de <strong>vida de partículas</strong> en Rust: miles de puntos de colores que se organizan solos en enjambres, células, anillos y estructuras vivas.</em>
 </p>
 
+
 <p align="center">
   <img src="https://img.shields.io/badge/Rust-2021-000000?logo=rust&logoColor=white" alt="Rust">
   <img src="https://img.shields.io/badge/render-macroquad-FF6B00" alt="macroquad">
