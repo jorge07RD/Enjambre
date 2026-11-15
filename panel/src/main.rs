@@ -16,9 +16,9 @@ fn main() -> eframe::Result<()> {
 
     let options = eframe::NativeOptions {
         viewport: eframe::egui::ViewportBuilder::default()
-            .with_inner_size([360.0, 760.0])
-            .with_min_inner_size([300.0, 400.0])
-            .with_title("Panel — Puntos de Atracción"),
+            .with_inner_size([380.0, 820.0])
+            .with_min_inner_size([320.0, 480.0])
+            .with_title("Enjambre — Panel"),
         ..Default::default()
     };
 
@@ -254,7 +254,9 @@ impl eframe::App for PanelApp {
         self.apply_telemetry();
 
         let mut events = Vec::new();
-        eframe::egui::CentralPanel::default().show(ctx, |ui| {
+        eframe::egui::CentralPanel::default()
+            .frame(eframe::egui::Frame::NONE.fill(shared::ui_theme::BG_BASE))
+            .show(ctx, |ui| {
             events = config_panel(ui, &mut self.params, &mut self.st);
         });
 

@@ -12,6 +12,7 @@ pub mod panel_ui;
 pub mod playlist;
 pub mod scenes;
 pub mod shapes;
+pub mod ui_kit;
 pub mod ui_theme;
 pub mod video;
 

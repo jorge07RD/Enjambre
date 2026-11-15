@@ -23,6 +23,7 @@
 //! No aplican en el visor GPU (mundo fijo, panel embebido): L/Z (zoom/lienzo),
 //! D (separar panel), y G no alterna recuadro (aquí es el debug grid/naive).
 
+mod glass;
 mod gpu_sim;
 mod rec;
 mod shape;
@@ -319,6 +320,8 @@ struct State {
     panel_visible: bool,
     egui_state: egui_winit::State,
     egui_renderer: egui_wgpu::Renderer,
+    /// Blur real de la escena detrás de la lámina de cristal del panel.
+    glass: glass::Glass,
     /// Avanzar un solo paso aunque esté en pausa (botón "Paso").
     step_once: bool,
     // FPS en el título (media sobre una ventana de frames).
@@ -398,9 +401,14 @@ impl State {
             Some(device.limits().max_texture_dimension_2d as usize),
         );
         let egui_renderer = egui_wgpu::Renderer::new(&device, config.format, None, 1, false);
+        let glass = glass::Glass::new(&device, config.format, config.width, config.height);
 
         let shape_store = ShapeStore::load();
-        let mut panel = PanelState::default();
+        let mut panel = PanelState {
+            // La escena se ve detrás del panel: la lámina de cristal la desenfoca.
+            backdrop: shared::ui_kit::Backdrop::Live,
+            ..PanelState::default()
+        };
         panel.scenes = store.names();
         panel.default_scene = store.default.clone().unwrap_or_default();
         panel.particle_count = count as usize;
@@ -485,6 +493,7 @@ impl State {
             panel_visible: world[0] >= world[1],
             egui_state,
             egui_renderer,
+            glass,
             step_once: false,
             frames: 0,
             t0: Instant::now(),
@@ -1374,7 +1383,11 @@ impl State {
         let out = ctx.run(raw, |ctx| {
             if panel_visible {
                 egui::SidePanel::left("panel")
-                    .default_width(330.0)
+                    .frame(egui::Frame::NONE)
+                    .show_separator_line(false)
+                    .resizable(true)
+                    .default_width(350.0)
+                    .min_width(300.0)
                     .show(ctx, |ui| {
                         events = config_panel(ui, &mut self.params, &mut self.panel);
                     });
@@ -1685,6 +1698,23 @@ impl State {
                 self.sim.draw_photo(&mut encoder, &self.queue, &r.view, true, half, reveal);
             }
             r.copy_frame(&mut encoder);
+        }
+
+        // Cristal: desenfocar la escena justo detrás de la lámina del panel
+        // (después de la copia a la grabación, así que no entra en el vídeo).
+        if panel_visible {
+            if let Some(r) = self.panel.glass_rect {
+                let ppp = out.pixels_per_point;
+                self.glass.encode(
+                    &self.device,
+                    &self.queue,
+                    &mut encoder,
+                    self.sim.scene_view(),
+                    &view,
+                    (self.config.width, self.config.height),
+                    [r.min.x * ppp, r.min.y * ppp, r.width() * ppp, r.height() * ppp],
+                );
+            }
         }
 
         // Pintar el panel encima de la escena.
