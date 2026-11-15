@@ -1437,6 +1437,10 @@ async fn main() {
                 }
                 egui_macroquad::ui(|ctx| {
                     // Aplica el tema neón + fuente de iconos una sola vez.
+                    // Las fuentes nuevas de egui (Inter, SemiBold) solo existen a
+                    // partir del frame siguiente a `set_fonts`: el primer frame
+                    // aplica el tema y no dibuja el panel.
+                    let fonts_ready = theme_applied;
                     if !theme_applied {
                         shared::ui_theme::apply(ctx);
                         theme_applied = true;
@@ -1445,9 +1449,12 @@ async fn main() {
                     want_keyboard = ctx.wants_keyboard_input();
                     // Oculto: no dibujamos panel (egui queda vacío este frame, así
                     // el ratón/teclado controlan el lienzo sin robar el foco).
-                    if panel_visible {
+                    if panel_visible && fonts_ready {
                         let resp = egui::SidePanel::right("panel")
-                            .default_width(310.0)
+                            .frame(egui::Frame::NONE.fill(shared::ui_theme::BG_BASE))
+                            .show_separator_line(false)
+                            .default_width(340.0)
+                            .min_width(300.0)
                             .show(ctx, |ui| {
                                 events = config_panel(ui, &mut params, &mut st);
                             });

@@ -1,19 +1,73 @@
-//! Tema visual del panel (compartido por el panel embebido en `sim` y el
-//! separado en `panel`, ambos sobre egui 0.31). Aplica un aspecto "oscuro neón"
-//! y registra una fuente de iconos (Nerd Font) como *fallback*, para que los
-//! glifos de icono se dibujen (egui por defecto solo trae un subconjunto de
-//! emoji y muchos salían como □).
+//! Tema visual del panel (compartido por el panel embebido en `sim`/`sim-gpu`
+//! y el separado en `panel`, todos sobre egui 0.31): "cristal de instrumento".
+//!
+//! Una lámina de cristal ahumado (la pinta `ui_kit::glass_slab`) con tarjetas
+//! de cristal más claras encima; un único acento (iris), colores semánticos
+//! para estado y cifras en mono. Tipografía Inter (Regular + SemiBold, OFL)
+//! embebida, con la Nerd Font de iconos como *fallback* para los glifos.
 //!
 //! Llamar `apply(ctx)` una sola vez por proceso, tras crear el contexto egui.
 
+use egui::{Color32, CornerRadius, FontFamily, FontId, Shadow, Stroke, TextStyle};
 use std::sync::Arc;
 
-/// Color de acento (cian neón) del tema.
-pub const ACCENT: egui::Color32 = egui::Color32::from_rgb(0x2f, 0xe6, 0xd6);
-/// Acento tenue para rellenos de selección/hover.
-const ACCENT_DIM: egui::Color32 = egui::Color32::from_rgb(0x12, 0x53, 0x4e);
+// ------------------------------------------------------------------ tokens
 
-/// Instala fuentes (con la Nerd Font como fallback de iconos) y la paleta oscura.
+/// Color con alfa *no* premultiplicado, evaluable en `const` (egui guarda los
+/// `Color32` premultiplicados).
+const fn rgba(r: u8, g: u8, b: u8, a: u8) -> Color32 {
+    Color32::from_rgba_premultiplied(pm(r, a), pm(g, a), pm(b, a), a)
+}
+
+const fn pm(c: u8, a: u8) -> u8 {
+    ((c as u16 * a as u16 + 127) / 255) as u8
+}
+
+/// Fondo opaco donde no hay escena detrás (sim CPU, ventana aparte).
+pub const BG_BASE: Color32 = Color32::from_rgb(0x0A, 0x0C, 0x11);
+/// Tinte de la lámina sobre el blur real de la escena (`sim-gpu`).
+pub const GLASS_TINT_LIVE: Color32 = rgba(14, 16, 24, 148);
+/// Tinte de la lámina sobre el fondo ambiental.
+pub const GLASS_TINT_AMBIENT: Color32 = rgba(14, 16, 24, 184);
+/// Relleno de las tarjetas de sección (y en hover).
+pub const CARD_FILL: Color32 = rgba(255, 255, 255, 9);
+pub const CARD_FILL_HOVER: Color32 = rgba(255, 255, 255, 14);
+/// Borde fino de cristal.
+pub const HAIRLINE: Color32 = rgba(255, 255, 255, 20);
+/// Brillo de 1 px en el canto superior (bisel).
+pub const BEVEL: Color32 = rgba(255, 255, 255, 36);
+/// Texto primario / secundario / pistas.
+pub const TEXT_1: Color32 = Color32::from_rgb(0xEC, 0xEE, 0xF4);
+pub const TEXT_2: Color32 = Color32::from_rgb(0xA6, 0xAB, 0xBA);
+pub const TEXT_3: Color32 = Color32::from_rgb(0x6C, 0x71, 0x83);
+/// Acento (iris): selección, relleno de slider, switch encendido, pestaña activa.
+pub const ACCENT: Color32 = Color32::from_rgb(0x9D, 0x8C, 0xFF);
+/// Acento tenue para fondos de lo seleccionado.
+pub const ACCENT_SOFT: Color32 = rgba(0x9D, 0x8C, 0xFF, 51);
+/// Estado: en vivo / aviso / peligro (REC, borrar).
+pub const OK: Color32 = Color32::from_rgb(0x5E, 0xE6, 0xA8);
+pub const WARN: Color32 = Color32::from_rgb(0xF5, 0xB8, 0x4B);
+pub const DANGER: Color32 = Color32::from_rgb(0xFF, 0x5A, 0x63);
+
+/// Radios: lámina, tarjeta y controles.
+pub const R_SLAB: u8 = 16;
+pub const R_CARD: u8 = 12;
+pub const R_CTRL: u8 = 8;
+
+/// Familia de la fuente SemiBold (títulos, wordmark, etiquetas fuertes).
+pub const STRONG: &str = "strong";
+
+/// `FontId` SemiBold del tamaño dado.
+pub fn strong(size: f32) -> FontId {
+    FontId::new(size, FontFamily::Name(STRONG.into()))
+}
+
+/// `FontId` monoespaciada (cifras) del tamaño dado.
+pub fn mono(size: f32) -> FontId {
+    FontId::monospace(size)
+}
+
+/// Instala fuentes (Inter + Nerd Font de iconos como fallback) y la paleta.
 pub fn apply(ctx: &egui::Context) {
     install_fonts(ctx);
     install_visuals(ctx);
@@ -21,6 +75,18 @@ pub fn apply(ctx: &egui::Context) {
 
 fn install_fonts(ctx: &egui::Context) {
     let mut fonts = egui::FontDefinitions::default();
+    fonts.font_data.insert(
+        "inter".to_owned(),
+        Arc::new(egui::FontData::from_static(include_bytes!(
+            "../../assets/fonts/Inter-Regular.ttf"
+        ))),
+    );
+    fonts.font_data.insert(
+        "inter_semibold".to_owned(),
+        Arc::new(egui::FontData::from_static(include_bytes!(
+            "../../assets/fonts/Inter-SemiBold.ttf"
+        ))),
+    );
     // Fuente de iconos empaquetada (Nerd Font: cubre Font Awesome + Material).
     fonts.font_data.insert(
         "icons".to_owned(),
@@ -28,50 +94,123 @@ fn install_fonts(ctx: &egui::Context) {
             "../../assets/icons.ttf"
         ))),
     );
-    // Añadirla al FINAL de cada familia = fallback: el texto normal usa las
-    // fuentes por defecto y solo los glifos de icono caen en la Nerd Font.
-    for fam in [egui::FontFamily::Proportional, egui::FontFamily::Monospace] {
-        fonts.families.entry(fam).or_default().push("icons".to_owned());
-    }
+
+    // Los iconos van justo detrás de Inter: las fuentes por defecto de egui
+    // (Ubuntu) tienen ligaduras "fi"/"fl" en U+F001/F002, que taparían iconos
+    // de Font Awesome como la nota musical.
+    let prop = fonts.families.entry(FontFamily::Proportional).or_default();
+    prop.insert(0, "inter".to_owned());
+    prop.insert(1, "icons".to_owned());
+    let fallback: Vec<String> = prop.iter().skip(1).cloned().collect();
+
+    // SemiBold: Inter SemiBold y, detrás, el mismo fallback.
+    let mut strong_fam = vec!["inter_semibold".to_owned()];
+    strong_fam.extend(fallback);
+    fonts
+        .families
+        .insert(FontFamily::Name(STRONG.into()), strong_fam);
+
+    // Mono (Hack, la de egui) para cifras, con iconos de fallback.
+    fonts
+        .families
+        .entry(FontFamily::Monospace)
+        .or_default()
+        .insert(1, "icons".to_owned());
     ctx.set_fonts(fonts);
 }
 
 fn install_visuals(ctx: &egui::Context) {
     let mut v = egui::Visuals::dark();
 
-    // Fondos algo más oscuros y fríos.
-    v.panel_fill = egui::Color32::from_rgb(0x12, 0x14, 0x18);
-    v.window_fill = egui::Color32::from_rgb(0x16, 0x19, 0x1f);
-    v.extreme_bg_color = egui::Color32::from_rgb(0x0b, 0x0d, 0x10);
+    // La lámina de cristal la pinta el kit; los contenedores de egui quedan
+    // transparentes para dejarla ver.
+    v.panel_fill = Color32::TRANSPARENT;
+    v.window_fill = Color32::from_rgba_unmultiplied(18, 20, 28, 242);
+    v.window_stroke = Stroke::new(1.0_f32, HAIRLINE);
+    v.extreme_bg_color = Color32::from_rgba_unmultiplied(0, 0, 0, 90);
+    v.faint_bg_color = Color32::from_rgba_unmultiplied(255, 255, 255, 6);
+    v.code_bg_color = Color32::from_rgba_unmultiplied(255, 255, 255, 12);
+    let shadow = Shadow {
+        offset: [0, 8],
+        blur: 24,
+        spread: 0,
+        color: Color32::from_black_alpha(120),
+    };
+    v.window_shadow = shadow;
+    v.popup_shadow = shadow;
 
-    // Acento neón en enlaces y selección.
     v.hyperlink_color = ACCENT;
-    v.selection.bg_fill = ACCENT_DIM;
-    v.selection.stroke = egui::Stroke::new(1.0, ACCENT);
+    v.warn_fg_color = WARN;
+    v.error_fg_color = DANGER;
+    v.selection.bg_fill = ACCENT_SOFT;
+    v.selection.stroke = Stroke::new(1.0_f32, ACCENT);
+    v.slider_trailing_fill = true;
+    v.handle_shape = egui::style::HandleShape::Circle;
+    v.override_text_color = None;
 
-    // Realce de acento al pasar/pulsar controles.
-    v.widgets.hovered.bg_fill = ACCENT_DIM;
-    v.widgets.hovered.weak_bg_fill = ACCENT_DIM;
-    v.widgets.hovered.fg_stroke = egui::Stroke::new(1.2, ACCENT);
-    v.widgets.active.bg_fill = ACCENT;
-    v.widgets.active.weak_bg_fill = ACCENT;
+    let ctrl = CornerRadius::same(R_CTRL);
+    let w = &mut v.widgets;
+    w.noninteractive.bg_fill = Color32::TRANSPARENT;
+    w.noninteractive.weak_bg_fill = Color32::TRANSPARENT;
+    w.noninteractive.bg_stroke = Stroke::new(1.0_f32, HAIRLINE);
+    w.noninteractive.fg_stroke = Stroke::new(1.0_f32, TEXT_2);
 
-    // Esquinas redondeadas (aspecto más suave).
-    let r = egui::CornerRadius::same(5);
-    v.widgets.noninteractive.corner_radius = r;
-    v.widgets.inactive.corner_radius = r;
-    v.widgets.hovered.corner_radius = r;
-    v.widgets.active.corner_radius = r;
-    v.widgets.open.corner_radius = r;
-    v.window_corner_radius = egui::CornerRadius::same(8);
-    v.menu_corner_radius = egui::CornerRadius::same(6);
+    w.inactive.bg_fill = Color32::from_rgba_unmultiplied(255, 255, 255, 22);
+    w.inactive.weak_bg_fill = Color32::from_rgba_unmultiplied(255, 255, 255, 13);
+    w.inactive.bg_stroke = Stroke::new(1.0_f32, HAIRLINE);
+    w.inactive.fg_stroke = Stroke::new(1.0_f32, TEXT_1);
+
+    w.hovered.bg_fill = Color32::from_rgba_unmultiplied(255, 255, 255, 32);
+    w.hovered.weak_bg_fill = Color32::from_rgba_unmultiplied(255, 255, 255, 23);
+    w.hovered.bg_stroke = Stroke::new(1.0_f32, Color32::from_rgba_unmultiplied(255, 255, 255, 41));
+    w.hovered.fg_stroke = Stroke::new(1.2_f32, TEXT_1);
+    w.hovered.expansion = 0.0;
+
+    w.active.bg_fill = ACCENT;
+    w.active.weak_bg_fill = ACCENT_SOFT;
+    w.active.bg_stroke = Stroke::new(1.0_f32, ACCENT);
+    w.active.fg_stroke = Stroke::new(1.5_f32, TEXT_1);
+    w.active.expansion = 0.0;
+
+    w.open.weak_bg_fill = ACCENT_SOFT;
+    w.open.bg_stroke = Stroke::new(1.0_f32, ACCENT);
+
+    for ws in [
+        &mut w.noninteractive,
+        &mut w.inactive,
+        &mut w.hovered,
+        &mut w.active,
+        &mut w.open,
+    ] {
+        ws.corner_radius = ctrl;
+    }
+    v.window_corner_radius = CornerRadius::same(R_CARD);
+    v.menu_corner_radius = CornerRadius::same(R_CTRL);
 
     ctx.set_visuals(v);
 
-    // Un poco más de aire entre controles.
     let mut style = (*ctx.style()).clone();
-    style.spacing.item_spacing = egui::vec2(8.0, 6.0);
-    style.spacing.button_padding = egui::vec2(8.0, 4.0);
+    style.text_styles = [
+        (TextStyle::Heading, strong(17.0)),
+        (TextStyle::Body, FontId::proportional(13.0)),
+        (TextStyle::Button, FontId::proportional(13.0)),
+        (TextStyle::Small, FontId::proportional(11.5)),
+        (TextStyle::Monospace, mono(12.0)),
+    ]
+    .into();
+    let s = &mut style.spacing;
+    s.item_spacing = egui::vec2(8.0, 8.0);
+    s.button_padding = egui::vec2(10.0, 5.0);
+    s.interact_size.y = 26.0;
+    s.slider_rail_height = 4.0;
+    s.icon_width = 16.0;
+    s.icon_width_inner = 9.0;
+    s.combo_width = 120.0;
+    let mut scroll = egui::style::ScrollStyle::floating();
+    scroll.floating_width = 4.0;
+    scroll.bar_width = 6.0;
+    s.scroll = scroll;
+    style.interaction.tooltip_delay = 0.35;
     ctx.set_style(style);
 }
 
@@ -111,6 +250,10 @@ pub mod icon {
     pub const FIT: &str = "\u{f065}"; // expand
     pub const UP: &str = "\u{f062}"; // arrow-up
     pub const DOWN: &str = "\u{f063}"; // arrow-down
+    pub const CHEVRON_DOWN: &str = "\u{f078}";
+    pub const CHEVRON_RIGHT: &str = "\u{f054}";
+    pub const WARN: &str = "\u{f071}"; // exclamation-triangle
+    pub const DOT: &str = "\u{f111}"; // circle
 
     // Iconos de cabecera de secciones.
     pub const H_INTERACT: &str = "\u{f0d0}"; // magic
@@ -124,4 +267,5 @@ pub mod icon {
     pub const H_SEQ: &str = "\u{f03a}"; // list
     pub const H_REC: &str = "\u{f111}"; // circle
     pub const H_CANVAS: &str = "\u{f125}"; // crop
+    pub const H_MUSIC: &str = "\u{f001}"; // music
 }

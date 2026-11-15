@@ -1206,6 +1206,12 @@ impl GpuSim {
         }
     }
 
+    /// Textura HDR de la escena (sin el panel), p. ej. para desenfocarla
+    /// detrás de la lámina de cristal del panel.
+    pub fn scene_view(&self) -> &wgpu::TextureView {
+        &self.offscreen_view
+    }
+
     /// Vuelca la escena HDR (sin el panel) a una textura externa, p. ej. la
     /// rgba8 del Recorder de vídeo.
     pub fn blit_to(&self, encoder: &mut wgpu::CommandEncoder, view: &wgpu::TextureView) {
