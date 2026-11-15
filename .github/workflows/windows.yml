@@ -1,0 +1,72 @@
+# Compila Enjambre para Windows (solo `sim-gpu`, el motor GPU con el panel
+# embebido: `sim` y `panel` usan sockets Unix y no compilan en Windows).
+#
+# - En PR: solo compila y deja el zip como artefacto, para validar.
+# - En una etiqueta `v*` (p. ej. al crear la release con `gh release create`):
+#   empaqueta y sube el zip + su sha256 a esa release.
+# - A mano (workflow_dispatch): compila la etiqueta indicada y la sube.
+name: windows
+
+on:
+  push:
+    tags: ["v*"]
+  pull_request:
+    paths:
+      - ".github/workflows/windows.yml"
+      - "sim-gpu/**"
+      - "shared/**"
+      - "assets/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Etiqueta de la release a la que subir el zip (p. ej. v0.1.1)"
+        required: true
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: windows-latest
+    env:
+      TAG: ${{ github.event.inputs.tag || (github.ref_type == 'tag' && github.ref_name) || 'dev' }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.inputs.tag || github.ref }}
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Compilar sim-gpu
+        run: cargo build --release --locked -p sim-gpu
+
+      - name: Empaquetar
+        shell: pwsh
+        run: |
+          $d = "enjambre-$env:TAG-windows-x86_64"
+          New-Item -ItemType Directory -Path $d | Out-Null
+          Copy-Item target/release/sim-gpu.exe "$d/"
+          Copy-Item README.md, assets/fonts/Inter-LICENSE.txt "$d/"
+          Copy-Item assets/logo/enjambre-512.png "$d/enjambre.png"
+          Compress-Archive -Path $d -DestinationPath "$d.zip"
+          $h = (Get-FileHash "$d.zip" -Algorithm SHA256).Hash.ToLower()
+          "$h  $d.zip" | Out-File -Encoding ascii "$d.zip.sha256"
+          "PKG=$d" | Out-File -Append -Encoding utf8 $env:GITHUB_ENV
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.PKG }}
+          path: |
+            ${{ env.PKG }}.zip
+            ${{ env.PKG }}.zip.sha256
+
+      - name: Subir a la release
+        if: env.TAG != 'dev'
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release upload $env:TAG "$env:PKG.zip" "$env:PKG.zip.sha256" --clobber --repo $env:GITHUB_REPOSITORY
