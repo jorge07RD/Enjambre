@@ -186,8 +186,9 @@ pub fn image_points_from_path(
     ))
 }
 
-/// Fuente del sistema para rasterizar el texto: la que resuelva fontconfig
-/// para "sans-serif" y, si no hay `fc-match`, unas rutas típicas de Linux.
+/// Fuente para rasterizar el texto: la que resuelva fontconfig para
+/// "sans-serif"; si no hay `fc-match`, rutas típicas de Linux y de Windows; y,
+/// como último recurso, la Inter SemiBold embebida (siempre hay fuente).
 fn load_font() -> Option<FontVec> {
     if let Ok(out) = std::process::Command::new("fc-match")
         .args(["--format=%{file}", "sans-serif"])
@@ -214,7 +215,22 @@ fn load_font() -> Option<FontVec> {
             }
         }
     }
-    None
+    // Windows: no hay fontconfig; las fuentes viven en %WINDIR%\Fonts.
+    let windir = std::env::var_os("WINDIR")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| std::path::PathBuf::from("C:\\Windows"));
+    for name in ["segoeui.ttf", "arial.ttf"] {
+        if let Ok(bytes) = std::fs::read(windir.join("Fonts").join(name)) {
+            if let Ok(f) = FontVec::try_from_vec(bytes) {
+                return Some(f);
+            }
+        }
+    }
+    // Último recurso: la fuente del panel, embebida en el binario.
+    FontVec::try_from_vec(
+        include_bytes!("../../assets/fonts/Inter-SemiBold.ttf").to_vec(),
+    )
+    .ok()
 }
 
 /// Rasteriza `text` (una línea, con kerning) y devuelve sus puntos meta.
